@@ -190,6 +190,7 @@ class TestShippedScenarios:
                 "crewmate-chat-clean",
                 "crewmate-panel-tabs",
                 "crewmate-reply-thread",
+                "crewmate-team-view",
                 "meet-crewmates-flow",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
