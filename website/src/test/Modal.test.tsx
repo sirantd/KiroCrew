@@ -135,6 +135,27 @@ describe('Modal — focus management', () => {
     expect(dialog).toContainElement(document.activeElement as HTMLElement)
   })
 
+  it('stands its Tab trap down while a dialog of its own is open above it (trapDisabled)', async () => {
+    // A host that opens a Radix dialog portals it to document.body, OUTSIDE
+    // this panel. With the trap armed, every Tab in that inner dialog reads
+    // as focus having escaped and is pulled back here on each keypress.
+    // `trapDisabled` is the stacked-dialog switch; the "Behind the overlay"
+    // button stands in for the inner dialog's control.
+    renderWithProviders(
+      <>
+        <button>Behind the overlay</button>
+        <Modal open onClose={() => {}} title="Outer" trapDisabled>
+          <button>First action</button>
+        </Modal>
+      </>,
+    )
+    await screen.findByRole('dialog')
+    const outside = screen.getByRole('button', { name: 'Behind the overlay' })
+    outside.focus()
+    fireEvent.keyDown(outside, { key: 'Tab' })
+    expect(outside).toHaveFocus()
+  })
+
   it('restores focus to the trigger when the dialog closes', async () => {
     renderWithProviders(<Harness />)
     const trigger = await openDialog()

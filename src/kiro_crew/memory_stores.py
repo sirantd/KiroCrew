@@ -826,7 +826,21 @@ def _allocate_member_id(config, member: str, *, refuse_damaged: bool = True) -> 
     failure the upgrade exists to end. The damaged record is still refused on its
     own behalf, by the candidate scan that rejects it.
     """
-    from kiro_crew.members import slug_for_name
+    from kiro_crew.members import MemberSlugError, dm_binding_path, slug_for_name
+
+    def dm_slug_is_reserved(identity: str) -> bool:
+        """Keep a retained DM binding from resolving to a new member."""
+        try:
+            dm_binding_path(identity).lstat()
+        except FileNotFoundError:
+            return False
+        except (MemberSlugError, OSError, RuntimeError) as exc:
+            if refuse_damaged:
+                raise UnknownMemoryStore(
+                    "Member DM binding state is unreadable; allocation refused"
+                ) from exc
+            return False
+        return True
 
     base = slug_for_name(member)
     identities = [getattr(item, "member_id", "") for item in config.agents.values()]
@@ -835,7 +849,7 @@ def _allocate_member_id(config, member: str, *, refuse_damaged: bool = True) -> 
         raise UnknownMemoryStore("Configured member identity must be a string; allocation refused")
     existing = {identity for identity in identities if isinstance(identity, str)}
     member_id = base
-    while member_id in existing:
+    while member_id in existing or dm_slug_is_reserved(member_id):
         member_id = f"{base[:48]}-{uuid.uuid4().hex[:12]}"
     return member_id
 

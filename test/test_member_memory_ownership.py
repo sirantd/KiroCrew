@@ -22,6 +22,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.config.sections import MemoryStoreConfig
+from kiro_crew.members import write_dm_binding
 from kiro_crew.memory_stores import (
     MemberAlreadyExists,
     UnknownMemoryStore,
@@ -130,6 +131,16 @@ class TestPrivateOwnership:
         assert require_member_memory_store(cfg, "Code Review") == first
         assert require_member_memory_store(cfg, "Code-Review") == second
         assert cfg.agents["Code Review"].member_id != cfg.agents["Code-Review"].member_id
+
+    def test_retained_dm_binding_reserves_deleted_legacy_slug(self):
+        write_dm_binding("code-review", member="Code Review", slot_key="member-code-review")
+        cfg = KiroCrewConfig.load()
+        cfg.agents["Code-Review"] = KiroCrewAgentConfig()
+
+        store = provision_member_memory(cfg, "Code-Review")
+
+        assert cfg.agents["Code-Review"].member_id.startswith("code-review-")
+        assert require_member_memory_store(cfg, "Code-Review") == store
 
     @pytest.mark.parametrize("replacement", ["Code Review", "Code-Review"])
     def test_deleted_member_identity_stays_reserved_by_retained_store(self, replacement):

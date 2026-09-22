@@ -2837,6 +2837,12 @@ export interface MemberRosterRow {
   name: string
   /** Stable path-safe slug deriving the member dir and the slot key. */
   slug: string
+  /** True when `slug` is derived from the NAME (a crew with no allocated
+   *  member id). Such a slug can be shared by a new name that slugs the same
+   *  way, so the New crewmate dialog refuses those names; a crew with an
+   *  allocated id gets a suffixed slug on collision and is safe. Absent on an
+   *  older gateway, which the page reads as legacy (the guard stays on). */
+  legacy_slug?: boolean
   /** The pinned DM thread's slot key ('' until first open / unbound). */
   slot_key: string
   /** O(1) liveness: the bound slot is mid-turn right now. */

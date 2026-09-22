@@ -160,3 +160,26 @@ class TestBenignRowsAreUntouched:
         assert row["name"] == "writer"
         assert row["slug"] == "writer"
         assert row["description"] == _SENSITIVE_MASK
+
+
+class TestSlugProvenance:
+    @pytest.mark.asyncio
+    async def test_legacy_slug_flags_a_name_derived_slug(self, tmp_path):
+        """``legacy_slug`` tells the New crewmate dialog which rows a new name
+        can COLLIDE with. A crew with an allocated ``member_id`` is addressed
+        by that id and the server suffixes any later allocation past it; a
+        legacy crew is addressed by the slug of its name, which a new name
+        that slugs the same way would be handed as its own id."""
+        agents = {
+            "legacy": KiroCrewAgentConfig(kiro_agent="kirocrew"),
+            "Allocated": KiroCrewAgentConfig(kiro_agent="kirocrew", member_id="allocated"),
+        }
+        rows, body = await _roster(tmp_path, agents)
+        assert rows["legacy"]["slug"] == "legacy"
+        assert rows["legacy"]["legacy_slug"] is True
+        assert rows["Allocated"]["slug"] == "allocated"
+        assert rows["Allocated"]["legacy_slug"] is False
+        # The id itself stays off the roster (it is execution attribution, see
+        # test_agents_roster_contract.WITHHELD_RECORD_FIELDS); only the flag
+        # derived from it ships.
+        assert all("member_id" not in row for row in body["members"])

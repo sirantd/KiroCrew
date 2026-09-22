@@ -293,6 +293,17 @@ async def api_members(request: web.Request) -> web.Response:
                 # would alter it.
                 "name": name,
                 "slug": slug,
+                # Where the slug comes from. A crew created through the API
+                # holds a `member_id` that `_allocate_member_id` suffixed past
+                # every id already taken, so its slug can never be shared. A
+                # legacy crew (no `member_id`) is addressed by the slug OF ITS
+                # NAME, and a new name that slugs the same way would then be
+                # allocated that very slug and share the old crew's chat. The
+                # New crewmate dialog refuses such a name up front, and this is
+                # how it knows which rows can collide (member_id itself is
+                # execution attribution, not a roster field; see
+                # test_agents_roster_contract.WITHHELD_RECORD_FIELDS).
+                "legacy_slug": not getattr(agent_cfg, "member_id", ""),
                 "kiro_agent": _roster_mask(agent_cfg.kiro_agent),
                 "workspace": _roster_mask(agent_cfg.workspace),
                 "memory_store": _roster_mask(agent_cfg.memory_store),
