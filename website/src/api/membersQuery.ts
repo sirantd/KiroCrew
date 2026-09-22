@@ -41,7 +41,13 @@ export const membersRosterQuery = {
   select: (rows: MemberRosterRow[]): MemberRosterRow[] => {
     for (const row of rows) {
       if (row.projections) {
-        memberProjectionStore.seed(row.slug, row.projections.values, row.projections.asOfSeq)
+        memberProjectionStore.seed(
+          row.slug,
+          row.projections.values,
+          row.projections.asOfSeq,
+          row.projections.stateVersions,
+          row.projections.seqs,
+        )
       }
     }
     return rows

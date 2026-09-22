@@ -5,8 +5,17 @@
  * frames and a roster baseline. Four invariants keep it correct against
  * replays, races, and server restarts:
  *
- *   - higher-seq-wins: apply() drops any frame whose seq <= the held row's
- *     seq, so replays and out-of-order stale frames are no-ops.
+ *   - generation-then-seq-wins: apply() compares (stateVersion, seq) in that
+ *     order, so an older generation loses outright and within one generation a
+ *     replayed or out-of-order seq is a no-op. A deletion arrives at an advanced
+ *     generation, which is what lets it outrank a row sitting at a high seq.
+ *   - a deletion RETAINS NOTHING: a null value drops the row rather than holding
+ *     a tombstone, because a re-enabled app picks its own stateVersion and cannot
+ *     know which generation the server advanced to -- a tombstone would discard
+ *     its real updates. Refusing a publish from the RETIRED generation is not
+ *     this layer's job: teardown revokes the grant before deleting rows and the
+ *     publish path commits behind a generation fence, so the server does not
+ *     send one.
  *   - an ATTRIBUTABLE baseline never truncates: while the roster stands behind
  *     a slug's sequence, seed() only applies values, so a live frame that raced
  *     ahead of the baseline keeps winning.
@@ -22,10 +31,20 @@
  * snapshot is referentially stable until that row actually changes.
  */
 
-/** One held projection: the value, the seq it arrived at, and how to render it. */
+/** One held projection: the value, where it sits in the order, and its version. */
 interface Row {
   value: unknown
   seq: number
+  /**
+   * The row's generation, which orders BEFORE seq. The server already publishes
+   * on this pair — a lower stateVersion is refused outright and an equal one
+   * requires the seq to advance — so comparing only the seq here would be a
+   * weaker rule than the one the rows were written under.
+   *
+   * Rows that predate the field, and every built-in key, read as 0, which makes
+   * the comparison collapse to plain higher-seq-wins for them.
+   */
+  stateVersion: number
 }
 
 /** The useSyncExternalStore-shaped view for a single (slug, key). */
@@ -53,9 +72,19 @@ export class MemberProjectionStore {
   }
 
   /**
-   * Apply one projected value. Higher-seq-wins: if a row exists and the incoming
-   * seq is not strictly greater, do nothing, so an equal-seq replay and a stale
-   * frame both drop. Otherwise store it and notify the (slug, key) face.
+   * Apply one projected value. Ordering is (stateVersion, seq), in that order:
+   * an older generation loses outright, and within one generation higher-seq-wins
+   * as before, so an equal-seq replay and a stale frame both drop. Otherwise
+   * store it and notify the (slug, key) face.
+   *
+   * A NULL value is a deletion, and it DROPS the row rather than holding a
+   * tombstone. Holding one would be the mirror defect: the deletion arrives at an
+   * advanced generation so that a concurrent older publish cannot resurrect the
+   * card, but a retained tombstone at that generation would then outrank the real
+   * updates of a re-enabled app -- and a re-enabled app cannot know which
+   * generation to publish past, because the server advanced it, not the app. With
+   * the row gone there is nothing left to lose against, and the next publish
+   * simply populates a fresh row.
    *
    * A frame for a slug the roster declared unattributable is DROPPED. The roster
    * is the only surface that checks whether a slug names one member; the live
@@ -64,16 +93,27 @@ export class MemberProjectionStore {
    * attribute. Refusing here is what makes the refusal reach the screen, and it
    * needs no audit of every future emitter.
    */
-  apply(slug: string, key: string, value: unknown, seq: number): void {
+  apply(slug: string, key: string, value: unknown, seq: number, stateVersion = 0): void {
     if (this.unattributable.has(slug)) return
     let byKey = this.rows.get(slug)
     const existing = byKey?.get(key)
-    if (existing && seq <= existing.seq) return
+    if (existing) {
+      if (stateVersion < existing.stateVersion) return
+      if (stateVersion === existing.stateVersion && seq <= existing.seq) return
+    }
+    if (value === null) {
+      // Won the comparison, so the deletion is current. Drop the row entirely.
+      if (!byKey) return
+      if (!byKey.delete(key)) return
+      if (byKey.size === 0) this.rows.delete(slug)
+      this.notify(slug, key)
+      return
+    }
     if (!byKey) {
       byKey = new Map<string, Row>()
       this.rows.set(slug, byKey)
     }
-    byKey.set(key, { value, seq })
+    byKey.set(key, { value, seq, stateVersion })
     this.notify(slug, key)
   }
 
@@ -82,11 +122,13 @@ export class MemberProjectionStore {
    * through apply(), so a live frame that already advanced the row past asOfSeq
    * keeps winning.
    *
-   * An EMPTY block is a statement, not an absence of one: the roster says this
-   * slug holds nothing readable, which is what a shared-slug collision produces
-   * for the slug both members claim. Applying no keys would leave whatever is
-   * cached in place, and for a collision that cache is the OTHER member's
-   * projection -- so the page would keep showing one member's data under a slug
+   * An OMITTED key is a statement, not an absence of one: the block answers for
+   * the whole slug, so a key it does not carry is one the roster would not serve
+   * again, and a cached row left behind renders a card for something that is no
+   * longer there. An EMPTY block is the same statement about every key at once,
+   * which is what a shared-slug collision produces for the slug both members
+   * claim. Keeping whatever is cached would, for a collision, keep the OTHER
+   * member's projection -- so the page would show one member's data under a slug
    * the server refuses to attribute, and a stale read of that kind looks
    * identical to a live one.
    *
@@ -109,7 +151,13 @@ export class MemberProjectionStore {
    * at a sequence the server would not stand behind is not a baseline, so it is
    * dropped rather than applied at a negative seq that every later frame beats.
    */
-  seed(slug: string, values: { [key: string]: unknown }, asOfSeq: number): void {
+  seed(
+    slug: string,
+    values: { [key: string]: unknown },
+    asOfSeq: number,
+    stateVersions: { [key: string]: number } = {},
+    seqs: { [key: string]: number } = {},
+  ): void {
     if (asOfSeq < 0) {
       this.unattributable.add(slug)
       const byKey = this.rows.get(slug)
@@ -123,19 +171,38 @@ export class MemberProjectionStore {
     }
     this.unattributable.delete(slug)
     const keys = Object.keys(values)
-    if (keys.length === 0) {
-      const byKey = this.rows.get(slug)
-      if (!byKey) return
+    const present = new Set(keys)
+    // A baseline answers for what it OMITS as well as for what it carries. A
+    // contributed key the roster does not serve is gone -- its app's row was
+    // deleted with the app, or the app may no longer publish that key -- and a
+    // cached row left behind renders a card for something no reader would be
+    // served again. Membership is asked of a Set rather than the object, so a key
+    // that happens to name an inherited property is treated like any other.
+    //
+    // Bounded by asOfSeq for the same reason every key in this block is: a row a
+    // live frame already carried PAST this read is newer than the baseline that
+    // omits it, so it stands. An empty block is this rule's k = 0 case, which is
+    // why it needs no branch of its own.
+    const byKey = this.rows.get(slug)
+    if (byKey) {
       for (const [key, row] of [...byKey]) {
+        if (present.has(key)) continue
         if (row.seq > asOfSeq) continue
         byKey.delete(key)
         this.notify(slug, key)
       }
       if (byKey.size === 0) this.rows.delete(slug)
-      return
     }
+    if (keys.length === 0) return
     for (const key of keys) {
-      this.apply(slug, key, values[key], asOfSeq)
+      // Each key at its OWN seq and generation, never the response's. Both belong to
+      // the row rather than to this reply: a contributed row's seq is the
+      // contributor's fold position, which TRAILS asOfSeq, so seeding at asOfSeq
+      // would make the gate in apply() drop that contributor's next live push and
+      // freeze the card at its baseline -- which is exactly why the backend sends
+      // these two maps beside the values. A built-in key appears in neither map and
+      // correctly falls back to asOfSeq and generation 0.
+      this.apply(slug, key, values[key], seqs[key] ?? asOfSeq, stateVersions[key] ?? 0)
     }
   }
 
