@@ -1817,11 +1817,20 @@ class VectorMemoryStore:
         snapshot: dict,
         messages: list[dict],
         facets: memory_schema.MemoryFacets | None = None,
+        admit: Callable[[], None] | None = None,
     ) -> dict:
         """Publish one extracted span, its provenance and retry receipt atomically.
 
         Embeddings remain NULL until the writer's maintenance sweep. No provider,
         transcript or filesystem operation takes place inside this transaction.
+
+        *admit*, when given, is called immediately before each mutation and once
+        more before the commit; it may raise. The consolidator hands in its
+        write gate's per-mutation check here (in-memory records only, so the
+        contract above holds): a session whose memory mode tightens while this
+        transaction runs raises out of the mutation it reached, the ``except``
+        below rolls the transaction back whole, and nothing partial is
+        committed.
         """
         if self.algorithm_version != "v2" or not source_id:
             raise ValueError("Consolidation requires a member database and stable source id")
@@ -1831,6 +1840,11 @@ class VectorMemoryStore:
         source_digest = consolidation_source_digest(messages)
         source = f"consolidation:{session_key}"
         receipt: dict = {"source_id": source_id, "semantic": 0, "episodic": 0, "lessons": 0}
+
+        def _admitted() -> None:
+            if admit is not None:
+                admit()
+
         with self._db_lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -1856,6 +1870,7 @@ class VectorMemoryStore:
                             "SELECT * FROM semantic_memory WHERE key=? AND is_deleted=0", (key,)
                         ).fetchone()
                         if before:
+                            _admitted()
                             record_meta.propose_conflict(
                                 self.db,
                                 kind="fact",
@@ -1885,6 +1900,7 @@ class VectorMemoryStore:
                         messages=messages,
                         session_key=session_key,
                     )
+                    _admitted()
                     rejection = self._write_semantic(
                         key,
                         json.dumps(value, ensure_ascii=False),
@@ -1928,6 +1944,7 @@ class VectorMemoryStore:
                     ).fetchone():
                         continue
                     item_id = str(uuid4())
+                    _admitted()
                     self.db.execute(
                         memory_schema.episodic_insert(self._lineage),
                         memory_schema.episodic_insert_params(
@@ -1999,6 +2016,7 @@ class VectorMemoryStore:
                         value["applies"] = applies
                     if self.validate_semantic(key, value, 0.9, source) is not None:
                         continue
+                    _admitted()
                     if not self._write_semantic(
                         key,
                         json.dumps(value, ensure_ascii=False),
@@ -2015,6 +2033,7 @@ class VectorMemoryStore:
                             )
                 entry = result.get("history_entry")
                 if isinstance(entry, str) and entry.strip():
+                    _admitted()
                     self._append_history(entry)
                 self.db.execute(
                     "INSERT INTO memory_consolidations VALUES (?,?,?,?,?,?)",
@@ -2027,6 +2046,9 @@ class VectorMemoryStore:
                         _now_iso(),
                     ),
                 )
+                # The last word before anything becomes durable: a mode that
+                # tightened during the mutations above rolls all of them back.
+                _admitted()
                 self.db.commit()
             except BaseException:
                 self.db.rollback()

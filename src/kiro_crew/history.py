@@ -817,6 +817,27 @@ def is_incognito_transcript(memory_mode: object) -> bool:
     return str(memory_mode or "").lower() in INCOGNITO_MEMORY_MODES
 
 
+def transcript_privacy_mode(memory_mode: object) -> str:
+    """The private mode a transcript header records, normalized, or ``""``.
+
+    The companion of :func:`is_incognito_transcript` for a caller that needs
+    the MODE rather than the yes/no: the same ``str()`` + ``lower()``
+    normalization and the same membership test, so the two cannot disagree
+    about which headers are private; ``""`` for a header that records no mode
+    or a value the set does not hold (whitespace is not stripped here either --
+    a header no reader recognizes is one the stamps below may REPAIR with a
+    recognized mode, which stripping would prevent). Every reader that compares
+    or reports a header's mode goes through this rather than the raw string: a
+    header is not bound by the API's validation (a hand edit, a foreign writer),
+    and a raw ``Temporary`` handed to a strictness compare reads as UNKNOWN --
+    weaker than any recognized mode -- so the tighten-only stamps would rewrite
+    it as ``incognito``, a tightening lost, and the consolidator would report
+    and audit the mode as spelled rather than as the mode it is.
+    """
+    normalized = str(memory_mode or "").lower()
+    return normalized if normalized in INCOGNITO_MEMORY_MODES else ""
+
+
 # The fields that record where a message came from: the session key it arrived
 # on (``source_thread``, e.g. ``slack:1785861252.833429``) and the platform user
 # who sent it (``source_user``). Written by :meth:`ConversationLog.append`, read
