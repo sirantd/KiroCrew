@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
@@ -255,6 +255,157 @@ class TestApplyEndpoint:
         for p in (mc_path, kiro_path, cc_path):
             data = json.loads(p.read_text(encoding="utf-8"))
             assert "foo" not in data["mcpServers"], f"foo still in {p}"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_uninstall_is_refused_before_any_side_effect(
+        self, tmp_path, monkeypatch
+    ):
+        """``team/foo`` and ``other:team/foo`` both alias to ``team-foo`` and
+        neither is keyed so: no scope can say which entry the row is. The whole
+        apply is refused as a request failure (409, an ``error`` the table shows
+        while keeping the pending change) BEFORE Phase 1 -- the companion package
+        is not uninstalled, no file changes, nothing is logged as an uninstall.
+        Red before Phase 0: the companion uninstall ran, the scope answered
+        ``ambiguous`` inside an ``ok: true`` response the table read as applied,
+        and ``mcp_uninstall`` was logged ``ok`` with both configurations kept."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        cc_path = tmp_path / "cc_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {"other": {"command": "o"}}}))
+        kiro_path.write_text(
+            json.dumps(
+                {"mcpServers": {"team/foo": {"command": "a"}, "other:team/foo": {"command": "b"}}}
+            )
+        )
+        cc_path.write_text(json.dumps({"mcpServers": {}}))
+        before = {p: p.read_bytes() for p in (mc_path, kiro_path, cc_path)}
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [McpScope("cc", cc_path, None)])
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+        manager = MagicMock(**{"available.return_value": True})
+        manager.uninstall_mcp = AsyncMock(
+            side_effect=AssertionError("companion uninstall ran for a refused change")
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager", lambda: manager
+        )
+        rebuild = MagicMock()
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", rebuild)
+        sel = MagicMock()
+        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
+
+        class _NoLock:
+            async def __aenter__(self):
+                pass
+
+            async def __aexit__(self, *a):
+                pass
+
+        monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
+
+        request = _make_request(
+            {
+                "changes": [
+                    {"name": "team-foo", "uninstall": True},
+                    {"name": "other", "uninstall": True},
+                ]
+            }
+        )
+        resp = await mcp_mod.api_mcp_apply(request)
+        assert resp.status == 409
+        body = json.loads(resp.body)
+        assert body["error"].startswith(
+            "uninstall refused: 'team-foo' is the alias of several entries in kiroGlobal"
+        )
+        assert body["ambiguous"] == {"team-foo": ["kiroGlobal"]}
+        assert "ok" not in body and "results" not in body
+        manager.uninstall_mcp.assert_not_called()
+        rebuild.assert_not_called()
+        # Nothing moved -- the second change in the same request included.
+        for p, raw in before.items():
+            assert p.read_bytes() == raw, p
+        ops = [c.kwargs.get("operation") for c in sel.log_api_access.call_args_list]
+        assert "mcp_uninstall" not in ops
+        assert ops == ["mcp_apply_rejected_ambiguous"]
+        assert sel.log_api_access.call_args.kwargs["outcome"] == "denied"
+
+    @pytest.mark.asyncio
+    async def test_a_config_edited_between_pin_and_purge_changes_nothing_about_the_removal(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 0 pins the raw key every scope holds for the row; Phase 2 removes
+        exactly those pinned entries and never resolves again. So an edit that
+        lands between the two -- here a second server ``other:team/foo`` whose
+        alias collides with the row -- cannot change what the request removes:
+        the pinned ``npm:@team/foo`` goes, the newcomer stays, the response reads
+        ``kiroGlobal: removed`` with no error and the uninstall is logged ``ok``.
+        Red under resolve-at-purge: the scope answered ``ambiguous`` after the
+        companion package was already gone, and the pinned entry stayed."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {}}))
+        kiro_path.write_text(json.dumps({"mcpServers": {"npm:@team/foo": {"command": "a"}}}))
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", list)
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+
+        real_pin = mcp_mod._pin_uninstall_keys
+
+        def pin_then_edit(names):
+            pins, ambiguous = real_pin(names)
+            # The concurrent edit: a distinct server whose alias collides lands
+            # after the pin and before the purge.
+            kiro_path.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "npm:@team/foo": {"command": "a"},
+                            "other:team/foo": {"command": "b"},
+                        }
+                    }
+                )
+            )
+            return pins, ambiguous
+
+        monkeypatch.setattr(mcp_mod, "_pin_uninstall_keys", pin_then_edit)
+        manager = MagicMock(**{"available.return_value": True})
+        manager.uninstall_mcp = AsyncMock(return_value=MagicMock(ok=True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager", lambda: manager
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        sel = MagicMock()
+        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
+
+        class _NoLock:
+            async def __aenter__(self):
+                pass
+
+            async def __aexit__(self, *a):
+                pass
+
+        monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
+
+        request = _make_request({"changes": [{"name": "team-foo", "uninstall": True}]})
+        resp = await mcp_mod.api_mcp_apply(request)
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        (result,) = body["results"]
+        assert result["actions"] == {
+            "kirocrew": "noop",
+            "kiroGlobal": "removed",
+            "capability": "uninstalled",
+        }
+        assert "error" not in result
+        assert set(json.loads(kiro_path.read_text())["mcpServers"]) == {"other:team/foo"}
+        ops = [c.kwargs.get("operation") for c in sel.log_api_access.call_args_list]
+        assert ops == ["mcp_uninstall"]
 
     @pytest.mark.asyncio
     async def test_calls_rebuild_agent_config_once(self, tmp_path, monkeypatch):
@@ -1069,9 +1220,9 @@ class TestUninstallCrashWindowCleanup:
         seen_threads: list[int] = []
         real_purge = mcp_mod._purge_server_config
 
-        def _spy_purge(name):
+        def _spy_purge(name, **kw):
             seen_threads.append(threading.get_ident())
-            return real_purge(name)
+            return real_purge(name, **kw)
 
         monkeypatch.setattr(mcp_mod, "_purge_server_config", _spy_purge)
 
