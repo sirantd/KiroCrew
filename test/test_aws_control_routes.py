@@ -28,6 +28,7 @@ import json
 import logging
 import re
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -846,6 +847,67 @@ class _FakeContent:
             yield chunk
 
 
+class TestACancelledThreadCallDrainsBeforeItUnwinds:
+    """A worker thread must never outlive the ``await`` that started it.
+
+    ``asyncio.to_thread`` cannot stop a thread that has started. On the drive upload
+    path the thread holds a DESCRIPTOR, and the code that runs next on cancellation is
+    the ``finally`` that closes it -- so an abandoned worker writes its next chunk
+    through a closed number the kernel has since handed to something else, or hands
+    that number to the CLI child as the body to upload. Bytes of an unrelated local
+    file are then overwritten or shipped off-host, with no recall.
+    """
+
+    def test_the_worker_has_finished_when_the_cancellation_reaches_the_caller(self):
+        started = threading.Event()
+        finished: list[str] = []
+
+        def slow_write(tag: str) -> None:
+            started.set()
+            time.sleep(0.25)
+            finished.append(tag)
+
+        async def drive() -> None:
+            task = asyncio.ensure_future(routes_mod._drained_thread(slow_write, "fd"))
+            await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # The assertion that matters: by the time the cancellation is observable
+            # here, the thread is done with what it was given. A plain `to_thread`
+            # returns while the worker is still inside `slow_write`.
+            assert finished == ["fd"], "the cancelled await returned before the worker finished"
+
+        asyncio.run(drive())
+
+    def test_the_uncancelled_path_still_returns_the_worker_result(self):
+        # The drain must not change the ordinary case, or every upload would pay for
+        # the cancellation guard with a different bug.
+        async def drive() -> None:
+            assert await routes_mod._drained_thread(lambda a, b: a + b, 2, 3) == 5
+
+        asyncio.run(drive())
+
+    def test_the_worker_error_does_not_replace_the_cancellation(self):
+        # The caller is unwinding, so its own CancelledError is the one to propagate;
+        # a failure inside the abandoned worker must not surface in its place.
+        started = threading.Event()
+
+        def boom(_tag: str) -> None:
+            started.set()
+            time.sleep(0.15)
+            raise ValueError("worker failed after the cancellation")
+
+        async def drive() -> None:
+            task = asyncio.ensure_future(routes_mod._drained_thread(boom, "fd"))
+            await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+
+
 class TestDriveUpload:
     def _run(self, chunks, *, key="f.bin", app_enabled_recheck=True, consent_recheck=True):
         handlers = _registered()
@@ -1006,6 +1068,49 @@ class TestDriveUpload:
         # permission DECISION so it must reach the audit trail.
         put.assert_not_called()
         audit.assert_any_call("drive_upload", mock.ANY, "denied", error="drive_changed")
+
+    def test_the_staging_root_is_resolved_off_the_event_loop(self):
+        # `staging_root()` does lstat, mkdir, two resolves, is_dir and chmod. Passed
+        # as an ARGUMENT to `asyncio.to_thread` those syscalls run in this coroutine
+        # before the thread is entered, so a slow or contended data home stalls every
+        # other task on the gateway loop -- which is the same reason every touch of
+        # the spool below is offloaded. Thread identity is what tells the two spellings
+        # apart: an argument records the loop's thread, a call inside the callable
+        # records a worker's.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        loop_thread = threading.get_ident()
+        seen: list[int] = []
+        real_root = routes_mod.storage_mod.staging_root
+
+        def recording_root():
+            seen.append(threading.get_ident())
+            return real_root()
+
+        req = _request(
+            "POST",
+            f"/drive/{ACCOUNT}/upload?section=drive&key=f.bin",
+            match_info={"account": ACCOUNT},
+        )
+        req._fake_content = _FakeContent([b"hello"])  # type: ignore[attr-defined]
+        with (
+            mock.patch.object(type(req), "content", new=property(lambda s: s._fake_content)),
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            mock.patch.object(routes_mod.storage_mod, "staging_root", side_effect=recording_root),
+            mock.patch.object(routes_mod.storage_mod, "find_drive", return_value="drive"),
+            mock.patch.object(routes_mod.storage_mod, "put_file"),
+        ):
+            asyncio.run(
+                handlers[("POST", "/drive/{account}/upload")](req)  # type: ignore[operator]
+            )
+        assert seen, "staging_root was never called, so this test measures nothing"
+        assert loop_thread not in seen, (
+            "staging_root ran on the event loop thread; call it inside the callable "
+            "passed to asyncio.to_thread, not as an argument evaluated before it"
+        )
 
     def test_the_put_targets_the_bucket_the_post_spool_discovery_returned(self):
         # A pass through the re-authorization means the pre-spool name and the
@@ -3036,6 +3141,16 @@ class TestLibrary:
 
 
 class TestBackupEndpoints:
+    @pytest.fixture(autouse=True)
+    def _payload_can_be_held(self, monkeypatch):
+        # Same reason as the job-route class: these measure the ENDPOINTS, so the
+        # platform pre-check is held satisfied. Without this, a host that cannot hold
+        # a body from creation answers 501 to every snapshot start and the endpoint
+        # assertions below never run.
+        monkeypatch.setattr(
+            routes_mod.backup_mod.storage, "body_bytes_can_be_held_from_creation", lambda: True
+        )
+
     def test_status_reports_toggle_runs_and_remote_listing(self):
         handlers = _registered()
         p1, p2, p3 = _enabled_owner_env()

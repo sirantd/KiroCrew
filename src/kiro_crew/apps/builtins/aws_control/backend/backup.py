@@ -120,7 +120,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import sqlite3
 import stat
 import sys
@@ -129,7 +128,7 @@ import tempfile
 import threading
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO, Any, NamedTuple, NoReturn, Optional
 
@@ -960,7 +959,7 @@ def _body_fingerprint(path: Path | None = None, *, fd: int | None = None) -> str
     paths pass it so that the archive they fingerprint is provably the archive they
     upload: taken from a name, this and the upload would be two resolutions of one
     string, and a same-UID process that replaced the file between them would leave
-    a record describing bytes the object does not hold. Reading from ``pread`` at
+    a record describing bytes the object does not hold. Reading at
     an explicit offset leaves the descriptor's own position alone, so the caller
     can hand the same descriptor to another reader. The restore side still passes a
     path, because there the file it hashes is one it created and holds exclusively.
@@ -973,7 +972,7 @@ def _body_fingerprint(path: Path | None = None, *, fd: int | None = None) -> str
     if fd is not None:
         offset = 0
         while True:
-            chunk = os.pread(fd, 1024 * 1024, offset)
+            chunk = _read_at(fd, 1024 * 1024, offset)
             if not chunk:
                 break
             digest.update(chunk)
@@ -985,6 +984,31 @@ def _body_fingerprint(path: Path | None = None, *, fd: int | None = None) -> str
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_at(fd: int, size: int, offset: int) -> bytes:
+    """Read up to *size* bytes of *fd* starting at *offset*.
+
+    The point of addressing by offset is that the caller's descriptor position is
+    left where the caller put it, so one descriptor can feed two fingerprints and
+    then the upload. ``os.pread`` does that in one syscall and exists only where
+    the platform provides it; Windows has no such call.
+
+    Where it is missing, the position is read, moved, and put back in a
+    ``finally``, which reaches the same outcome for the single-threaded staging
+    path that calls this: no other reader shares the descriptor while a build is
+    in flight. A caller that did share one across threads would need the real
+    ``pread``, and that is the platform where it exists.
+    """
+    pread = getattr(os, "pread", None)
+    if pread is not None:
+        return pread(fd, size, offset)
+    keep = os.lseek(fd, 0, os.SEEK_CUR)
+    try:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, size)
+    finally:
+        os.lseek(fd, keep, os.SEEK_SET)
 
 
 #: The snapshot bundle's metadata member, named relative to the bundle root.
@@ -1098,17 +1122,63 @@ def _tree_fingerprint(
     return rolling.hexdigest()
 
 
+class _OffsetReader(io.RawIOBase):
+    """A read-only file object over a descriptor, addressing bytes by OFFSET.
+
+    ``os.dup`` is the obvious way to read a descriptor twice and it is wrong here:
+    a duplicate SHARES the file offset with the original, so reading the archive
+    through one would leave the caller's descriptor positioned at the end -- and
+    the push paths hand that same descriptor to the upload afterwards. Depending on
+    a re-open of ``/dev/stdin`` to reset it would be depending on a platform
+    detail: Linux gives a fresh file description, a character-device spelling need
+    not.
+
+    :func:`_read_at` takes the offset per call, so this keeps its own position and
+    the caller's descriptor is left where the caller put it.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        chunk = _read_at(self._fd, len(buffer), self._pos)
+        buffer[: len(chunk)] = chunk
+        self._pos += len(chunk)
+        return len(chunk)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            self._pos = offset
+        elif whence == os.SEEK_CUR:
+            self._pos += offset
+        elif whence == os.SEEK_END:
+            self._pos = os.fstat(self._fd).st_size + offset
+        else:
+            raise ValueError(f"unsupported whence: {whence}")
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+
 def _archive_entries(
     archive: Path | None = None, *, volatile_root: bool, fd: int | None = None
 ) -> list[tuple[str, str, int, int, str]]:
     """One ``(kind, path, permission mode, size, content digest)`` row per member.
 
-    *fd* is read through :class:`_PreadReader`, so the entry set digested here is
+    *fd* is read through :class:`_OffsetReader`, so the entry set digested here is
     the entry set of the file that is then uploaded -- no name is resolved in
     between -- and the caller's descriptor position is left exactly where it was.
     """
     if fd is not None:
-        with io.BufferedReader(_PreadReader(fd)) as raw:
+        with io.BufferedReader(_OffsetReader(fd)) as raw:
             with tarfile.open(fileobj=raw, mode="r:gz") as tar:
                 return _entries_of(tar, volatile_root=volatile_root)
     if archive is None:
@@ -1169,52 +1239,6 @@ def _manifest_digest(raw: bytes) -> str:
     stable = {k: v for k, v in parsed.items() if k not in _VOLATILE_MANIFEST_FIELDS}
     canonical = json.dumps(stable, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-class _PreadReader(io.RawIOBase):
-    """A read-only file object over a descriptor, addressing bytes by OFFSET.
-
-    ``os.dup`` is the obvious way to read a descriptor twice and it is wrong here:
-    a duplicate SHARES the file offset with the original, so reading the archive
-    through one would leave the caller's descriptor positioned at the end -- and
-    the push paths hand that same descriptor to the upload afterwards. Depending on
-    a re-open of ``/dev/stdin`` to reset it would be depending on a platform
-    detail: Linux gives a fresh file description, a character-device spelling need
-    not.
-
-    ``os.pread`` takes the offset per call and touches no shared state, so this
-    keeps its own position and the caller's descriptor is untouched.
-    """
-
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-        self._pos = 0
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return True
-
-    def readinto(self, buffer: Any) -> int:
-        chunk = os.pread(self._fd, len(buffer), self._pos)
-        buffer[: len(chunk)] = chunk
-        self._pos += len(chunk)
-        return len(chunk)
-
-    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
-        if whence == os.SEEK_SET:
-            self._pos = offset
-        elif whence == os.SEEK_CUR:
-            self._pos += offset
-        elif whence == os.SEEK_END:
-            self._pos = os.fstat(self._fd).st_size + offset
-        else:
-            raise ValueError(f"unsupported whence: {whence}")
-        return self._pos
-
-    def tell(self) -> int:
-        return self._pos
 
 
 def _default_label(install_id: str) -> str:
@@ -3542,39 +3566,50 @@ def _publish_label(
     would invite a reader to trust the copy that can lie.
     """
     try:
-        with tempfile.TemporaryDirectory(prefix="kc-backup-label-") as tmp:
-            path = Path(tmp) / LABEL_OBJECT_NAME
-            path.write_text(
+        # Under the masked staging root for the same reason the archive is: the
+        # shared system temp root is same-UID writable, and the descriptor
+        # `put_file` holds fixes which inode it sends rather than that inode's
+        # bytes. This document is published under the owner's key, so a rewrite
+        # between the write and the upload puts a sibling agent's bytes there.
+        #
+        # PINNED, not merely relocated: on a platform with no `/dev/stdin` the
+        # CLI is handed this file's NAME, and `put_file` rests on its caller
+        # holding the directory open for that arm to be sound.
+        with storage.pinned_staging("kc-backup-label-") as (tmp, _staging_fd):
+            with storage.held_body(
+                tmp,
+                LABEL_OBJECT_NAME,
                 json.dumps(
                     {
                         "label": identity["label"],
                         "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                     }
-                ),
-                encoding="utf-8",
-            )
-            for sub in KIND_SUBPATHS.values():
-                # Inside the loop, not before it. The first PUT is an S3 round trip,
-                # so a gate hoisted above the loop would leave the second write
-                # running on a decision taken before that trip.
-                #
-                # `payload_kind=None` because this write is not any kind's payload:
-                # it is one document, a label and a time, deliberately published
-                # under BOTH prefixes. Keying it to the prefix it happens to be
-                # writing would make an install with one kind's nightly off lose
-                # that prefix's caption -- which is a rename going unseen, not a
-                # transcript leaving the machine.
-                _authorize_upload(account, profile, region, caller=caller, payload_kind=None)
-                storage.put_file(
-                    profile,
-                    region,
-                    bucket,
-                    "backup",
-                    f"{sub}/{identity['id']}/{LABEL_OBJECT_NAME}",
-                    str(path),
-                    account=account,
-                    timeout=60,
-                )
+                ).encode("utf-8"),
+            ) as (path, label_fd):
+                for sub in KIND_SUBPATHS.values():
+                    # Inside the loop, not before it. The first PUT is an S3 round trip,
+                    # so a gate hoisted above the loop would leave the second write
+                    # running on a decision taken before that trip.
+                    #
+                    # `payload_kind=None` because this write is not any kind's payload:
+                    # it is one document, a label and a time, deliberately published
+                    # under BOTH prefixes. Keying it to the prefix it happens to be
+                    # writing would make an install with one kind's nightly off lose
+                    # that prefix's caption -- which is a rename going unseen, not a
+                    # transcript leaving the machine.
+                    _authorize_upload(account, profile, region, caller=caller, payload_kind=None)
+                    storage.put_file(
+                        profile,
+                        region,
+                        bucket,
+                        "backup",
+                        f"{sub}/{identity['id']}/{LABEL_OBJECT_NAME}",
+                        str(path),
+                        account=account,
+                        timeout=60,
+                        body_fd=label_fd,
+                        body_fd_denies_write=True,
+                    )
     except Exception:
         logger.warning(
             "aws-control: this install's backup label could not be published; another "
@@ -3802,12 +3837,48 @@ def _record_skip(
     )
 
 
+def _refuse_snapshot_without_a_producer_held_payload(account: str, *, caller: str) -> None:
+    """Refuse a snapshot backup where its payload cannot be held from creation.
+
+    The archive path creates its own file and holds it, so on every platform the
+    bytes that are digested are the bytes that are uploaded. The snapshot path
+    cannot: ``snapshot_main`` and :func:`snapshot.prepare_redacted_copy` create and
+    close the payload by name, and only afterwards can this module open it. On POSIX
+    that gap is covered by the sandbox mask over the staging leaf, which removes the
+    writer entirely. On a platform with no such mask the writer is present, and the
+    checks available after the fact -- a regular file, singly named, owned by this
+    user -- all pass for a same-user replacement, while the fingerprint and the
+    upload then read the substituted descriptor and agree with each other.
+
+    So the run stops here, before a payload exists, rather than uploading bytes whose
+    provenance cannot be established. Refusing is the conservative direction: an
+    operator who gets no backup knows they have none, whereas one who gets a
+    substituted backup believes they are covered and finds out at restore, off-host,
+    with nothing left to compare against.
+
+    Archive backups are not affected by this refusal. Whether the sessions kind runs
+    on a given platform is a separate capability question with its own answer, so
+    neither this refusal nor its prose speaks for it. Removing this refusal is tracked
+    as producer-owned deny-write handles for both snapshot producers.
+
+    The same condition is readable BEFORE a run starts, through
+    :func:`kind_unavailable_reason`, which quotes this refusal's own reason. That
+    matters more than it looks: without it the route starts a run, this helper raises
+    inside the worker, and the owner gets a failed run record -- which reads like a
+    broken backup rather than a platform that never offered the feature.
+    """
+    if storage.body_bytes_can_be_held_from_creation():
+        return
+    _refuse_upload(account, _NO_HELD_PAYLOAD_REASON, caller=caller)
+
+
 def run_snapshot_backup(
     account: str, profile: str, region: str, bucket: str, *, caller: str
 ) -> dict[str, Any]:
     """Build a snapshot archive and push it. Returns the run record."""
+    _refuse_snapshot_without_a_producer_held_payload(account, caller=caller)
     identity = install_identity()
-    with _pinned_staging("kc-backup-") as (tmp_dir, dir_fd):
+    with storage.pinned_staging("kc-backup-") as (tmp_dir, dir_fd):
         tmp = str(tmp_dir)
         rc = snapshot_main([tmp, "--keep", "1"])
         if rc != 0:
@@ -3840,7 +3911,7 @@ def run_snapshot_backup(
         # nothing measured. ``_open_pinned_archive_fd`` also refuses a link or a
         # multiply-named file AT the name, which is what a bundle replaced before
         # this point would be.
-        payload_fd = _open_pinned_archive_fd(dir_fd, payload.name)
+        payload_fd = _open_pinned_archive_fd(tmp_dir, dir_fd, payload.name)
         try:
             # Does this archive carry anything the drive does not already hold? Taken
             # over the PAYLOAD, so it is the bytes that would actually leave that are
@@ -3907,6 +3978,7 @@ def run_snapshot_backup(
                 account=account,
                 timeout=_PUSH_TIMEOUT_SECS,
                 body_fd=payload_fd,
+                body_fd_denies_write=True,
             )
             record = _record_run(
                 account,
@@ -3978,6 +4050,22 @@ _NO_PINNING_REASON = (
     "archived and uploaded, so the backup is refused instead."
 )
 
+#: Why the snapshot backup refuses where its payload cannot be held from creation.
+#: One string, quoted by both the run-time refusal and
+#: :func:`kind_unavailable_reason`, so the answer an owner gets before pressing the
+#: button is the same sentence the refusal would have raised.
+#:
+#: It states only the snapshot kind's own ground. It deliberately makes no claim
+#: about whether the sessions kind runs here, because that is a separate capability
+#: with a separate answer -- and on a platform reaching this refusal the sessions
+#: kind is typically refused too, for the traversal reason above.
+_NO_HELD_PAYLOAD_REASON = (
+    "snapshot backups are unavailable on this platform: the snapshot payload is"
+    " written by the snapshot builder before this app can hold it open, and"
+    " without that hold another process running as the same user could replace"
+    " the file between the build and the upload without being detected"
+)
+
 
 #: Flags for creating the staging archive ourselves, relative to a pinned
 #: directory descriptor. ``O_EXCL`` is what refuses an entry a watcher planted at
@@ -3991,8 +4079,8 @@ _ARCHIVE_CREATE_FLAGS = (
 )
 
 
-def _create_pinned_archive_fd(dir_fd: int, name: str) -> int:
-    """Create ``name`` under *dir_fd* and return the only descriptor for it.
+def _create_pinned_archive_fd(staging: Path, dir_fd: int, name: str) -> int:
+    """Create ``name`` in *staging* under *dir_fd* and return its only descriptor.
 
     This is the first half of binding the archive's bytes to one inode. The tar is
     written THROUGH this descriptor, so no name is resolved to create it; the
@@ -4000,28 +4088,39 @@ def _create_pinned_archive_fd(dir_fd: int, name: str) -> int:
     same descriptor afterwards. A same-UID process that replaces the name later
     changes what the NAME reaches and nothing this run reads.
 
+    *staging* is the directory *dir_fd* pins, and it is used only where ``os.open``
+    takes no ``dir_fd`` -- the descriptor is the authority everywhere it can be. It
+    is a parameter rather than a lookup from the descriptor so that every caller
+    that pins a directory can call this, and so there is no second place that has
+    to be kept in step with the pin's lifetime.
+
     0o600 because the staging directory is ``mkdtemp``'s 0700 and the file inside
     it has no reason to be wider. Raises ``OSError`` when the name is already
     taken, which is the refusal, not a retry: a name that exists in a directory
     this process just created is somebody else's.
+
+    On Windows the create also DENIES other processes write access for the whole
+    life of this descriptor, through :func:`platform_compat.create_file_deny_write`.
+    That is not the same protection as the pin and it is needed for a different
+    reason: Windows uploads by NAME, and between this create and that upload sit the
+    tar write, the entry-set digest and two network round trips. A same-UID process
+    that rewrites the bytes anywhere in that span is invisible to every later check,
+    because they all read this descriptor and so agree with whatever it now holds.
+    Taking the refusal at the create is what makes the span covered rather than its
+    last moment. POSIX cannot express it and does not need it -- the sandbox mask
+    over the staging leaf has already removed the writer there.
     """
     if os.open in os.supports_dir_fd:
         return os.open(name, _ARCHIVE_CREATE_FLAGS, 0o600, dir_fd=dir_fd)
     # Windows has no ``dir_fd``. What stands in for it is the caller's held
     # directory handle: a directory with one open cannot be renamed or deleted,
     # nor can any directory above it, so the path this resolves cannot be
-    # re-pointed between the pin and this create. ``O_EXCL`` still refuses a
-    # planted entry at the name itself.
-    return os.open(os.path.join(_dir_fd_path[dir_fd], name), _ARCHIVE_CREATE_FLAGS, 0o600)
+    # re-pointed between the pin and this create. ``CREATE_NEW`` still refuses a
+    # planted entry at the name itself, as ``O_EXCL`` does on the other arm.
+    return platform_compat.create_file_deny_write(os.path.join(str(staging), name), 0o600)
 
 
-#: Windows-only bridge from a pinned directory descriptor back to its path,
-#: because ``os.open`` there takes no ``dir_fd``. Populated by
-#: :func:`_pinned_staging`, which owns both ends of the lifetime.
-_dir_fd_path: dict[int, str] = {}
-
-
-def _open_pinned_archive_fd(dir_fd: int, name: str) -> int:
+def _open_pinned_archive_fd(staging: Path, dir_fd: int, name: str) -> int:
     """Open an EXISTING ``name`` under *dir_fd* and prove it is a file of its own.
 
     The snapshot path needs this rather than :func:`_create_pinned_archive_fd`:
@@ -4029,6 +4128,10 @@ def _open_pinned_archive_fd(dir_fd: int, name: str) -> int:
     files, so the earliest this run can take hold of one is after it exists. The
     checks are the ones :func:`storage._verified_body_fd` makes, taken here so the
     fingerprints and the upload share one already-proven descriptor.
+
+    *staging* carries the same meaning as in :func:`_create_pinned_archive_fd`: the
+    directory the descriptor pins, consulted only where ``os.open`` cannot take a
+    ``dir_fd``.
 
     Raises ``OSError`` when the name is a symlink (``O_NOFOLLOW``) and
     ``ValueError`` when the descriptor is not a singly-named regular file owned by
@@ -4040,50 +4143,29 @@ def _open_pinned_archive_fd(dir_fd: int, name: str) -> int:
     if os.open in os.supports_dir_fd:
         fd = os.open(name, flags, dir_fd=dir_fd)
     else:
-        fd = os.open(os.path.join(_dir_fd_path[dir_fd], name), flags)
+        # Unreachable while the snapshot path refuses: this arm belongs to the
+        # platforms with no ``dir_fd``, which are exactly the platforms whose staging
+        # leaf has no mask, and
+        # ``_refuse_snapshot_without_a_producer_held_payload`` stops the run before a
+        # payload exists there. It asks for the deny-write anyway rather than leaving
+        # a plain open behind, but the request is NOT what makes this sound: the
+        # payload was created and closed by another module before this runs, which is
+        # the whole reason for the refusal. This is the right spelling for the day the
+        # producers hand over a descriptor they held themselves, not a second defence
+        # that could be mistaken for one.
+        fd = platform_compat.open_file_no_reparse(os.path.join(str(staging), name), deny_write=True)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("the staged archive is not a regular file")
         if info.st_nlink != 1:
             raise ValueError("the staged archive has more than one name")
-        if platform_compat.IS_POSIX and info.st_uid != os.getuid():
+        if not platform_compat.stat_owned_by_current_user(info):
             raise ValueError("the staged archive is owned by another user")
     except Exception:
         os.close(fd)
         raise
     return fd
-
-
-@contextlib.contextmanager
-def _pinned_staging(prefix: str) -> Iterator[tuple[Path, int]]:
-    """A private staging directory plus a descriptor that PINS it.
-
-    Yields ``(path, dir_fd)``. Every archive this module builds goes here, and the
-    descriptor is what the build and the upload address the archive through, so
-    the directory's NAME is never resolved again after this returns.
-
-    ``mkdtemp`` for the 0700 mode, then :func:`platform_compat.pin_directory` to
-    refuse a link at the name and to hold the directory. On Windows holding it is
-    the protection (no rename, no delete, of it or of anything above it); on POSIX
-    the descriptor is a resolution root for our own opens, which is the stronger
-    guarantee for what this needs -- it does not matter whether the directory is
-    renamed if nothing resolves its name again.
-    """
-    tmp = tempfile.mkdtemp(prefix=prefix)
-    dir_fd = -1
-    try:
-        dir_fd = platform_compat.pin_directory(tmp)
-        if not platform_compat.IS_POSIX:
-            _dir_fd_path[dir_fd] = tmp
-        yield Path(tmp), dir_fd
-    finally:
-        if dir_fd >= 0:
-            _dir_fd_path.pop(dir_fd, None)
-            # Before the removal: on Windows the pin is exactly what would make
-            # the rmtree fail.
-            os.close(dir_fd)
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _add_pinned(tar: tarfile.TarFile, dir_fd: int, arc_prefix: str, depth: int) -> int:
@@ -5314,7 +5396,7 @@ def run_sessions_backup(
     # says which of those happened.
     layer_b_scope = "cli" if layer_b and not layer_b_conversations else ""
     _audit_layer_b_decision(account, layer_b, conversations=layer_b_conversations, caller=caller)
-    with _pinned_staging("kc-backup-") as (tmp, dir_fd):
+    with storage.pinned_staging("kc-backup-") as (tmp, dir_fd):
         name = f"sessions-{_stamp()}.tar.gz"
         archive = tmp / name
         # The archive is created through a descriptor, not through its name, and
@@ -5326,7 +5408,7 @@ def run_sessions_backup(
         # `O_EXCL` also refuses an entry planted at the name before the tar opens,
         # which is what a plain `tarfile.open(path, "w:gz")` would have written
         # through.
-        archive_fd = _create_pinned_archive_fd(dir_fd, name)
+        archive_fd = _create_pinned_archive_fd(tmp, dir_fd, name)
         try:
             with os.fdopen(os.dup(archive_fd), "wb") as raw:
                 with tarfile.open(fileobj=raw, mode="w:gz") as tar:
@@ -5568,6 +5650,7 @@ def run_sessions_backup(
                     account=account,
                     timeout=_PUSH_TIMEOUT_SECS,
                     body_fd=archive_fd,
+                    body_fd_denies_write=True,
                 )
             record = _record_run(
                 account,
@@ -5726,9 +5809,16 @@ def kind_unavailable_reason(kind: str) -> str | None:
     Returns the prose reason so every surface quotes ONE explanation. Callers
     must treat a non-``None`` result as "offer this as unavailable", not as an
     error to log.
+
+    Both kinds are answered here, and each for its own reason: the sessions kind
+    needs descriptor-pinned traversal, the snapshot kind needs to hold its payload
+    from creation. A kind is unavailable when ITS OWN capability is missing, so one
+    being refused here says nothing about the other.
     """
     if kind == KIND_SESSIONS and not _CAN_PIN_TRAVERSAL:
         return _NO_PINNING_REASON
+    if kind == KIND_SNAPSHOT and not storage.body_bytes_can_be_held_from_creation():
+        return _NO_HELD_PAYLOAD_REASON
     return None
 
 
