@@ -463,7 +463,7 @@ def test_generated_view_keeps_lifecycle_ownership_out_of_the_agent_spec(native_t
     metadata = json.loads(_metadata_file(agents, prepared).read_text(encoding="utf-8"))
     assert metadata[projection._MANAGED_MARKER] == projection._MANAGED_MARKER_VALUE
     assert metadata[projection._MANAGED_CREW_HOME] == (home.parent / "crew").as_posix()
-    assert metadata[projection._MANAGED_WORK_DIR] == project.absolute().as_posix()
+    assert "x-kirocrew-work-dir" not in metadata
     assert metadata[projection._MANAGED_AGENT] == "custom"
     assert metadata[projection._MANAGED_SOURCE] == (agents / "custom.json").as_posix()
     assert (
@@ -903,19 +903,66 @@ def test_the_rotation_offset_is_not_a_constant_and_stays_in_range(native_tree):
     assert len(drawn) > 1, "a constant offset walks one prefix forever"
 
 
-def test_prune_reclaims_alias_whose_work_dir_was_deleted(native_tree, monkeypatch, tmp_path):
+def test_every_work_dir_shares_one_alias_per_agent(native_tree, tmp_path):
+    """The alias is named by the view, not by where it is spawned.
+
+    Every subagent and cron run spawns in its own directory. Keying the alias on
+    that directory wrote a full copy of every agent per run, and kiro-cli's
+    subagent tool lists every copy it finds in the agents directory.
+    """
     _home, agents, project = native_tree
-    gone = tmp_path / "gone-workdir"
-    gone.mkdir()
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
-    first = projection.prepare_native_skill_projection(gone)
+    runs = []
+    for n in range(5):
+        run_dir = tmp_path / f"subagent_{n:08x}"
+        run_dir.mkdir()
+        runs.append(projection.prepare_native_skill_projection(run_dir))
+    live = projection.prepare_native_skill_projection(project)
+    assert {run.agent("custom") for run in runs} == {live.agent("custom")}
+    views = list(agents.glob(f"{projection.NATIVE_SKILL_ALIAS_PREFIX}*.json"))
+    assert views == [_alias_file(agents, live)]
+
+
+def test_two_crew_homes_never_share_an_alias(native_tree, monkeypatch, tmp_path):
+    """Identical views from two data homes must not contend for one file.
+
+    A shared file would flip its ownership sidecar to whichever home spawned
+    last, so each home's cleanup would misjudge the other's live view.
+    """
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "data_home", lambda: tmp_path / "crew-a")
+    first = projection.prepare_native_skill_projection(project)
+    monkeypatch.setattr(projection, "data_home", lambda: tmp_path / "crew-b")
+    second = projection.prepare_native_skill_projection(project)
+    assert first.agent("custom") != second.agent("custom")
+    assert _alias_file(agents, first).exists()
+    assert _alias_file(agents, second).exists()
+
+
+def test_republishing_identical_view_keeps_the_file_in_place(native_tree, tmp_path):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
+    before = os.stat(_alias_file(agents, first))
+    other = tmp_path / "other"
+    other.mkdir()
+    second = projection.prepare_native_skill_projection(other)
+    after = os.stat(_alias_file(agents, second))
+    assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
+
+
+def test_editing_an_agent_publishes_a_new_alias_and_reclaims_the_old(native_tree):
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom","description":"v1"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
     stale = _alias_file(agents, first)
-    assert stale.exists()
     del first
     gc.collect()
-    shutil.rmtree(gone)
-    # A spawn for a still-live work_dir triggers the prune of the dead one.
-    projection.prepare_native_skill_projection(project)
+    source.write_text('{"name":"custom","description":"v2"}', encoding="utf-8")
+    second = projection.prepare_native_skill_projection(project)
+    assert _alias_file(agents, second) != stale
     assert not stale.exists()
 
 
@@ -931,7 +978,8 @@ def test_prune_reclaims_unused_alias_whose_work_dir_still_exists(native_tree, tm
     _home, agents, project = native_tree
     run_dir = tmp_path / "subagent_deadbeef"
     run_dir.mkdir()
-    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom","description":"old"}', encoding="utf-8")
     ended = projection.prepare_native_skill_projection(run_dir)
     alias = _alias_file(agents, ended)
     metadata = _metadata_file(agents, ended)
@@ -939,6 +987,7 @@ def test_prune_reclaims_unused_alias_whose_work_dir_still_exists(native_tree, tm
     gc.collect()
     assert run_dir.is_dir(), "the run directory is deliberately left in place"
 
+    source.write_text('{"name":"custom","description":"new"}', encoding="utf-8")
     projection.prepare_native_skill_projection(project)
     assert not alias.exists(), "an unused alias survived because its work dir still exists"
     assert not metadata.exists(), "the ownership sidecar outlived its alias"
@@ -970,6 +1019,10 @@ def test_prune_reclaims_at_least_as_many_aliases_as_one_spawn_publishes(
     left_behind = [_alias_file(agents, ended, n) for n in names]
     del ended
     gc.collect()
+    for name in names:
+        (agents / f"{name}.json").write_text(
+            json.dumps({"name": name, "description": "edited"}), encoding="utf-8"
+        )
 
     live = projection.prepare_native_skill_projection(project)
     assert live is not None
@@ -989,10 +1042,20 @@ def test_prune_drains_headroom_beyond_one_spawn_publishes(native_tree, monkeypat
         lambda **kw: [SimpleNamespace(name=n, filename=f"{n}.json", scope="global") for n in names],
     )
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 2)
+
+    def edit(version):
+        for name in names:
+            (agents / f"{name}.json").write_text(
+                json.dumps({"name": name, "description": version}), encoding="utf-8"
+            )
+
     run_dirs = [tmp_path / f"subagent_{n:08x}" for n in range(2)]
-    for run_dir in run_dirs:
+    ended = []
+    for n, run_dir in enumerate(run_dirs):
         run_dir.mkdir()
-    ended = [projection.prepare_native_skill_projection(run_dir) for run_dir in run_dirs]
+        edit(f"v{n}")
+        ended.append(projection.prepare_native_skill_projection(run_dir))
+    edit("live")
     backlog = [_alias_file(agents, prepared, name) for prepared in ended for name in names]
     del ended
     gc.collect()
@@ -1186,7 +1249,6 @@ def test_prune_never_touches_another_homes_alias(native_tree):
                 "name": foreign.stem,
                 projection._MANAGED_MARKER: projection._MANAGED_MARKER_VALUE,
                 projection._MANAGED_CREW_HOME: "/some/other/crew/home",
-                projection._MANAGED_WORK_DIR: "/nonexistent/workdir",
                 projection._MANAGED_AGENT: "ghost",
                 projection._MANAGED_SOURCE: "/nonexistent/workdir/.kiro/agents/ghost.json",
             }
@@ -1557,3 +1619,232 @@ def test_census_counts_what_the_reclaim_would_keep_and_remove(native_tree, tmp_p
     assert census["truncated"] == 1
     assert census["total"] == published + 1
     del live
+
+
+def test_boot_drain_pause_outlasts_the_lock_poll_cap():
+    """A spawn blocked on the publication lock polls with backoff up to the
+    lock's poll cap. A between-batch gap shorter than that cap can open and
+    close while the waiter sleeps, so it never takes the lock and runs into
+    the 2s acquisition ceiling instead."""
+    from kiro_crew import platform_compat
+
+    assert projection._DRAIN_BATCH_PAUSE_SECS > platform_compat._LOCK_POLL_MAX_SECS
+    assert projection._DRAIN_BATCH_PAUSE_SECS < projection._PROJECTION_LOCK_TIMEOUT_SECS
+
+
+def test_boot_drain_clears_a_backlog_past_the_per_spawn_cap(native_tree, monkeypatch):
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    # Every version stays held while the next is published, so no spawn prunes
+    # it; releasing them all at once leaves a backlog, as a capped prune does.
+    held = []
+    for n in range(7):
+        source.write_text(json.dumps({"name": "custom", "description": f"v{n}"}), encoding="utf-8")
+        held.append(projection.prepare_native_skill_projection(project))
+    backlog = [(_alias_file(agents, p), _metadata_file(agents, p)) for p in held]
+    del held
+    gc.collect()
+    assert all(alias.exists() and meta.exists() for alias, meta in backlog)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_RECLAIMS", 2)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 7
+    assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
+
+
+def test_boot_drain_keeps_aliases_a_live_projection_holds(native_tree):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    live = projection.prepare_native_skill_projection(project)
+    projection.drain_stale_aliases()
+    assert _alias_file(agents, live).exists()
+    assert _metadata_file(agents, live).exists()
+
+
+def test_boot_drain_removes_orphaned_sidecars_of_this_home_only(native_tree):
+    home, agents, _project = native_tree
+    metadata_dir = agents / projection._PROJECTION_METADATA_DIR_NAME
+    metadata_dir.mkdir()
+    ours = metadata_dir / f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{'a' * 24}.json"
+    theirs = metadata_dir / f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{'b' * 24}.json"
+    record = {projection._MANAGED_MARKER: projection._MANAGED_MARKER_VALUE}
+    ours.write_text(
+        json.dumps({**record, projection._MANAGED_CREW_HOME: (home.parent / "crew").as_posix()}),
+        encoding="utf-8",
+    )
+    theirs.write_text(
+        json.dumps({**record, projection._MANAGED_CREW_HOME: "/some/other/home"}),
+        encoding="utf-8",
+    )
+    kept_with_alias = metadata_dir / f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{'c' * 24}.json"
+    kept_with_alias.write_text(ours.read_text(), encoding="utf-8")
+    (agents / kept_with_alias.name).write_text("{}", encoding="utf-8")
+
+    assert projection.drain_stale_aliases() == 1
+    assert not ours.exists()
+    assert theirs.exists()
+    assert kept_with_alias.exists()
+
+
+def test_boot_drain_gives_up_after_consecutive_lock_misses(native_tree, monkeypatch):
+    _home, agents, _project = native_tree
+    attempts = []
+
+    def unavailable(_directory):
+        attempts.append(1)
+        raise OSError("held")
+
+    monkeypatch.setattr(projection, "_projection_alias_lock", unavailable)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+    assert projection.drain_stale_aliases() == 0
+    assert len(attempts) == projection._DRAIN_LOCK_ATTEMPTS
+
+
+def test_boot_drain_retries_a_batch_that_missed_the_lock(native_tree, monkeypatch):
+    """One contended batch at boot -- a spawn publishing while the drain
+    runs -- must not abandon the whole backlog until the next restart."""
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    held = []
+    for n in range(5):
+        source.write_text(json.dumps({"name": "custom", "description": f"v{n}"}), encoding="utf-8")
+        held.append(projection.prepare_native_skill_projection(project))
+    backlog = [(_alias_file(agents, p), _metadata_file(agents, p)) for p in held]
+    del held
+    gc.collect()
+    real_lock = projection._projection_alias_lock
+    outcomes = iter(["ok", "held", "ok", "ok", "ok", "ok"])
+
+    def flaky(directory):
+        if next(outcomes) == "held":
+            raise OSError("held")
+        return real_lock(directory)
+
+    monkeypatch.setattr(projection, "_projection_alias_lock", flaky)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_RECLAIMS", 2)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 5
+    assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
+
+
+def _released_backlog(agents, project, count):
+    """*count* stale aliases of one agent, each with its sidecar, no lease held."""
+    source = agents / "custom.json"
+    held = []
+    for n in range(count):
+        source.write_text(json.dumps({"name": "custom", "description": f"v{n}"}), encoding="utf-8")
+        held.append(projection.prepare_native_skill_projection(project))
+    backlog = [(_alias_file(agents, p), _metadata_file(agents, p)) for p in held]
+    del held
+    gc.collect()
+    assert all(alias.exists() and meta.exists() for alias, meta in backlog)
+    return backlog
+
+
+def _recorded_walks(monkeypatch):
+    """Every _PruneWalk the drain's batches return, in order."""
+    real_walk = projection._prune_stale_managed_aliases_walk
+    walks = []
+
+    def recording(directory, crew_home_id, **kwargs):
+        walk = real_walk(directory, crew_home_id, **kwargs)
+        walks.append(walk)
+        return walk
+
+    monkeypatch.setattr(projection, "_prune_stale_managed_aliases_walk", recording)
+    return walks
+
+
+def test_boot_drain_continues_past_a_batch_the_budget_cut_short(native_tree, monkeypatch):
+    """A batch that spends its time budget before reaching a reclaimable entry
+    returns zero, and that zero is not the end of the backlog: the per-spawn
+    prune walks from a random offset, so a prefix of kept or leased entries
+    can eat a whole budget. Only a batch that classified every candidate and
+    still found nothing means the sweep is done."""
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 5)
+    real_budget = projection._PRUNE_MAX_SECONDS_PER_RUN
+    walks = _recorded_walks(monkeypatch)
+    recording = projection._prune_stale_managed_aliases_walk
+
+    def starve_the_first_batch(directory, crew_home_id, **kwargs):
+        # A zero budget is spent at the first candidate, before any is classified.
+        monkeypatch.setattr(
+            projection, "_PRUNE_MAX_SECONDS_PER_RUN", 0.0 if not walks else real_budget
+        )
+        return recording(directory, crew_home_id, **kwargs)
+
+    monkeypatch.setattr(projection, "_prune_stale_managed_aliases_walk", starve_the_first_batch)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 5
+    assert walks[0] == projection._PruneWalk(reclaimed=0, exhaustive=False, listed=True)
+    assert walks[1].reclaimed == 5
+    assert walks[-1] == projection._PruneWalk(reclaimed=0, exhaustive=True, listed=True)
+    assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
+
+
+def test_boot_drain_ends_on_an_exhaustive_batch_that_reclaims_nothing(native_tree, monkeypatch):
+    """The continue-past-a-cut-short-batch rule must not turn a clean directory
+    into a thousand-batch walk: one batch that saw everything ends it."""
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    live = projection.prepare_native_skill_projection(project)
+    walks = _recorded_walks(monkeypatch)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 0
+    assert walks == [projection._PruneWalk(reclaimed=0, exhaustive=True, listed=True)]
+    assert _alias_file(agents, live).exists()
+
+
+def test_boot_drain_stops_when_the_alias_directory_cannot_be_listed(
+    native_tree, monkeypatch, caplog
+):
+    """An unlistable directory is not a cut-short walk to retry: every later
+    batch would fail the same way, so the drain stops and says why."""
+    import errno
+
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 2)
+    walks = _recorded_walks(monkeypatch)
+    real_glob = projection.Path.glob
+
+    def unlistable(self, pattern, *args, **kwargs):
+        if self == agents:
+            raise OSError(errno.EIO, "input/output error", str(self))
+        return real_glob(self, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(projection.Path, "glob", unlistable)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert projection.drain_stale_aliases() == 0
+    assert walks == [projection._PruneWalk(reclaimed=0, exhaustive=False, listed=False)]
+    assert any("cannot list" in record.getMessage() for record in caplog.records)
+    assert all(alias.exists() and meta.exists() for alias, meta in backlog)
+
+
+def test_boot_drain_names_the_error_it_gave_up_on(native_tree, monkeypatch, caplog):
+    """The lock helper raises OSError for a busy lock AND for a lock-file fault
+    (a symlinked lock, a permission error), and the two are the same type. The
+    drain retries both within the same bound, so the line it leaves behind must
+    carry the error rather than assert the lock was merely busy."""
+    _home, agents, _project = native_tree
+    attempts = []
+
+    def faulted(_directory):
+        attempts.append(1)
+        raise OSError("skill projection lock is a symlink or junction")
+
+    monkeypatch.setattr(projection, "_projection_alias_lock", faulted)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert projection.drain_stale_aliases() == 0
+    assert len(attempts) == projection._DRAIN_LOCK_ATTEMPTS
+    stopped = [r for r in caplog.records if "drain stopped" in r.getMessage()]
+    assert len(stopped) == 1
+    assert "symlink or junction" in stopped[0].getMessage()
+    assert "lock unavailable" not in stopped[0].getMessage()
