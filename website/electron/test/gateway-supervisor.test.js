@@ -128,7 +128,7 @@ function harness(overrides = {}) {
       ...(overrides.app || {}),
     },
     store,
-    BrowserWindow: class {},
+    BrowserWindow: overrides.BrowserWindow || class {},
     nativeTheme: { shouldUseDarkColors: false },
     dialog: overrides.dialog
       || { showMessageBox: async () => ({ response: 1 }) },
@@ -152,6 +152,7 @@ function harness(overrides = {}) {
       errors.push(message);
     },
     logPath: () => "/virtual/logs/gateway-launch.log",
+    predictLocalPort: overrides.predictLocalPort,
     fsMod,
     osMod: { homedir: () => "/virtual/home" },
     pathMod: path.posix,
@@ -452,6 +453,9 @@ async function spawnedSuccessor(built) {
   await supervisor.start();
   spawnCalls[0].child.emit("exit", 75, null);
   spawnCalls[1].child.emit("exit", 75, null);
+  // The port is read for an existing gateway before the successor is exec'd, so
+  // the spawn lands a turn after the event that asks for it.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor, "a successor copy of this app is spawned");
   successor.child.emit("spawn");
@@ -497,8 +501,13 @@ test("a second stale exit starts a fresh copy of the app and exits only once its
   assert.strictEqual(spawnCalls.filter((call) => call[0] !== APP_EXEC_PATH).length, 2,
     "the budget is one backend re-resolve per incident");
   assert.ok(state.execProbes.length >= 1, "the app executable is probed before restarting");
+  // The port is read for an existing gateway before the successor is exec'd, so
+  // the spawn lands a turn after the event that asks for it.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor, "a successor copy of this app is spawned");
+  assert.ok(requests.some((url) => url.endsWith("/api/ready")),
+    "the port is read before the handoff, so an existing gateway cannot be mistaken for the successor");
   assert.deepStrictEqual(successor[1], ["--some-flag"], "the successor gets this instance's arguments");
   assert.deepStrictEqual(successor[2], { detached: true, stdio: "ignore" });
   assert.strictEqual(state.lockReleases, 1, "the single-instance lock is released so the successor can win it");
@@ -527,6 +536,305 @@ test("a second stale exit starts a fresh copy of the app and exits only once its
   assert.deepStrictEqual(timers.pending, [], "the deadline is disarmed once the successor is confirmed");
   assert.ok(state.statuses.filter((entry) => entry === "status:Restarting Kiro Crew to finish the update…").length >= 2,
     "the restart announcement is re-sent on every poll so a splash that loaded late still shows it");
+});
+
+// Driving the failure dialog itself: the fake window records the document the
+// dialog loads and answers it the way the page does, by setting a title the
+// supervisor reads back. That makes the enable-retry click reachable without an
+// Electron runtime, so the states the user actually sees can be asserted rather
+// than inferred from the source.
+function clientOnlyClickHarness({ readyAnswers, actions }) {
+  const documents = [];
+  const queue = [...actions];
+  const state = { exits: [], lockReleases: 0 };
+
+  class DialogWindow {
+    constructor() { this.handlers = new Map(); }
+    setMenu() {}
+    on(event, handler) { this.handlers.set(event, handler); }
+    isDestroyed() { return false; }
+    loadURL(url) {
+      documents.push(decodeURIComponent(
+        String(url).replace(/^data:text\/html;charset=utf-8,/, ""),
+      ));
+      const action = queue.shift() || "quit";
+      setImmediate(() => {
+        const titled = this.handlers.get("page-title-updated");
+        if (titled) titled({}, `mc-action:${action}`);
+        const closed = this.handlers.get("closed");
+        if (closed) closed();
+      });
+    }
+  }
+
+  // Refuses this app's own status probe, so the client-only failure surfaces, and
+  // optionally ANSWERS the successor's readiness probe, which is what makes the
+  // handoff refuse before spawning anything.
+  const httpMod = {
+    get(url, _options, callback) {
+      const request = new EventEmitter();
+      request.destroy = () => {};
+      const isReady = String(url).includes("/api/ready");
+      queueMicrotask(() => {
+        if (isReady && readyAnswers) {
+          const response = new EventEmitter();
+          response.statusCode = 200;
+          response.resume = () => {};
+          if (typeof callback === "function") callback(response);
+          response.emit("data", "{}");
+          response.emit("end");
+          return;
+        }
+        request.emit("error", new Error("connection refused"));
+      });
+      return request;
+    },
+  };
+
+  const mainWindow = {
+    isDestroyed: () => false,
+    isMinimized: () => false,
+    restore() {},
+    show() {},
+    focus() {},
+    webContents: { loadFile() {}, send() {} },
+  };
+
+  const built = harness({
+    store: fakeStore({
+      runLocalGateway: false,
+      remoteHosts: { 7778: { host: "crew.example.com" } },
+    }),
+    port: 7778,
+    predictLocalPort: () => 5476,
+    BrowserWindow: DialogWindow,
+    httpMod,
+    mainWindow,
+    app: {
+      exit: (code) => state.exits.push(code),
+      releaseSingleInstanceLock: () => { state.lockReleases += 1; },
+      requestSingleInstanceLock: () => true,
+    },
+    processRef: {
+      platform: "test",
+      arch: "x64",
+      execPath: APP_EXEC_PATH,
+      argv: APP_ARGV,
+      env: { KIROCREW_HOME: "/virtual/kirocrew-home" },
+      resourcesPath: "/virtual/resources",
+      kill() { throw new Error("process kill must not run in this harness"); },
+    },
+    fsMod: {
+      constants: { X_OK: 1 },
+      mkdirSync() {},
+      // The app executable is present, so a re-exec is possible and the button
+      // is offered; nothing else on disk is.
+      accessSync(target) {
+        if (target === APP_EXEC_PATH) return;
+        const error = new Error("not found");
+        error.code = "ENOENT";
+        throw error;
+      },
+      existsSync() { return false; },
+      openSync() { return 41; },
+      closeSync() {},
+      readFileSync() { throw new Error("no log"); },
+    },
+  });
+
+  return { ...built, documents, mainWindow, state };
+}
+
+test("a Retry after an occupied-port refusal still names the port", async () => {
+  // Retry discards the failure record and startGateway builds a fresh one, so a
+  // busy port written only onto the old object would vanish -- and the rebuilt
+  // message would say this app is set not to start a gateway, which the click has
+  // already made false. The port is supervisor state for that reason.
+  const { supervisor, documents, mainWindow } = clientOnlyClickHarness({
+    readyAnswers: true,
+    actions: ["enable-retry", "retry", "quit"],
+  });
+
+  assert.strictEqual(await supervisor.start(), false);
+  await supervisor.connect(mainWindow);
+  for (let i = 0; i < 80 && documents.length < 3; i += 1) await flush();
+
+  assert.strictEqual(documents.length, 3, "the dialog reopens after the refusal and again after Retry");
+  const rebuilt = documents[2];
+  assert.match(rebuilt, /did not begin/, "the rebuilt record still reports the refusal");
+  assert.match(rebuilt, /port 5476/, "and still names the occupied port");
+  assert.doesNotMatch(
+    rebuilt,
+    /set not to start a gateway/,
+    "the setting is on by now, so that sentence must not come back",
+  );
+});
+
+test("a lost restart promotes Start Local Gateway too, because its own copy asks for it", async () => {
+  // The successor here is a fake EventEmitter, so ending it is what reaches the
+  // state a lost restart leaves behind -- no real readiness deadline has to
+  // elapse for the dialog to be driven to it.
+  const { supervisor, documents, mainWindow, spawnCalls } = clientOnlyClickHarness({
+    readyAnswers: false,
+    actions: ["enable-retry", "quit"],
+  });
+
+  assert.strictEqual(await supervisor.start(), false);
+  await supervisor.connect(mainWindow);
+  for (let i = 0; i < 60 && spawnCalls.length === 0; i += 1) await flush();
+  assert.strictEqual(spawnCalls.length, 1, "the click spawns one successor");
+  const { child } = spawnCalls[0];
+  child.exitCode = 1;
+  child.emit("exit", 1, null);
+  for (let i = 0; i < 200 && documents.length < 2; i += 1) await flush();
+
+  assert.strictEqual(documents.length, 2, "the dialog reopens after the lost restart");
+  const reopened = documents[1];
+  assert.match(reopened, /did not finish/, "this is the lost-restart state");
+  // This state's own paragraph ends "choose Start Local Gateway to try again", so
+  // the accent has to sit there. Gated on the busy port alone it stayed on Retry,
+  // which reaches only the crew the same message has just said is unreachable --
+  // so the highlighted control was the one that cannot help.
+  assert.match(reopened, /class="ok" onclick="act\('enable-retry'\)"/,
+    "Start Local Gateway carries the accent after a lost restart");
+  assert.doesNotMatch(reopened, /class="ok" onclick="act\('retry'\)"/,
+    "Retry must not keep the accent here either");
+  assert.strictEqual(
+    (reopened.match(/<button[^>]*onclick="act\('enable-retry'\)"/g) || []).length,
+    1,
+    "promoted, it must not also render as a secondary",
+  );
+  // Same set and same order as the busy state, so only the accent differs between
+  // two openings of a dialog that carries the same title.
+  assert.match(
+    reopened,
+    /act\('configure-remote'\)[\s\S]*?onclick="act\('retry'\)">Retry crew\.example\.com[\s\S]*?act\('quit'\)/,
+    "the demoted Retry keeps its slot and names the crew",
+  );
+});
+
+test("clicking Start Local Gateway onto an occupied port names the port and keeps the button", async () => {
+  // predictLocalPort answers 5476 and something is already serving there. Nothing
+  // is spawned and nothing is torn down, so the user must not be told a restart
+  // ran, and the button must not be spent: freeing that port is outside this app
+  // and makes the same click work.
+  const { supervisor, documents, mainWindow, state, spawnCalls } = clientOnlyClickHarness({
+    readyAnswers: true,
+    actions: ["enable-retry", "quit"],
+  });
+
+  assert.strictEqual(await supervisor.start(), false);
+  await supervisor.connect(mainWindow);
+  // The reopen is dispatched from the refusal callback rather than awaited by
+  // connect(), so wait for the document itself. Bounded, so a reopen that never
+  // happens fails the assertion below instead of hanging.
+  for (let i = 0; i < 50 && documents.length < 2; i += 1) await flush();
+
+  assert.strictEqual(documents.length, 2, "the dialog reopens after the refused handoff");
+  const [first, second] = documents;
+  assert.match(first, /Start Local Gateway/, "the first dialog offers the button");
+
+  assert.match(second, /did not begin/, "the reopened dialog says nothing restarted");
+  assert.match(second, /port 5476/, "it names the port that is occupied");
+  assert.doesNotMatch(second, /port 7778 is already served/,
+    "the occupied port is the successor's, not this process's own");
+  assert.doesNotMatch(second, /did not finish/,
+    "it must not report a restart that never happened");
+  assert.match(second, /enable-retry/,
+    "the button survives, because the occupied port is not this app's to fix");
+  // The message asks for Start Local Gateway, and Retry reaches only the crew
+  // that is already unreachable -- so the accent has to sit on the action the
+  // sentence names, or the colouring points the eye at the one that cannot work.
+  assert.match(second, /class="ok" onclick="act\('enable-retry'\)"/,
+    "Start Local Gateway is the primary action in this state");
+  assert.doesNotMatch(second, /class="ok" onclick="act\('retry'\)"/,
+    "Retry must not keep the accent here");
+  // Promoted to primary, it must not also render as a secondary: one control. The
+  // count is over BUTTONS, since the Enter key binding names the same action.
+  assert.strictEqual(
+    (second.match(/<button[^>]*onclick="act\('enable-retry'\)"/g) || []).length,
+    1,
+    "Start Local Gateway appears as exactly one button",
+  );
+  // Moving the accent must not remove the control: this same message still tells
+  // the user to repair the tunnel and "then retry to reach ... again", so a
+  // window without a Retry button leaves that sentence naming nothing, and a
+  // user who has just fixed the tunnel can only quit. Demoted, not dropped --
+  // which also keeps the button SET stable between two openings of a dialog that
+  // carries the same title, so an accent that moves cannot turn a habit press
+  // into a different action.
+  //
+  // Demoted, it is the one button whose target is ambiguous: the sentence above
+  // it is about a local start that just refused, so a bare "Retry" reads as
+  // retrying THAT. The label names the crew instead.
+  assert.match(
+    second,
+    /<button class="cancel" onclick="act\('retry'\)">Retry crew\.example\.com<\/button>/,
+    "Retry stays available as a secondary and names the crew it reaches",
+  );
+  // Same slot the other state gives Start Local Gateway, so the row reads
+  // primary / Edit Remote Crew / the other action / Quit in BOTH states: the set
+  // and the order both hold still while only the accent moves.
+  assert.match(
+    second,
+    /act\('configure-remote'\)[\s\S]*?onclick="act\('retry'\)">Retry[\s\S]*?act\('quit'\)/,
+    "the demoted Retry sits between Edit Remote Crew and Quit",
+  );
+  assert.strictEqual(
+    (second.match(/<button[^>]*onclick="act\('retry'\)"/g) || []).length,
+    1,
+    "Retry appears as exactly one button",
+  );
+
+  assert.deepStrictEqual(state.exits, [], "this instance keeps running");
+  assert.strictEqual(state.lockReleases, 0, "nothing was torn down");
+  assert.strictEqual(successorCall(spawnCalls), undefined, "no successor is exec'd");
+});
+
+test("a gateway already answering on the successor's port abandons the handoff", async () => {
+  const { supervisor, spawnCalls, logs, state, timers } = staleBundleHarness();
+
+  await supervisor.start();
+  spawnCalls[0].child.emit("exit", 75, null);
+  // Something else is serving on the port the successor would bind: a gateway a
+  // terminal started, or a side-by-side install. Its readiness is indistinguishable
+  // from a successor's, so confirming on it would exit this instance on a
+  // stranger's liveness -- and if the successor then died during initialization,
+  // nothing would be left running at all.
+  state.http.status = 200;
+  state.http.body = JSON.stringify({ ready: true });
+  spawnCalls[1].child.emit("exit", 75, null);
+  await flush();
+
+  assert.strictEqual(successorCall(spawnCalls), undefined,
+    "no successor is exec'd, because its readiness could not be told from the gateway already there");
+  assert.deepStrictEqual(state.exits, [], "this instance keeps running");
+  assert.strictEqual(state.lockReleases, 0, "the single-instance lock is kept, so a later manual launch still routes here");
+  assert.ok(!timers.pending.some((timer) => timer.ms === SUCCESSOR_READY_TIMEOUT_MS),
+    "no handoff wait is armed for a handoff that never began");
+  assert.ok(logs.some((line) => line.includes("already has a responder") && line.includes("surfacing the failure")),
+    "the refusal is logged");
+});
+
+test("a legacy gateway answering 404 on the successor's port also abandons the handoff", async () => {
+  const { supervisor, spawnCalls, logs, state } = staleBundleHarness();
+
+  await supervisor.start();
+  spawnCalls[0].child.emit("exit", 75, null);
+  // A gateway too old to serve the readiness endpoint answers 404 there. The
+  // readiness classifier calls that "unknown", the same answer a refused
+  // connection gives, so a check written on the classifier would read this
+  // occupied port as an empty one and hand a successor a port someone holds.
+  state.http.status = 404;
+  state.http.body = "not found";
+  spawnCalls[1].child.emit("exit", 75, null);
+  await flush();
+
+  assert.strictEqual(successorCall(spawnCalls), undefined,
+    "no successor is exec'd: a 404 is a responder, not an empty port");
+  assert.deepStrictEqual(state.exits, [], "this instance keeps running");
+  assert.strictEqual(state.lockReleases, 0, "the single-instance lock is kept");
+  assert.ok(logs.some((line) => line.includes("already has a responder")));
 });
 
 test("a successor whose gateway is still booting (503 starting) also counts as alive", async () => {
@@ -616,6 +924,8 @@ test("a bundle pruned after the probe fails the successor spawn and falls back t
   await supervisor.start();
   spawnCalls[0].child.emit("exit", 75, null);
   spawnCalls[1].child.emit("exit", 75, null);
+  // The port is read for an existing gateway before the successor is exec'd.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor);
   assert.deepStrictEqual(state.exits, []);
@@ -645,6 +955,8 @@ test("a pruned bundle whose app executable survived still restarts the app", asy
   assert.strictEqual(spawnCalls.length, 2);
   spawnCalls[1].child.emit("error", enoent);
 
+  // The port is read for an existing gateway before the successor is exec'd.
+  await flush();
   const successor = successorCall(spawnCalls);
   assert.ok(successor);
   successor.child.emit("spawn");

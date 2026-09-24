@@ -19,6 +19,33 @@ function migrateRemoteHostConfig(store, port) {
 }
 
 /**
+ * Which port a legacy `remoteHost` should be keyed under.
+ *
+ * The entry carries a host and no port, so this key is what makes the crew
+ * visible to every per-port lookup -- and it has to be the port this launch will
+ * actually target, or the launch runs against a port whose remote host is
+ * recorded somewhere else. An explicit `KIROCREW_PORT` outranks selection, so it
+ * outranks this too, so an override that the launch will actually bind is taken
+ * over the configured port. It still has to be a port this app can bind: an
+ * unselectable override is refused before it reaches here, and keying a legacy
+ * crew under one anyway is what let `remoteHosts["80"]` exist -- the entry whose
+ * missed lookup makes a tunnelled crew read as local and leaks the internal
+ * secret to it. Otherwise the answer matches what selection reaches with no crew
+ * in the store, which is the state a legacy entry implies.
+ *
+ * @param {object} input
+ * @param {{get: (key: string) => unknown}} input.store
+ * @param {number} input.envPort  usable `KIROCREW_PORT`, or 0 when absent.
+ * @param {number|null} input.configuredPort  port from `dashboard.url`, if any.
+ * @returns {number}
+ */
+function legacyMigrationPort({ store, envPort, configuredPort }) {
+  if (isSelectablePort(envPort)) return envPort;
+  if (isSelectablePort(configuredPort)) return configuredPort;
+  return fallbackLocalPort(store);
+}
+
+/**
  * The one port this app must never SELECT as a launch target.
  *
  * The shell reaches its gateway over `http://localhost:<port>`, and
@@ -48,9 +75,36 @@ function isSelectablePort(port) {
 }
 
 /**
+ * Does one `remoteHosts` entry name a machine to reach? Entries holding only a
+ * `defaultName` are window-title settings rather than a remote target. Both
+ * readers in this module share it, so the whole-store scan and the per-port
+ * question cannot drift apart.
+ *
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+function hasHost(config) {
+  return typeof config?.host === "string" && config.host !== "";
+}
+
+/**
+ * Is this port the local end of a link to a crew this app is configured to
+ * reach?
+ *
+ * Selectability is a separate question: a port can name a crew and still be one
+ * this app declines to target.
+ *
+ * @param {{get: (key: string) => unknown}} store
+ * @param {unknown} port
+ * @returns {boolean}
+ */
+function namesConfiguredCrew(store, port) {
+  return hasHost(getRemoteHostConfig(store, port));
+}
+
+/**
  * Port of a remote crew this app is configured to reach, or null when none is
- * configured. Entries holding only a `defaultName` are window-title settings
- * rather than a remote target, so they are skipped.
+ * configured.
  *
  * Ports are compared numerically and the lowest wins, so the answer is stable
  * for a given store instead of depending on key insertion order.
@@ -62,7 +116,7 @@ function remoteHostPort(store) {
   const hosts = store.get("remoteHosts") || {};
   let lowest = null;
   for (const [key, config] of Object.entries(hosts)) {
-    if (!config || typeof config.host !== "string" || config.host === "") continue;
+    if (!hasHost(config)) continue;
     // Only a canonical decimal key names a port. parseInt alone reads
     // "5477-old" as 5477, which would dial a port whose own entry does not
     // exist -- so the launch would carry no host for the port it targeted.
@@ -101,10 +155,115 @@ function setRemoteHostConfig(store, port, { host, binPath, remotePort, remotePat
   store.set("remoteHosts", hosts);
 }
 
+/** Port a launch falls back to when no stored record names a better one. */
+const DEFAULT_PORT = 5476;
+
+/** How far above `DEFAULT_PORT` to look for a port no configured crew claims. */
+const FALLBACK_SCAN_PORTS = 64;
+
+/**
+ * A local port to bind that no configured crew claims.
+ *
+ * `DEFAULT_PORT` is the product default, which makes it both the likeliest free
+ * port and the likeliest local end of a tunnel. Binding a port a crew claims is
+ * the shadowing this module refuses everywhere else, so the search walks upward
+ * over selectable ports until one is unclaimed.
+ *
+ * Returns `DEFAULT_PORT` when every port in the window is claimed: a defined
+ * answer beats one that depends on how far the search happened to reach, and a
+ * store naming sixty-four consecutive crews is a configuration to report rather
+ * than one to out-guess.
+ *
+ * @param {{get: (key: string) => unknown}} store
+ * @param {(message: string) => void} [log]
+ * @returns {number}
+ */
+function fallbackLocalPort(store, log = () => {}) {
+  const limit = DEFAULT_PORT + FALLBACK_SCAN_PORTS;
+  for (let port = DEFAULT_PORT; port < limit; port += 1) {
+    if (!isSelectablePort(port)) continue;
+    if (namesConfiguredCrew(store, port)) continue;
+    if (port !== DEFAULT_PORT) {
+      log("A remote crew is configured on " + DEFAULT_PORT + "; using " + port + " instead");
+    }
+    return port;
+  }
+  log(
+    "Every port from " + DEFAULT_PORT + " to " + (limit - 1) + " names a configured crew; "
+    + "using " + DEFAULT_PORT + " and leaving the collision visible",
+  );
+  return DEFAULT_PORT;
+}
+
+/**
+ * Which port this launch targets, given the dashboard record and the
+ * local-gateway setting.
+ *
+ * Pure: every input arrives as an argument, so the whole decision is testable
+ * without Electron.
+ *
+ * @param {object} input
+ * @param {{get: (key: string) => unknown}} input.store
+ * @param {number|null} input.configuredPort  port from `dashboard.url`, if any.
+ * @param {boolean} input.localGatewayEnabled  the "Run a local gateway" setting.
+ * @param {(message: string) => void} [input.log]
+ * @returns {number}
+ */
+function selectLaunchPort({ store, configuredPort, localGatewayEnabled, log = () => {} }) {
+  if (!localGatewayEnabled) {
+    // A dashboard.url naming a port that has no remote host of its own records a
+    // backend which will not run here: nothing binds it and there is no host to
+    // mint a token from. A machine switched from local to remote-only keeps
+    // exactly that record, so honouring it would rebuild the dead end the
+    // opt-out is meant to avoid. A dashboard.url that DOES name a configured
+    // crew still wins -- that is the user choosing between crews rather than a
+    // leftover.
+    if (
+      configuredPort
+      && isSelectablePort(configuredPort)
+      && namesConfiguredCrew(store, configuredPort)
+    ) {
+      return configuredPort;
+    }
+    const remotePort = remoteHostPort(store);
+    if (remotePort) {
+      log("Local gateway is off; targeting the configured remote crew on port " + remotePort);
+      return remotePort;
+    }
+    // No crew is configured, so there is no better target than the local
+    // record: naming the port the user configured beats naming the default.
+  } else if (configuredPort && namesConfiguredCrew(store, configuredPort)) {
+    // With the setting on, this launch stands a gateway up on the port it
+    // selects. A dashboard.url whose port has a configured crew records the
+    // local end of a link to that crew, so binding it shadows that crew's
+    // identity on a port the user did not choose for a local gateway -- and the
+    // supervisor's conflict resolver reads the same entry, so it classifies the
+    // gateway this app itself started as foreign. The user asked for a gateway
+    // on this machine and that record does not name one, so fall back.
+    const fallback = fallbackLocalPort(store, log);
+    log(
+      "Ignoring the dashboard.url port " + configuredPort
+      + " because a remote crew is configured there; using " + fallback,
+    );
+    return fallback;
+  }
+
+  // Selectability gates this exit too. Both branches above refuse an
+  // unselectable port, so honouring one here is the only way a stored 80
+  // reaches a launch -- and 80 is exactly the target whose URL drops its port,
+  // which is what makes a remote link read as local.
+  if (configuredPort && isSelectablePort(configuredPort)) return configuredPort;
+  const fallback = fallbackLocalPort(store, log);
+  log("No usable dashboard.url port in the data home, falling back to " + fallback);
+  return fallback;
+}
+
 module.exports = {
   isSelectablePort,
+  legacyMigrationPort,
   migrateRemoteHostConfig,
   remoteHostPort,
   getRemoteHostConfig,
+  selectLaunchPort,
   setRemoteHostConfig,
 };

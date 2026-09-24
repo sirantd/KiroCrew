@@ -175,7 +175,7 @@ test("describeGatewayFailure: the disabled case names the port and both ways out
 // #6138: with the launch aimed at a configured remote crew, this text must name
 // that target and must NOT offer to start a gateway here -- the spawn binds the
 // crew's own port, so the offer the dialog hides cannot be promised in words.
-test("describeGatewayFailure: a remote target is named and no local start offered", () => {
+test("describeGatewayFailure: a remote target is named, not the generic wording", () => {
   const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
   assert.match(s, /a\.example\.com/);
   assert.match(s, /7778/);
@@ -185,18 +185,149 @@ test("describeGatewayFailure: a remote target is named and no local start offere
   assert.doesNotMatch(s, /could not be launched|exited on launch|failed to start/);
 });
 
-// The dialog withholds its start-a-gateway button on a crew's port, and the page
-// that owns the choice is served by a gateway, so this sentence is the only exit
-// the state has. Without it the user is left with a Retry that cannot succeed.
-test("describeGatewayFailure: a remote target names a way to run one here anyway", () => {
-  const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
+// The page that owns the choice is served by a gateway, so the dialog's button is
+// the ordinary way back. The message names exactly one exit: the composer already
+// knows which one it is rendering, so making the reader resolve a branch at the
+// moment of failure hands them work the system had already done.
+test("describeGatewayFailure: an offered button is the named exit", () => {
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com", canStartHere: true,
+  });
+  assert.match(s, /choose Start Local Gateway/);
+  // The button restarts the app rather than binding this port, and a user who is
+  // not told that reads the restart as a crash.
+  assert.match(s, /restarts the app/);
+  // "a port it can serve here" made a reader carry two senses of "port" and two
+  // of "local" through one paragraph, the crew's own and this machine's.
+  assert.match(s, /free port on this computer/);
+  // The button writes a setting that persists, and a reader who cannot see how to
+  // undo it reads the only offered exit as a one-way door. Settings is reachable
+  // once a gateway serves, which is exactly the state the button produces, so the
+  // way back belongs in the sentence that asks for the click.
+  assert.match(s, /turn that setting back off in Settings/);
+  // The reader clicked hesitantly, unsure whether their work lives on the other
+  // machine and would vanish. The button starts a second, separate gateway, so
+  // the sentence that asks for the click says what happens to the crew's sessions.
+  assert.match(s, /sessions on a\.example\.com/);
+  assert.match(s, /stay there/);
+  // Retry is ambiguous once a dialog carries two failures, so the crew advice
+  // names what retrying reaches.
+  assert.match(s, /retry to reach a\.example\.com/);
+  // Naming the manual route beside an offered button is what sent users through
+  // it unnecessarily.
+  assert.doesNotMatch(s, /KIROCREW_PORT/);
+});
+
+// Both remaining states withhold the button, and they must not share wording: a
+// user who clicked it and watched the restart run is told something they know to
+// be false if the message says restarting is unavailable.
+test("describeGatewayFailure: the post-click states drop the clause the click made false", () => {
+  // Using the button turns the setting on, so "set not to start a gateway on this
+  // machine" is false afterwards. A paragraph asserting that AND "the setting
+  // stays on" cannot be reconciled by a reader, and it lands exactly where they
+  // need the exit. Both post-click states describe the launch instead.
+  const base = { disabled: true, port: 7778, remoteHost: "a.example.com", canStartHere: false };
+  for (const [label, extra] of [
+    ["busy port", { canStartHere: true, localStartPortBusy: 5476 }],
+    ["failed attempt", { localStartFailed: true }],
+  ]) {
+    const s = describeGatewayFailure({ ...base, ...extra });
+    assert.match(s, /setting stays on/, label);
+    assert.doesNotMatch(s, /set not to start a gateway/, label);
+    assert.match(s, /this launch did not start one here/, label);
+  }
+  // Before any click the clause is true and stays.
+  const offered = describeGatewayFailure({ ...base, canStartHere: true });
+  assert.match(offered, /set not to start a gateway/);
+  assert.doesNotMatch(offered, /this launch did not start one here/);
+});
+
+test("describeGatewayFailure: a lost restart outranks a port that was busy earlier", () => {
+  // The record survives every attempt. A run that reached a restart and lost it
+  // is the newer fact, so reporting the earlier busy port would send the user to
+  // a button this failure has just withdrawn.
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com",
+    canStartHere: false, localStartFailed: true, localStartPortBusy: 5476,
+  });
+  assert.match(s, /did not finish/);
+  assert.doesNotMatch(s, /did not begin/);
+  assert.doesNotMatch(s, /choose Start Local Gateway again/);
+});
+
+test("describeGatewayFailure: an occupied port is named, not reported as a failed restart", () => {
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com",
+    canStartHere: true, localStartPortBusy: 5476,
+  });
+  // The port is the actionable fact, and it is not this app's port.
+  assert.match(s, /port 5476/);
+  assert.match(s, /did not begin/);
+  // The title names the crew's port, so this one says which machine it is on:
+  // two bare numbers in one dialog read as one.
+  assert.match(s, /port 5476 on this computer/);
+  // "the setting" is a guess at which setting; name it.
+  assert.match(s, /"Run a local gateway" setting stays on/);
+  // Same reason the failed attempt leads: the reopened dialog must not look
+  // unchanged.
+  assert.ok(s.startsWith("Starting a local gateway here did not begin"));
+  // Nothing restarted, so the wording for a restart that ran must not appear.
+  assert.doesNotMatch(s, /did not finish/);
+  assert.doesNotMatch(s, /restarted app never served one/);
+  // Freeing the port makes the same click work, so the button is still named.
+  assert.match(s, /choose Start Local Gateway again/);
+  // "Stop whatever is on port 5476" is an instruction only a reader who already
+  // knows how to find a listener can carry out; for everyone else it is the one
+  // exit this state names and it is unusable. So the likeliest occupant is named
+  // -- an orphan from a terminal-started Kiro Crew, which is also what the
+  // retired-flag path says produces it -- together with an action anyone can take.
+  assert.match(s, /another Kiro Crew started from a terminal/);
+  assert.match(s, /quit that one/);
+  assert.doesNotMatch(s, /Stop whatever is on port/);
+});
+
+test("describeGatewayFailure: a failed local-start attempt is acknowledged, not denied", () => {
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com",
+    canStartHere: false, localStartFailed: true,
+  });
+  assert.match(s, /did not finish/);
+  assert.match(s, /"Run a local gateway" setting stays on/);
+  // The remedy has to name the control that carries it out. "launching Kiro Crew
+  // again" left a reader unsure whether Quit was the way to do that, or whether
+  // the missing button was an accident.
+  assert.match(s, /choose Start Local Gateway to try again/);
+  assert.doesNotMatch(s, /choose Quit and then open Kiro Crew again/);
+  // The acknowledgement has to LEAD. Every branch shares the crew advice, so a
+  // reopened dialog that starts with it repeats three identical sentences and
+  // reads as nothing having happened, which buries the one thing that changed.
+  const acknowledged = s.indexOf("did not finish");
+  const crewAdvice = s.indexOf("Nothing is answering at");
+  assert.ok(acknowledged >= 0 && crewAdvice >= 0, "both parts present");
+  assert.ok(
+    acknowledged < crewAdvice,
+    "the acknowledgement must precede the shared crew advice",
+  );
+  assert.ok(s.startsWith("Starting a local gateway here did not finish"));
+  // Denying the attempt is the defect: the restart did happen.
+  assert.doesNotMatch(s, /not available here/);
+});
+
+test("describeGatewayFailure: a withheld button leaves the explicit-port route", () => {
+  const s = describeGatewayFailure({
+    disabled: true, port: 7778, remoteHost: "a.example.com", canStartHere: false,
+  });
   assert.match(s, /KIROCREW_PORT/);
   assert.match(s, /no remote host configured/);
-  // BOTH steps, or the instruction under-promises: an explicit port re-aims the
-  // launch, but the opt-out is still in force, so that launch stops at this same
-  // state -- on a port where the withheld button is offered again. A user told
-  // only the first step reads the second dialog as "it did not work".
-  assert.match(s, /then choose Start Local Gateway when prompted/);
+  // A variable name alone is not an instruction: the reader has to be told where
+  // to set it, or the only exit this state offers is one they cannot carry out.
+  assert.match(s, /from a terminal/);
+  assert.match(s, /environment variable/);
+  // Offering a button this dialog is not rendering sends the user hunting for it.
+  assert.doesNotMatch(s, /Start Local Gateway/);
+  // This state never ran a restart, so it must not borrow the wording that
+  // acknowledges one.
+  assert.doesNotMatch(s, /did not finish/);
 });
 
 test("describeGatewayFailure: the remote-side instruction names the tunnel", () => {
@@ -249,7 +380,10 @@ test("describeGatewayFailure: no remotePort falls back to the shared port form",
       disabled: true, port: 7778, remoteHost: "a.example.com", remotePort,
     });
     assert.match(s, /a\.example\.com on port 7778/);
-    assert.doesNotMatch(s, /local port/);
+    // The two-port target form, not the words in isolation: "local port" also
+    // reads naturally in ordinary advice, and a guard that catches that instead
+    // reports a collision with prose as a rendering bug.
+    assert.doesNotMatch(s, /reached through local port/);
     assert.doesNotMatch(s, /:undefined|: ,|::/);
   }
 });
