@@ -146,11 +146,24 @@ def _find_cli() -> list[str]:
 # first and a tamper pin second, and it is an env var rather than a config pair
 # so no config precedence applies to it at all. ``update_governance`` and
 # ``auto_improvement``'s clone setup already pin it for the same reason.
+#
+# GIT_OPTIONAL_LOCKS is the other non-config pin, and it is about WHAT GIT WRITES
+# on a read. ``git status`` refreshes the index's stat cache and saves it back,
+# taking ``index.lock`` to do so, which makes a command that is a read to its
+# caller a WRITE to the repository. Every fleet render runs one per row, so
+# against a checkout this app may only read the guarantee would break on the
+# ordinary path, and against this product's own checkout the fleet contends with
+# the operator's git for the lock. Set to ``0`` here rather than as a
+# ``--no-optional-locks`` flag per call site so the argv this handler builds stays
+# the subcommand it names, and so a read added later inherits it. Nothing this
+# handler needs is lost: the porcelain answer is identical, and a real mutation
+# still takes the locks it REQUIRES.
 # Harmless for non-git commands (pip/npm ignore GIT_*).
 _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     "GIT_ALLOW_PROTOCOL": "https:ssh",
     "GIT_PROTOCOL_FROM_USER": "0",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
     "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",

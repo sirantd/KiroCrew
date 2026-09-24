@@ -2769,10 +2769,19 @@ async def _ensure_repo_resolved() -> None:
     state than the honest "restart the gateway" this replaces.
     """
     global _refresher_task
-    # A resolved and VALID checkout returns here before any await. A resolved-but-invalid
-    # one falls through, because the operator can still correct the path its banner names
-    # and `repository` reopens that latch once the configured string changes.
-    if repository.MAIN_REPO and not repository._REPO_INVALID_MSG:
+    # A resolved checkout this app fully owns returns here before any await. One
+    # carrying either verdict falls through, because the operator can still correct
+    # the path its banner names and `repository` reopens that latch once the
+    # configured string changes. Both verdicts, not just the invalid one: a
+    # read-only checkout is equally a path the operator may have meant to change,
+    # and this is the poll route that would otherwise keep serving a stranger's
+    # repository — with the base branch and upstream remote resolved against it —
+    # until the gateway restarts.
+    if (
+        repository.MAIN_REPO
+        and not repository._REPO_INVALID_MSG
+        and not repository._REPO_READ_ONLY_MSG
+    ):
         return
     await repository.ensure_main_repo_discovered()
     try:

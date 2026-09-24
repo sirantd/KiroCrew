@@ -6797,7 +6797,9 @@ async def test_fleet_payload_marks_an_inferred_main_checkout():
 @pytest.mark.asyncio
 async def test_fleet_payload_redacts_credentials_in_main_repo():
     sensitive = f"/tmp/ghp_{'A' * 40}/checkout"
-    with patch.object(repository_mod, "_repo", return_value=sensitive):
+    # ``_repo_read`` is the accessor the payload reads: rendering the path is a
+    # read, and it must still render for a checkout this app may only read.
+    with patch.object(repository_mod, "_repo_read", return_value=sensitive):
         fleet = await _fleet_with(
             [{"path": "/repo", "branch": "main", "is_main": True}]
         )
@@ -6809,7 +6811,7 @@ async def test_fleet_payload_redacts_credentials_in_main_repo():
 @pytest.mark.asyncio
 async def test_fleet_payload_preserves_ordinary_main_repo_path():
     ordinary = "/home/user/oss/KiroCrew"
-    with patch.object(repository_mod, "_repo", return_value=ordinary):
+    with patch.object(repository_mod, "_repo_read", return_value=ordinary):
         fleet = await _fleet_with(
             [{"path": "/repo", "branch": "main", "is_main": True}]
         )
