@@ -2450,9 +2450,10 @@ class TestTheGrantIsRecheckedAfterTheRead:
         current routes can see. So the rule is asserted over the module's own source,
         and it is asserted as a shape a new route cannot get wrong rather than as a
         line each route must remember: the re-check has exactly ONE caller, which is
-        the helper that offloads, and no agent-door route suspends by itself. A route
-        that wants to build a payload off the loop therefore has one way in, and that
-        way re-checks the grant before the route's own shaping ever runs.
+        the helper that offloads, and the gate and that helper are the only places an
+        agent-door route is allowed to suspend. A route that wants to build a payload
+        off the loop therefore has one way in, and that way re-checks the grant before
+        the route's own shaping ever runs.
         """
         import ast
         import inspect
@@ -2471,13 +2472,35 @@ class TestTheGrantIsRecheckedAfterTheRead:
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             }
 
-        def _suspends(node):
-            return any(
-                isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "to_thread"
-                for n in ast.walk(node)
-            )
+        # Suspension has three spellings -- ``await``, ``async with``, ``async for``
+        # -- and a route that reaches storage through any of them can answer under a
+        # grant taken before the read. Naming the storage calls to look for would
+        # cover whichever ones are spelled today and miss ``run_in_executor``, an
+        # awaited storage coroutine, or a gather. So the rule is stated from the other
+        # side: these are the only two suspension points a door route may hold, and
+        # anything else that suspends is named back. A route that genuinely needs a
+        # third has to say so here, which is the point at which somebody decides
+        # whether it owes a re-check.
+        allowed_awaits = {"_authorize_crew_log_read", "_offload_then_recheck"}
+
+        def _suspends_outside(node):
+            offenders = []
+            for n in ast.walk(node):
+                if isinstance(n, (ast.AsyncWith, ast.AsyncFor)):
+                    offenders.append(type(n).__name__)
+                    continue
+                if not isinstance(n, ast.Await):
+                    continue
+                awaited = n.value
+                name = ""
+                if isinstance(awaited, ast.Call):
+                    if isinstance(awaited.func, ast.Name):
+                        name = awaited.func.id
+                    else:
+                        name = ast.unparse(awaited.func)
+                if name not in allowed_awaits:
+                    offenders.append(name or ast.unparse(awaited))
+            return offenders
 
         rechecking = sorted(f.name for f in functions if "_stale_grant_refusal" in _calls(f))
         assert rechecking == ["_offload_then_recheck"], (
@@ -2487,9 +2510,11 @@ class TestTheGrantIsRecheckedAfterTheRead:
 
         doors = [f for f in functions if "_authorize_crew_log_read" in _calls(f)]
         for door in doors:
-            assert not _suspends(door), (
-                f"{door.name} suspends by itself, so it can answer under a grant "
-                "taken before the read; offload through _offload_then_recheck"
+            outside = _suspends_outside(door)
+            assert not outside, (
+                f"{door.name} suspends at {outside}, outside the gate and the helper, "
+                "so it can answer under a grant taken before the read; offload through "
+                "_offload_then_recheck"
             )
         folded = sorted(f.name for f in doors if "_offload_then_recheck" in _calls(f))
         # A control: an empty door set would satisfy the loop above silently.
@@ -2506,7 +2531,7 @@ class TestTheGrantIsRecheckedAfterTheRead:
         assert len(resolve) == 1, "resolve is no longer an agent-door route"
         assert "_offload_then_recheck" not in _calls(resolve[0])
         assert "_stale_grant_refusal" not in _calls(resolve[0])
-        assert not _suspends(resolve[0])
+        assert _suspends_outside(resolve[0]) == []
 
 
 class TestTheOffloadHelperOwnsTheOrder:
