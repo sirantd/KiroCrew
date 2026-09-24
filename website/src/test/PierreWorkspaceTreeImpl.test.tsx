@@ -32,6 +32,7 @@ vi.mock('../api/client', () => ({
 vi.mock('../components/AppIcon', () => ({ default: () => null }))
 
 import { PierreWorkspaceTreeImpl } from '../pierre/PierreWorkspaceTreeImpl'
+import { STATE_ROW_DECORATION, STATE_ROW_ICON, STATE_ROW_MARKER } from '../pierre/treeStateRows'
 import { api } from '../api/client'
 import {
   recallExpandedPaths,
@@ -39,10 +40,12 @@ import {
   __resetTreeExpansionMemoryForTests,
 } from '../pierre/treeExpansionMemory'
 import { treeMock } from './__mocks__/pierreTreesReact'
-import type { MenuItem, MenuContext } from './__mocks__/pierreTreesReact'
+import type { MenuItem, MenuContext, VisibleRow } from './__mocks__/pierreTreesReact'
 
 const ROOT = '/repo/project'
 const PATHS = ['README.md', 'src/a/b.ts']
+// Every state row's synthetic segment ends in this (see `treeStateRows`).
+const M = STATE_ROW_MARKER
 
 type TreePayload = Awaited<ReturnType<typeof api.projectTree>>
 type StatusPayload = Awaited<ReturnType<typeof api.projectGitStatus>>
@@ -186,17 +189,27 @@ describe('PierreWorkspaceTreeImpl — data loading', () => {
     renderTree()
     await waitForTree()
 
+    // `late/nested` holds nothing in this payload, so it carries the state row
+    // every childless folder gets (see the state-row block below).
     expect(treeMock.last().calls.resetPaths).toEqual([
-      ['alpha/a.ts', 'alpha/', 'late/', 'late/nested/'],
+      ['alpha/a.ts', 'alpha/', 'late/', 'late/nested/', `late/nested/Empty folder${M}`],
     ])
     const decorate = treeMock.last().options.renderRowDecoration as (
-      context: { item: MenuItem },
+      context: { item: MenuItem; row: VisibleRow },
     ) => { text: string; title?: string } | null
-    expect(decorate({ item: { kind: 'directory', name: 'late', path: 'late' } })).toEqual({
-      text: 'files hidden',
-      title: 'files hidden',
+    // `late` still has `nested` beneath it, so its badge stays whether or not
+    // it is expanded: no state row of its own says the same thing.
+    const late = { kind: 'directory', name: 'late', path: 'late' } as const
+    expect(decorate({ item: late, row: { ...late, isExpanded: false } })).toEqual({
+      text: 'files not shown',
+      title: 'files not shown',
     })
-    expect(decorate({ item: { kind: 'directory', name: 'alpha', path: 'alpha' } })).toBeNull()
+    expect(decorate({ item: late, row: { ...late, isExpanded: true } })).toEqual({
+      text: 'files not shown',
+      title: 'files not shown',
+    })
+    const alpha = { kind: 'directory', name: 'alpha', path: 'alpha' } as const
+    expect(decorate({ item: alpha, row: { ...alpha, isExpanded: true } })).toBeNull()
     expect(screen.getByText(/all folders remain available/i)).toBeInTheDocument()
   })
 
@@ -205,6 +218,70 @@ describe('PierreWorkspaceTreeImpl — data loading', () => {
     renderTree()
 
     await waitFor(() => expect(screen.getByText('No files in this workspace yet')).toBeInTheDocument())
+    expect(screen.queryByTestId('file-tree')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('workspace-tree-root-unreadable')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('workspace-tree-root-hidden-only')).not.toBeInTheDocument()
+  })
+
+  it('says which folder could not be read, with Refresh and the agent hand-off, instead of calling it empty', async () => {
+    // The server names the project root as `.` when its own `scandir` failed:
+    // the listing is empty because nothing READ it. One level down the state
+    // row sits under the folder it qualifies; here no folder row exists, so
+    // the notice names the folder itself and carries the same two actions as
+    // the host's failed-listing notice: Refresh re-asks the listing, the
+    // hand-off gives the agent the sentence with the path in it.
+    const errorReport = await import('../utils/errorReport')
+    errorReport.__resetErrorJournalForTests()
+    errorReport.__resetNavSeamForTests()
+    sessionStorage.clear()
+    errorReport.installSoftNavigate(() => {})
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: [],
+      directories: [],
+      repo: false,
+      unreadableDirectories: ['.'],
+    }))
+    try {
+      renderTree()
+
+      const state = await screen.findByTestId('workspace-tree-root-unreadable')
+      expect(state).toHaveTextContent(`Couldn't read the folder ${ROOT}`)
+      expect(state).not.toHaveTextContent('Folder not readable')
+      expect(screen.queryByText('No files in this workspace yet')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('file-tree')).not.toBeInTheDocument()
+      expect(api.projectTree).toHaveBeenCalledTimes(1)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+      await waitFor(() => expect(api.projectTree).toHaveBeenCalledTimes(2))
+
+      fireEvent.click(screen.getByRole('button', { name: 'Ask the agent' }))
+      expect(errorReport.consumeChatHandoff()).toContain(`Couldn't read the folder ${ROOT}`)
+    } finally {
+      errorReport.__resetErrorJournalForTests()
+      errorReport.__resetNavSeamForTests()
+      sessionStorage.clear()
+    }
+  })
+
+  it('says the root holds only skipped or hidden folders instead of calling the workspace empty', async () => {
+    // `.` in `hiddenOnlyDirectories`: the project directory's top level holds
+    // only folders the listing skips or hides (a `.kiro/`, a `node_modules/`),
+    // so the payload is empty the same way an empty workspace's is -- and the
+    // copy the state row uses one level down stands in for the empty notice.
+    // Not an error: nothing to refresh, nothing to hand off.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: [],
+      directories: [],
+      repo: false,
+      hiddenOnlyDirectories: ['.'],
+    }))
+    renderTree()
+
+    const state = await screen.findByTestId('workspace-tree-root-hidden-only')
+    expect(state).toHaveTextContent('This workspace contains only hidden items')
+    expect(screen.queryByText('No files in this workspace yet')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('workspace-tree-root-unreadable')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Refresh' })).not.toBeInTheDocument()
     expect(screen.queryByTestId('file-tree')).not.toBeInTheDocument()
   })
 
@@ -271,6 +348,328 @@ describe('PierreWorkspaceTreeImpl — data loading', () => {
       expect(treeMock.last().calls.gitStatus.at(-1)).toEqual([{ path: 'a.ts', status: 'modified' }]),
     )
     expect(screen.queryByTestId('workspace-tree-changed-truncated')).not.toBeInTheDocument()
+  })
+})
+
+// The listing arrives whole -- there is no per-folder request -- so a folder
+// with nothing beneath it is decided by the payload, never by a fetch in
+// flight. Pierre has no slot for a status line under a row, so the wrapper
+// feeds each childless folder ONE synthetic child whose basename is the
+// label; these tests pin what reaches the model and how the wrapper keeps
+// that row inert.
+describe('PierreWorkspaceTreeImpl — state row under a childless folder', () => {
+  it('puts an "Empty folder" row under a folder the payload lists with nothing in it', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['README.md'],
+      directories: ['empty'],
+    }))
+    renderTree()
+    await waitForTree()
+
+    expect(treeMock.last().calls.resetPaths).toEqual([
+      ['README.md', 'empty/', `empty/Empty folder${M}`],
+    ])
+  })
+
+  it('says "Contains only hidden items" when the folder holds only folders the listing skips or hides', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['HEARTBEAT.md'],
+      directories: ['_bg'],
+      hiddenOnlyDirectories: ['_bg'],
+      repo: false,
+    }))
+    renderTree()
+    await waitForTree()
+
+    expect(treeMock.last().calls.resetPaths).toEqual([
+      ['HEARTBEAT.md', '_bg/', `_bg/Contains only hidden items${M}`],
+    ])
+  })
+
+  it('puts no state row and no marker under a folder the server could not read, and keeps its parent populated', async () => {
+    // Nothing beneath the folder is KNOWN, so no row may make a claim -- and a
+    // failed read is an error, which reaches the user only through the
+    // `ErrorNotice` above the tree (next test), never as a label, a glyph or a
+    // title in the tree. The folder is still an ordinary row of its own, so its
+    // parent is not childless.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['README.md'],
+      directories: ['vault', 'vault/locked'],
+      unreadableDirectories: ['vault/locked'],
+      repo: false,
+    }))
+    renderTree()
+    await waitForTree()
+
+    const model = treeMock.last()
+    expect(model.calls.resetPaths).toEqual([['README.md', 'vault/', 'vault/locked/']])
+    expect(model.calls.resetPaths[0].some(p => p.endsWith(M))).toBe(false)
+    const decorate = model.options.renderRowDecoration as (
+      context: { item: MenuItem; row: VisibleRow },
+    ) => unknown
+    const locked = { kind: 'directory', name: 'locked', path: 'vault/locked' } as const
+    expect(decorate({ item: locked, row: { ...locked, isExpanded: false } })).toBeNull()
+    expect(decorate({ item: locked, row: { ...locked, isExpanded: true } })).toBeNull()
+    const vault = { kind: 'directory', name: 'vault', path: 'vault' } as const
+    expect(decorate({ item: vault, row: { ...vault, isExpanded: true } })).toBeNull()
+  })
+
+  it('names the folders the server could not read in a notice above the tree, with the agent hand-off', async () => {
+    // The row beneath the folder is a status line inside Pierre's shadow root:
+    // it can carry no button. The failure itself -- a `scandir` the server
+    // could not perform -- is an error the user may not be able to fix but the
+    // agent often can, so it also surfaces through `ErrorNotice` above the
+    // tree with the hand-off on (a listing holds no draft to lose). The root
+    // marker `.` has its own whole-panel state and never appears here.
+    const errorReport = await import('../utils/errorReport')
+    errorReport.__resetErrorJournalForTests()
+    errorReport.__resetNavSeamForTests()
+    sessionStorage.clear()
+    errorReport.installSoftNavigate(() => {})
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['README.md'],
+      directories: ['vault', 'vault/locked', 'ops', 'ops/secrets'],
+      unreadableDirectories: ['vault/locked', 'ops/secrets'],
+      repo: false,
+    }))
+    try {
+      const { qc } = renderTree()
+      await waitForTree()
+
+      const notice = await screen.findByTestId('workspace-tree-unreadable-notice')
+      expect(notice).toHaveTextContent('Folders not readable: vault/locked, ops/secrets')
+      expect(notice).toHaveAttribute('role', 'alert')
+      fireEvent.click(screen.getByRole('button', { name: 'Ask the agent' }))
+      expect(errorReport.consumeChatHandoff()).toContain('Folders not readable: vault/locked, ops/secrets')
+
+      // The notice follows the payload: a poll that finds the folders readable
+      // again takes it down with the rows.
+      vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+        paths: ['README.md', 'vault/locked/inside.txt'],
+        directories: ['vault', 'vault/locked', 'ops', 'ops/secrets'],
+        unreadableDirectories: [],
+        repo: false,
+      }))
+      await act(async () => { await qc.refetchQueries({ queryKey: ['project-tree', ROOT] }) })
+      await waitFor(() => expect(screen.queryByTestId('workspace-tree-unreadable-notice')).not.toBeInTheDocument())
+    } finally {
+      errorReport.__resetErrorJournalForTests()
+      errorReport.__resetNavSeamForTests()
+      sessionStorage.clear()
+    }
+  })
+
+  it('shows no not-readable notice when every folder was read', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['README.md'],
+      directories: ['empty'],
+      unreadableDirectories: [],
+      repo: false,
+    }))
+    renderTree()
+    await waitForTree()
+    expect(screen.queryByTestId('workspace-tree-unreadable-notice')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('says the files were not listed when a childless folder lost them to the file cap, once at a time', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['README.md'],
+      directories: ['big'],
+      truncatedDirectories: ['big'],
+      truncated: true,
+    }))
+    renderTree()
+    await waitForTree()
+
+    expect(treeMock.last().calls.resetPaths).toEqual([
+      ['README.md', 'big/', `big/Files not shown: file limit of 10,000 reached${M}`],
+    ])
+    // The folder row's badge and the state row beneath it make the same claim,
+    // so the badge yields while the row is showing (the folder is expanded) and
+    // is back the moment the folder is collapsed and the row goes with it.
+    const decorate = treeMock.last().options.renderRowDecoration as (
+      context: { item: MenuItem; row: VisibleRow },
+    ) => { text: string; title?: string } | null
+    const big = { kind: 'directory', name: 'big', path: 'big/' } as const
+    expect(decorate({ item: big, row: { ...big, isExpanded: true } })).toBeNull()
+    expect(decorate({ item: big, row: { ...big, isExpanded: false } })).toEqual({
+      text: 'files not shown',
+      title: 'files not shown',
+    })
+  })
+
+  it('adds no state row under a folder that has a file or a subfolder', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['src/a/b.ts', 'docs/readme.md'],
+      // `src` holds a subfolder, `src/a` and `docs` hold a file, `pkg` holds a
+      // subfolder that is itself childless: only that leaf gets a row.
+      directories: ['src', 'src/a', 'docs', 'pkg', 'pkg/lib'],
+    }))
+    renderTree()
+    await waitForTree()
+
+    const [paths] = treeMock.last().calls.resetPaths
+    const stateRows = paths.filter(p => p.endsWith(M))
+    expect(stateRows).toEqual([`pkg/lib/Empty folder${M}`])
+  })
+
+  it('drops the row the moment a refetch brings real children', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ paths: ['README.md'], directories: ['empty'] }))
+    const { qc } = renderTree()
+    await waitForTree()
+    expect(treeMock.last().calls.resetPaths.at(-1)).toContain(`empty/Empty folder${M}`)
+
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ paths: ['README.md', 'empty/new.ts'], directories: ['empty'] }))
+    await act(async () => { await qc.refetchQueries({ queryKey: ['project-tree', ROOT] }) })
+
+    await waitFor(() => expect(treeMock.last().calls.resetPaths).toHaveLength(2))
+    expect(treeMock.last().calls.resetPaths.at(-1)).toEqual(['README.md', 'empty/new.ts', 'empty/'])
+  })
+
+  it('never reports a state row as a file open, and leaves it unselected', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ paths: ['README.md'], directories: ['empty'] }))
+    const onFileOpen = vi.fn()
+    renderTree({ onFileOpen })
+    await waitForTree()
+    const model = treeMock.last()
+
+    act(() => { model.simulateSelection(`empty/Empty folder${M}`) })
+
+    expect(onFileOpen).not.toHaveBeenCalled()
+    expect(model.calls.deselect).toEqual([`empty/Empty folder${M}`])
+    expect(model.getSelectedPaths()).toEqual([])
+  })
+
+  it('opens no context menu on a state row and closes the request Pierre already opened', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ paths: ['README.md'], directories: ['empty'] }))
+    renderTree({ onAddToContext: vi.fn() })
+    await waitForTree()
+
+    const context: MenuContext = {
+      anchorElement: document.createElement('div'),
+      anchorRect: document.createElement('div').getBoundingClientRect(),
+      close: vi.fn(),
+      restoreFocus: vi.fn(),
+    }
+    const node = treeMock.fileTreeProps.at(-1)!.renderContextMenu!(
+      { kind: 'file', name: 'Empty folder', path: `empty/Empty folder${M}` },
+      context,
+    )
+    expect(node).toBeNull()
+    // Pierre flips into its menu-open state BEFORE asking for the content, and
+    // while that state holds it swallows every key but Escape. A null render
+    // alone would leave a keyboard user (Shift+F10 on the focused row) stuck
+    // behind an invisible menu, so the rejection must also close it -- after
+    // the render, since Pierre's close is a state update on its own root.
+    expect(context.close).not.toHaveBeenCalled()
+    await waitFor(() => expect(context.close).toHaveBeenCalledTimes(1))
+    expect(context.close).toHaveBeenCalledWith()
+  })
+
+  it('styles the state rows as a status line through the shadow stylesheet, keyed on the decoration the plan emits', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ paths: ['README.md'], directories: ['empty'] }))
+    renderTree()
+    await waitForTree()
+
+    const css = treeMock.last().options.unsafeCSS as string
+    // Selected by the decoration the wrapper emits for a PLANNED row, never by
+    // the marker suffix (a real file can end in it) and never by a label (the
+    // sheet is fixed at model construction while the labels follow the
+    // language, and a real file may carry a label's exact name).
+    expect(css).toContain(`[data-icon-name="${STATE_ROW_ICON}"]`)
+    expect(css).not.toContain('data-item-path')
+    expect(css).not.toContain('Empty folder')
+    expect(css).toContain('pointer-events:none')
+    const decorate = treeMock.last().options.renderRowDecoration as (
+      context: { item: MenuItem; row: VisibleRow },
+    ) => unknown
+    const planned = { kind: 'file', name: `Empty folder${M}`, path: `empty/Empty folder${M}` } as const
+    expect(decorate({ item: planned, row: { ...planned, isExpanded: false } })).toEqual(STATE_ROW_DECORATION)
+    const readme = { kind: 'file', name: 'README.md', path: 'README.md' } as const
+    expect(decorate({ item: readme, row: { ...readme, isExpanded: false } })).toBeNull()
+  })
+
+  it('leaves a real file whose name ends in the marker character alone', async () => {
+    // An agent or a cloned repository can write a file whose name ends in
+    // U+200B -- the external-content boundary. The marker is the planned row's
+    // identity in the path, not the styling hook: only a path in the plan gets
+    // the decoration the sheet keys on, so this file keeps its icon, its
+    // pointer and its open.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: [`notes/x${M}`, 'README.md'],
+      directories: ['notes', 'empty'],
+    }))
+    const onFileOpen = vi.fn()
+    renderTree({ onFileOpen })
+    await waitForTree()
+
+    const model = treeMock.last()
+    const [paths] = model.calls.resetPaths
+    expect(paths).toContain(`notes/x${M}`)
+    expect(paths).toContain(`empty/Empty folder${M}`)
+    const decorate = model.options.renderRowDecoration as (
+      context: { item: MenuItem; row: VisibleRow },
+    ) => unknown
+    const real = { kind: 'file', name: `x${M}`, path: `notes/x${M}` } as const
+    expect(decorate({ item: real, row: { ...real, isExpanded: false } })).toBeNull()
+    expect(model.options.unsafeCSS as string).not.toContain('data-item-path')
+    // And the wrapper's guards do not treat it as a state row: selecting it opens it.
+    act(() => { model.simulateSelection(`notes/x${M}`) })
+    expect(onFileOpen).toHaveBeenCalledWith(`${ROOT}/notes/x${M}`)
+    expect(model.calls.deselect).toEqual([])
+  })
+
+  it('leaves a real file that is named like a label alone', async () => {
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['notes/Empty folder', 'README.md'],
+      directories: ['notes', 'empty'],
+    }))
+    const onFileOpen = vi.fn()
+    renderTree({ onFileOpen })
+    await waitForTree()
+
+    // The real file's path carries no marker, so the stylesheet leaves its icon
+    // and pointer; only the synthetic row under `empty` ends in it.
+    const [paths] = treeMock.last().calls.resetPaths
+    expect(paths.filter(p => p.endsWith(M))).toEqual([`empty/Empty folder${M}`])
+    expect(paths).toContain('notes/Empty folder')
+    // And the wrapper's guards do not treat it as a state row: selecting it opens it.
+    const model = treeMock.last()
+    act(() => { model.simulateSelection('notes/Empty folder') })
+    expect(onFileOpen).toHaveBeenCalledWith(`${ROOT}/notes/Empty folder`)
+    expect(model.calls.deselect).toEqual([])
+  })
+
+  it('re-plans the rows in the new language when the UI language switches at runtime', async () => {
+    // LanguageProvider repaints with cloneElement, so this component re-renders
+    // WITHOUT remounting: labels read once per mount would leave the state row
+    // as the one string in the panel still in the old language.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({ paths: ['README.md'], directories: ['empty'] }))
+    const { update } = renderTree()
+    await waitForTree()
+    expect(treeMock.last().calls.resetPaths.at(-1)).toContain(`empty/Empty folder${M}`)
+
+    const { i18next } = await import('../i18n/all')
+    try {
+      await act(async () => { await i18next.changeLanguage('fr') })
+      // The provider's repaint, which this harness has no provider to deliver.
+      update()
+      await waitFor(() =>
+        expect(treeMock.last().calls.resetPaths.at(-1)).toContain(`empty/${i18next.t('components.workspaceTree.row_empty')}${M}`),
+      )
+      expect(i18next.t('components.workspaceTree.row_empty')).not.toBe('Empty folder')
+    } finally {
+      await act(async () => { await i18next.changeLanguage('en') })
+    }
+  })
+
+  it('adds no state rows in changed mode, whose folders are all parents of a changed file', async () => {
+    vi.mocked(api.projectGitStatus).mockResolvedValue(mkStatus([mkFile('project/src/a.ts', 'M')]))
+    renderTree({ mode: 'changed' })
+    await waitForTree()
+
+    expect(treeMock.last().calls.resetPaths).toEqual([['src/a.ts']])
   })
 })
 
@@ -636,6 +1035,74 @@ describe('PierreWorkspaceTreeImpl — search forwarding', () => {
 
     // '' and null both mean "no search"; the model only accepts null for that.
     expect(treeMock.last().calls.search).toEqual([null, 'rail', null, null])
+  })
+
+  it('withholds the state rows while the filter is active and feeds them back when it clears', async () => {
+    // A state row is a status line, not a name: typing "empty" must not list
+    // every empty folder's row as a result. Pierre matches every listed path,
+    // so while the filter is active the rows are not in the model at all; a
+    // truncated childless folder then keeps its badge, since no row says it.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['README.md'],
+      directories: ['empty', 'big'],
+      truncatedDirectories: ['big'],
+    }))
+    const { update } = renderTree()
+    await waitForTree()
+    const model = treeMock.last()
+    expect(model.calls.resetPaths.at(-1)).toEqual([
+      'README.md', 'empty/', 'big/', `empty/Empty folder${M}`, `big/Files not shown: file limit of 10,000 reached${M}`,
+    ])
+
+    update({ searchQuery: 'emp' })
+    expect(model.calls.resetPaths.at(-1)).toEqual(['README.md', 'empty/', 'big/'])
+    expect(model.calls.search.at(-1)).toBe('emp')
+    const decorate = model.options.renderRowDecoration as (
+      context: { item: MenuItem; row: VisibleRow },
+    ) => { text: string } | null
+    const big = { kind: 'directory', name: 'big', path: 'big' } as const
+    expect(decorate({ item: big, row: { ...big, isExpanded: true } })).toMatchObject({ text: 'files not shown' })
+
+    update({ searchQuery: null })
+    expect(model.calls.resetPaths.at(-1)).toEqual([
+      'README.md', 'empty/', 'big/', `empty/Empty folder${M}`, `big/Files not shown: file limit of 10,000 reached${M}`,
+    ])
+    expect(model.calls.search.at(-1)).toBeNull()
+    expect(decorate({ item: big, row: { ...big, isExpanded: true } })).toBeNull()
+  })
+
+  it('carries the expansion across the filter toggle in a host that does not persist it', async () => {
+    // Filter on and filter off are each a path reset. Without an
+    // `initialExpandedPaths` the reset collapses the tree -- and Pierre's own
+    // filter snapshot, taken right after, would then restore a collapsed tree
+    // as the pre-filter state. A payload change is not a filter toggle and
+    // keeps the host's plain reset.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['notes/a.md', 'src/b.ts'],
+      directories: ['notes', 'src', 'empty'],
+    }))
+    const { update, qc } = renderTree()
+    await waitForTree()
+    const model = treeMock.last()
+    expect(model.calls.resetPathsOptions.at(-1)).toBeUndefined()
+
+    model.simulateExpanded(['notes'])
+    update({ searchQuery: 'a' })
+    expect(model.calls.resetPathsOptions.at(-1)).toEqual({ initialExpandedPaths: ['notes'] })
+
+    model.simulateExpanded(['notes', 'src'])
+    update({ searchQuery: null })
+    expect(model.calls.resetPathsOptions.at(-1)).toEqual({ initialExpandedPaths: ['notes', 'src'] })
+
+    // A poll that changes the path set with no filter toggle: plain reset, as before.
+    vi.mocked(api.projectTree).mockResolvedValue(mkTree({
+      paths: ['notes/a.md', 'src/b.ts', 'src/c.ts'],
+      directories: ['notes', 'src', 'empty'],
+    }))
+    const before = model.calls.resetPaths.length
+    await act(async () => { await qc.refetchQueries({ queryKey: ['project-tree', ROOT] }) })
+    await waitFor(() => expect(model.calls.resetPaths.length).toBe(before + 1))
+    expect(model.calls.resetPathsOptions.at(-1)).toBeUndefined()
   })
 })
 

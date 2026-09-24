@@ -8633,7 +8633,13 @@
       "ask_agent_history": "Chiedi all'agente della cronologia"
     },
     "workspaceTree": {
-      "status_failed": "Impossibile leggere lo stato del repository."
+      "status_failed": "Impossibile leggere lo stato del repository.",
+      "row_empty": "Cartella vuota",
+      "row_hidden_only": "Contiene solo elementi nascosti",
+      "row_truncated": "File non mostrati: limite di 10.000 file raggiunto",
+      "root_unreadable": "Impossibile leggere la cartella {{path}}",
+      "root_hidden_only": "Questa area di lavoro contiene solo elementi nascosti",
+      "unreadable_folders": "Cartelle non leggibili: {{paths}}"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",
@@ -9967,8 +9973,8 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "in attesa di avvio — in coda a causa del limite di concorrenza",
         "workflows": "Workflow",
         "workspace_empty": "Quest'area di lavoro non contiene ancora file",
-        "workspace_truncated": "Area di lavoro grande: vengono mostrati fino a 10.000 file; tutte le cartelle restano disponibili",
-        "workspace_directory_truncated": "file nascosti",
+        "workspace_truncated": "Area di lavoro grande: limite di 10.000 file raggiunto, alcuni file non vengono mostrati; tutte le cartelle restano disponibili",
+        "workspace_directory_truncated": "file non mostrati",
         "output_load_failed": "Impossibile caricare l’output",
         "retry": "Riprova",
         "cancel_failed": "Impossibile annullare il subagente",
