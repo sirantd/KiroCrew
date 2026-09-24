@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, fireEvent, waitFor } from '@testing-library/react'
+import { render, fireEvent, waitFor, act } from '@testing-library/react'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { copyToClipboard } from '../utils/clipboard'
 
@@ -74,12 +74,24 @@ describe('broken-image fallback chip', () => {
     expect(queryByText(MISSING_LABEL)).toBeNull()
   })
 
-  it('copies the on-disk path on click and confirms via the title flash', async () => {
+  it('copies the on-disk path on click and confirms via the title flash once the write lands', async () => {
+    vi.mocked(copyToClipboard).mockResolvedValue(true)
     const { getByRole } = renderErrored(`![账户列表](${GONE})`)
     const chip = getByRole('button')
-    fireEvent.click(chip)
+    await act(async () => { fireEvent.click(chip) })
     expect(copyToClipboard).toHaveBeenCalledWith(GONE)
     expect(chip.getAttribute('title')).toBe('Copied!')
+  })
+
+  it('renders a refused write as a failure beside the chip, never as "Copied!"', async () => {
+    vi.mocked(copyToClipboard).mockResolvedValue(false)
+    const { getByRole, getByTestId, queryByTestId } = renderErrored(`![账户列表](${GONE})`)
+    const chip = getByRole('button', { name: /账户列表/ })
+    await act(async () => { fireEvent.click(chip) })
+    expect(chip.getAttribute('title')).not.toBe('Copied!')
+    expect(getByTestId('md-chip-copy-error')).toHaveTextContent('Copy failed')
+    fireEvent.click(getByRole('button', { name: 'Dismiss' }))
+    expect(queryByTestId('md-chip-copy-error')).toBeNull()
   })
 
   it('copies via keyboard activation (Enter)', () => {

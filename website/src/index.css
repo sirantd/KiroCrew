@@ -1624,6 +1624,17 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 /* Kiro theme: inline code = neutral elevated surface (Prey/750) + light-purple text (Figma 3906:185658) */
 [data-theme="kiro-dark"] .msg-content :not(pre)>code{background:#28242e;color:#c19aff}
 [data-theme="kiro-light"] .msg-content :not(pre)>code{background:var(--bg-hover);color:#723acc}
+/* Inline-code CHIPS (MarkdownRenderer): a chip whose click navigates — a confirmed path
+   (`open` / `browse`), a session (`switch`), an autolinked work item or a span inside a link
+   (`link`) — wears the accent; a chip that only copies (`copy`) wears the inline-code look
+   above, which IS plain code. The two Kiro rules above set `color` at specificity (0,2,2),
+   and the utilities are emitted unlayered, so the `text-accent` utility (0,1,0) the actionable
+   chips carry lost to them: every chip painted in the code colour and a copy chip could not be
+   told from a path chip. The actionable state therefore gets its own rule here, at (0,4,2),
+   keyed on the `data-chip-action` the renderer sets (raw HTML cannot: InlineCode drops any
+   inbound one). Kiro dark uses Purple/300, the same step-up message links take below. */
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action]:not([data-chip-action="copy"]){color:#b07fff}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action]:not([data-chip-action="copy"]){color:var(--accent)}
 /* Kiro dark: brighten message links — #8e48ff (=accent, same as the button fill) reads dull as thin
    text on the dark bg, so step up to Purple/300 for equal perceived vibrancy. Scoped to Kiro. */
 [data-theme="kiro-dark"] .msg-content a{color:#b07fff;text-decoration-color:rgba(176,127,255,.45)}
