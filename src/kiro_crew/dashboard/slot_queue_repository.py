@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 # bounds orphaned bookkeeping; an evicted agent remains recoverable on restart.
 MAX_PENDING_SUBAGENT_DELIVERIES = 128
 
+#: Cap on a slot's LIVE in-memory queue, shared by every producer that guards
+#: an append against a full queue. One named constant because two bare
+#: literals bounding the same population drift: the cron origin-injection path
+#: (handlers/messaging.py) evicts the OLDEST entry at this cap, while the
+#: MCP-App message path (handlers/mcp_apps.py) refuses the NEWEST — different
+#: overflow semantics on purpose (a cron notification is periodic and
+#: regenerates; an app message is a one-shot user action whose producer can be
+#: told 429) — but the SIZE they guard is the same queue.
+MAX_LIVE_QUEUE_ENTRIES = 50
+
 #: How many queued user prompts one session's metadata line carries, and how
 #: many a restore admits back. Front-first, because the front is what runs
 #: first: an over-cap queue keeps the entries closest to delivery.
@@ -684,6 +694,18 @@ class SlotQueueRepository:
             # Retry callbacks settle the exact automatic payload that failed;
             # moving them to replacement text would acknowledge the wrong work.
             if "_on_consumed" in item or "_on_irreversibly_consumed" in item:
+                return False
+            # A system-injection entry's kind decides how the drain writes the
+            # row (role, provenance meta, mirror suppression) — rewriting only
+            # its content would drain the USER'S OWN replacement words as
+            # machine-authored: an edited MCP-App entry, for example, would
+            # land as an `inject` row labelled with the app, actor `app`, and
+            # the linked-thread mirror suppressed, so a human on the mirrored
+            # channel never sees what the user typed. Refused, not re-kinded:
+            # these entries are not user prompts to begin with.
+            from kiro_crew.dashboard.chat_utils import _SYSTEM_INJECTION_KINDS
+
+            if item.get("kind") in _SYSTEM_INJECTION_KINDS:
                 return False
             # The lists index the OLD text's markers; drop only what this edit
             # removed (named before, unnamed now) and renumber the survivors

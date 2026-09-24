@@ -14,7 +14,7 @@
  * state is supplied BY the host as a registry entry instead.
  */
 import React, { memo } from 'react'
-import { Clock, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react'
+import { Clock, AppWindow, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { i18nT } from '../i18n/t'
 import { isNoteRow } from '../lib/noteContract'
 import { parseOptions } from './protocol'
@@ -551,15 +551,19 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     roles: ['inject'],
     render: (m, ctx) => {
       const cronLabel = (m.meta?.cronLabel as string) || ''
+      const appLabel = (m.meta?.appLabel as string) || ''
       const stripped = cronLabel
         ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')
-        : m.content
+        : appLabel
+          ? m.content.replace(/^\[MCP app message from ".*"\]\n/, '').replace(/\n\[End of MCP app message\]$/, '')
+          : m.content
       // A note's marker is consumed into the pill row, so rendering it too would show the
       // same choices twice. Non-note inject rows keep it: there it is prose, not syntax.
       const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
       return ctx.wrapper(
         <>
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
+          {!cronLabel && appLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><AppWindow size={11} className="inline mr-0.5" />{i18nT('components.mcpApp.from_app', { app: appLabel.split('/')[0] })}</span>}
           <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} softBreaks /></MessageErrorBoundary>
           </div>

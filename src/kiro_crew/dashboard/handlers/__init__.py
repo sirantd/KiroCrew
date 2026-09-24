@@ -259,6 +259,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
 )
 from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
     api_mcp_apps_call,
+    api_mcp_apps_message,
 )
 
 # ── Crew Members (handlers/members.py) ──

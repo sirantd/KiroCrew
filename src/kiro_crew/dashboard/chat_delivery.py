@@ -1005,4 +1005,12 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
     attachments = attachment_meta(item.get("meta"))
     if attachments:
         view["meta"] = attachments
+    # The structural kind tag rides in ``meta`` so the queue card can classify
+    # a system entry (an MCP-App message, for one) without parsing its text —
+    # the same enqueue-time source the server's own drain reads, and the same
+    # ``meta.kind`` spelling transcript rows use (e.g. compaction). Omitted for
+    # a plain user prompt so its shape is unchanged.
+    kind = item.get("kind")
+    if isinstance(kind, str) and kind:
+        view.setdefault("meta", {})["kind"] = kind
     return view

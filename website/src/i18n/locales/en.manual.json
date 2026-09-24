@@ -3405,6 +3405,10 @@
       "unexpected_response": "Unexpected response",
       "deploy_failed": "Deploy failed",
       "stale_preview_retry": "The app changed since it was checked — try again."
+    },
+    "mcpApp": {
+      "from_app": "From your action in the {{app}} app",
+      "delivery_failed": "Couldn't deliver your message — try again."
     }
   },
   "hooks": {

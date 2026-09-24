@@ -8968,6 +8968,10 @@
       "unexpected_response": "Risposta inaspettata",
       "deploy_failed": "Deploy non riuscito",
       "stale_preview_retry": "L’app è cambiata dopo il controllo — riprova."
+    },
+    "mcpApp": {
+      "from_app": "Dalla tua azione nell'app {{app}}",
+      "delivery_failed": "Impossibile recapitare il messaggio: riprova."
     }
   },
   "hooks": {

@@ -32,6 +32,26 @@ export function isNonInteractiveQueued(m: ChatMessage): boolean {
   return isSystemDelivery(m) || parseRecoveryMessage(m.content || '') !== null
 }
 
+/** An MCP-App ui/message entry waiting in the queue. It stays VISIBLE in the
+ *  stack (the user's own click, awaiting delivery) but read-only: editing its
+ *  card would drain the user's replacement words as app-authored (inject row,
+ *  actor `app`, channel mirror suppressed) — the backend refuses the edit
+ *  (queue_edit_by_id), so the card must not offer it. The `meta.kind` tag
+ *  rides on both the live twin row and the slot-detail queue hydration. */
+export function isAppMessageQueued(m: ChatMessage): boolean {
+  return m.meta?.kind === 'mcp_app_message'
+}
+
+/** Display text for a queued entry: an app-message entry drops its machine
+ *  envelope so the queue card wears the same skin the transcript row will —
+ *  two skins for one message read as two different messages. */
+export function queuedDisplayText(m: ChatMessage): string {
+  if (!isAppMessageQueued(m)) return m.content
+  return m.content
+    .replace(/^\[MCP app message from ".*"\]\n/, '')
+    .replace(/\n\[End of MCP app message\]$/, '')
+}
+
 /** Split a slot's message list into the three things a pane surface needs:
  *  the transcript (everything not queued), the INTERACTIVE queue cards, and a
  *  count of held sub-agent deliveries for the collapsed progress line.
@@ -339,6 +359,13 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
             const isPending = !!queueId && !!pendingIds?.has(queueId)
             // Per-card actions show on the front single card or when expanded.
             const showActions = (expanded || messages.length === 1) && !!queueId
+            // App-message entries are read-only-but-visible: the backend
+            // refuses queue_edit_by_id for system-injection kinds (the user's
+            // replacement words would drain app-authored), so the card must
+            // not offer the pencil. Cancel/interrupt/reorder stay: they change
+            // WHEN or WHETHER the entry runs, never who authored its text.
+            const isAppEntry = isAppMessageQueued(m)
+            const displayText = queuedDisplayText(m)
 
             return (
               <motion.div
@@ -375,7 +402,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                     <EditInput initial={m.content} onCommit={v => commitEdit(queueId!, v)} onCancel={cancelEdit} />
                   ) : (
                     <>
-                      <span className="truncate flex-1">{m.content}</span>
+                      <span className="truncate flex-1">{displayText}</span>
                       {/* Reorder arrows only make sense with 2+ cards, and only
                           in the expanded stack where the run order is visible.
                           Index 0 runs first and renders at the BOTTOM of the
@@ -403,7 +430,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                           </button>
                         </>
                       )}
-                      {onEdit && showActions && (
+                      {onEdit && showActions && !isAppEntry && (
                         <button
                           className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.edit_queued_message')}

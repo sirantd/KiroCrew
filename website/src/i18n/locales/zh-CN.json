@@ -8730,6 +8730,10 @@
       "unexpected_response": "意外的响应",
       "deploy_failed": "部署失败",
       "stale_preview_retry": "检查后应用已更改 — 请重试。"
+    },
+    "mcpApp": {
+      "from_app": "来自您在 {{app}} 应用中的操作",
+      "delivery_failed": "无法送达您的消息，请重试。"
     }
   },
   "hooks": {

@@ -8849,6 +8849,10 @@
       "unexpected_response": "Unerwartete Antwort",
       "deploy_failed": "Bereitstellung fehlgeschlagen",
       "stale_preview_retry": "Die App hat sich seit der Prüfung geändert — versuche es erneut."
+    },
+    "mcpApp": {
+      "from_app": "Aus deiner Aktion in der App {{app}}",
+      "delivery_failed": "Deine Nachricht konnte nicht zugestellt werden – versuch es erneut."
     }
   },
   "hooks": {

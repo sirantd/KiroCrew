@@ -8730,6 +8730,10 @@
       "unexpected_response": "예기치 않은 응답",
       "deploy_failed": "배포에 실패했습니다",
       "stale_preview_retry": "확인 후 앱이 변경되었습니다 — 다시 시도하세요."
+    },
+    "mcpApp": {
+      "from_app": "{{app}} 앱에서의 작업으로부터",
+      "delivery_failed": "메시지를 전달하지 못했습니다. 다시 시도해 주세요."
     }
   },
   "hooks": {

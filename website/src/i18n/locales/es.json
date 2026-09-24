@@ -8968,6 +8968,10 @@
       "unexpected_response": "Respuesta inesperada",
       "deploy_failed": "Error al desplegar",
       "stale_preview_retry": "La aplicación cambió desde la comprobación — inténtalo de nuevo."
+    },
+    "mcpApp": {
+      "from_app": "De tu acción en la aplicación {{app}}",
+      "delivery_failed": "No se pudo entregar tu mensaje. Inténtalo de nuevo."
     }
   },
   "hooks": {

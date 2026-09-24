@@ -8730,6 +8730,10 @@
       "unexpected_response": "予期しないレスポンス",
       "deploy_failed": "デプロイに失敗",
       "stale_preview_retry": "チェック後にアプリが変更されました — もう一度お試しください。"
+    },
+    "mcpApp": {
+      "from_app": "{{app}} アプリでの操作から",
+      "delivery_failed": "メッセージを送信できませんでした。もう一度お試しください。"
     }
   },
   "hooks": {
