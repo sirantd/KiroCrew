@@ -68,7 +68,7 @@ from kiro_crew.discord.client import (
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import break_credential_seam, redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -125,6 +125,11 @@ def _redact_all(text: str) -> str:
 def _redact_transformed(text: str) -> str:
     text, _ = redact_for_display(text, _redact_all)
     return _DISCORD_MENTION_AT_RE.sub("@\u200b", text)
+
+
+def _break_seam(prior: str, text: str) -> tuple[str, bool]:
+    """Withhold what a reader could rejoin with the message above *text*."""
+    return break_credential_seam(prior, text, _redact_all)
 
 
 # Discord's typing indicator lasts ~10s per trigger; refresh just under that
@@ -530,6 +535,13 @@ class DiscordRenderer(Renderer):
         # text pushed (skip no-op edits), and the edit throttle timestamp.
         self._stream_mid: str | None = None
         self._shown = ""
+        # The message ABOVE the one being written: frozen text a reader can put
+        # beside whatever lands next. Grading a cut says nothing about a head
+        # some later branch replaces, so every sink re-asks the question against
+        # this before it sends. ``_landed_text`` is what the CURRENT message
+        # carries, promoted to ``_frozen_above`` when a fresh one opens.
+        self._frozen_above = ""
+        self._landed_text = ""
         # Delivery accounting for `delivery_failed`: how many seals were tried
         # and how many actually reached Discord.
         self._seals_attempted = 0
@@ -845,6 +857,9 @@ class DiscordRenderer(Renderer):
 
     def _open_new_message(self) -> None:
         """Next render creates a fresh message instead of editing the old one."""
+        # Whatever this message last carried is now frozen above the next one, so
+        # it becomes the text the next send has to be safe beside.
+        self._frozen_above, self._landed_text = self._landed_text, ""
         self._stream_mid = None
         self._shown = ""
 
@@ -895,6 +910,11 @@ class DiscordRenderer(Renderer):
         # ``TurnDriver`` applies — and the display pass exists precisely for the
         # credential that is invisible until Discord renders the markdown away.
         body = _redact_transformed(body)
+        # Same question as the seal asks, at the other sink: this frame sits under
+        # a frozen message, and a reader reads straight through the gap between
+        # them. Live frames are throttled, so this runs at most once per throttle
+        # window and costs one scan while the seam is clean.
+        body, _ = _break_seam(self._frozen_above, body)
         footer = f"-# 🔧 {self._tool}…" if self._tool else ""
         if footer:
             room = self._limit() - len(footer) - 2
@@ -905,6 +925,7 @@ class DiscordRenderer(Renderer):
             return
         self._last_edit = now
         self._shown = text
+        self._landed_text = text
         if self._stream_mid is None:
             mid = await self._client.send_message(self._channel_id, text)
             if mid is not None:
@@ -1010,6 +1031,7 @@ class DiscordRenderer(Renderer):
                     self._channel_id, self._stream_mid, text, files, components=components
                 ):
                     self._seals_landed += 1
+                    self._landed_text = text
                     self._tally_redactions(text)
                     return True
                 # A missing live message falls through to a fresh send.
@@ -1022,6 +1044,7 @@ class DiscordRenderer(Renderer):
             )
             if landed:
                 self._seals_landed += 1
+                self._landed_text = text
                 self._tally_redactions(text)
             return landed
         except Exception:
@@ -1076,6 +1099,13 @@ class DiscordRenderer(Renderer):
             if components is None:
                 return
             text = "…"
+        # The message above is frozen and this text may have been rewritten since
+        # any cut was graded (a presentation snapshot, an options expansion, a
+        # footer), so the pair is re-asked here rather than trusted. Ahead of the
+        # cap split below, which then sizes what actually goes out. The withheld
+        # run is replaced by the redactor's own tag, so `_tally_redactions` counts
+        # it on landing and the turn's notice reports it like any other redaction.
+        text, _ = _break_seam(self._frozen_above, text)
 
         chunks = [text]
         if len(text) > DISCORD_MAX_TEXT:
@@ -1102,6 +1132,11 @@ class DiscordRenderer(Renderer):
         )
         try:
             source = _redact_transformed(source)
+            # This recovery restores the markup the extraction cut, so it is a
+            # THIRD form of the same segment and the message above it has not
+            # moved -- re-asked here as well, or the sink's guarantee holds only
+            # for the payload that failed to upload.
+            source, _ = _break_seam(self._frozen_above, source)
             recovery = [source]
             if len(source) > DISCORD_MAX_TEXT:
                 recovery = await asyncio.to_thread(split_markdown_safe, source, DISCORD_MAX_TEXT)

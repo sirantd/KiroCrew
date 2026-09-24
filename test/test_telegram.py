@@ -25,6 +25,7 @@ from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
+from kiro_crew.messaging.display_safety import joins_to_a_credential
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -36,6 +37,7 @@ from kiro_crew.messaging.renderer import (
     TEXT_CHUNK,
     TOOL_CALL,
     OutputEvent,
+    _default_redactor,
     session_provenance_tag,
 )
 from kiro_crew.messaging.session_resume import RoutingDecision
@@ -1867,6 +1869,49 @@ class TestRenderer:
         r._buf = [closed_src]
         asyncio.run(r._rotate_on_length())
         assert "".join(r._buf).rstrip().endswith("```")
+
+    def test_a_head_rewritten_after_a_seal_carries_no_credential(self) -> None:
+        """A boundary is graded by whoever creates it, not only by the rotation.
+
+        ``_rotate_on_length`` seals frames and keeps a remainder live. That
+        remainder is the text the boundary was judged on, and the options-cap
+        expansion then REPLACES it: the segment buffer is rewritten after a frame
+        has already sealed. The sealed message is frozen and cannot be taken back,
+        so the pair the reader gets is that message beside a head nobody asked
+        about -- and a key whose first half ends the sealed message and whose
+        second half opens the replacement is readable on screen while each
+        message alone scrubs clean.
+        """
+        # Neither half is a credential alone, which is why each message's own scan
+        # cannot see this and the PAIR is what has to be checked.
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+        # Sized so the first chunk ENDS at the key's first half: one paragraph just
+        # under the render cap, then a second the cap cannot also hold.
+        first_para = "filler " * 520 + head_half
+        r._buf = [first_para + "\n\nsecond para " + "more text " * 50]
+
+        async def _go() -> None:
+            await r._rotate_on_length()
+            frozen = [t for t, _ in cli.sent]
+            assert frozen == [first_para], frozen[:1]
+            # Premise: the boundary the ROTATION made severs nothing, so this is
+            # about the rewrite and not about where the cut fell.
+            assert not joins_to_a_credential(frozen[-1], "".join(r._buf), _default_redactor)
+            # The writer under test: the segment is replaced after the seal.
+            r._buf = [f"{tail_half} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        for message in screen:
+            assert _default_redactor(message) == message, f"redacted alone: {message}"
+        assert not joins_to_a_credential(
+            screen[-2], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
 
     def test_streaming_strips_options_and_renders_keyboard(self) -> None:
         cli = self._drive(

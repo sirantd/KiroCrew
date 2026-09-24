@@ -13,12 +13,14 @@ import pytest
 
 from conftest import CREDENTIAL_STRADDLE_SHAPES
 from kiro_crew.messaging.display_safety import (
+    CREDENTIAL_SEAM_TAG,
+    break_credential_seam,
     canonicalize_display,
     joins_to_a_credential,
     redact_for_display,
     safe_split_offset,
 )
-from kiro_crew.messaging.renderer import _default_redactor
+from kiro_crew.messaging.renderer import _default_redactor, count_redaction_tags
 
 
 class TestTheOracleIsAsStrongAsTheSendPath:
@@ -208,3 +210,92 @@ class TestSafeSplitOffset:
         # each. The ceiling is deliberately loose: the property is the ORDER, and a
         # linear walk cannot fit under it.
         assert calls < 60, calls
+
+
+class TestBreakCredentialSeam:
+    """The other half of the cut: the message ABOVE is already frozen.
+
+    ``safe_split_offset`` decides where a cut may fall, which is available only to
+    whoever makes the cut. Once the message above is sent it cannot be taken back,
+    so a later writer that replaces the text BELOW it owns the boundary and has
+    only that text left to fix.
+    """
+
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    def test_every_straddle_shape_is_closed(self, head: str, tail: str) -> None:
+        # Premise: each side is clean alone, which is why neither message's own
+        # scan can see this.
+        assert _default_redactor(head) == head, "the head half must be clean alone"
+        assert _default_redactor(tail) == tail, "the tail half must be clean alone"
+
+        safe, broken = break_credential_seam(head, tail, _default_redactor)
+
+        assert broken, "an open seam must report that text was withheld"
+        assert not joins_to_a_credential(
+            head, safe, _default_redactor
+        ), f"the reader can still rejoin a key: {safe!r}"
+
+    @pytest.mark.parametrize(
+        ("prior", "text"),
+        [
+            pytest.param("plain prose ending here", "and continuing there", id="prose"),
+            pytest.param("", "AKIAIOSFODNN7EXAMPLE alone", id="no-message-above"),
+            pytest.param("AKIAIOSFODNN7EXAMPLE alone", "", id="nothing-below"),
+            pytest.param("ends in AKIAIOSF", "a whole paragraph of prose", id="half-key-above"),
+        ],
+    )
+    def test_a_closed_seam_is_left_alone(self, prior: str, text: str) -> None:
+        # The allow direction, and it carries the cost argument: a guard that
+        # rewrites every message delivers a redaction tag on ordinary prose.
+        assert break_credential_seam(prior, text, _default_redactor) == (text, False)
+
+    def test_the_tag_alone_can_be_absorbed_so_the_search_keeps_going(self) -> None:
+        # Inserting the tag is the FIRST candidate, not the answer. Here the text
+        # below opens with the ``)`` that closes a link the message above left
+        # open, so the tag lands inside the link target and the join collapses it
+        # away -- putting the key's halves side by side again.
+        prior, text = "[AKIA](https://ex.test/a,b", ")IOSFODNN7EXAMPLE"
+        absorbed = CREDENTIAL_SEAM_TAG + text
+        assert joins_to_a_credential(
+            prior, absorbed, _default_redactor
+        ), "premise: inserting the tag alone does not close this seam"
+
+        safe, broken = break_credential_seam(prior, text, _default_redactor)
+
+        assert broken
+        assert safe.startswith(CREDENTIAL_SEAM_TAG)
+        assert not joins_to_a_credential(prior, safe, _default_redactor)
+        assert ")" not in safe, "the character that closes the link must be withheld"
+
+    def test_the_withheld_run_is_reported_as_a_redaction(self) -> None:
+        # The tag is the redactor's own, so the channel's existing per-message
+        # tally counts it and the turn's notice tells the user something was held
+        # back. A private marker would be a silent gap.
+        safe, _ = break_credential_seam("ends in AKIAIOSF", "ODNN7EXAMPLE rest", _default_redactor)
+        assert count_redaction_tags(safe)[0] == 1, safe
+
+    def test_a_closed_seam_costs_one_scan(self) -> None:
+        # The cost claim the sinks rest on: this runs on every outgoing frame, and
+        # every ordinary frame has a clean seam. One ``joins_to_a_credential`` is
+        # four redaction passes over prose -- each side once, then the two
+        # readings -- and nothing walks.
+        calls = 0
+
+        def counting_redactor(text: str) -> str:
+            nonlocal calls
+            calls += 1
+            return _default_redactor(text)
+
+        prior = "a whole paragraph of ordinary prose, ending in a full stop."
+        text = "another paragraph, carrying on from it with nothing secret."
+
+        assert break_credential_seam(prior, text, counting_redactor) == (text, False)
+        assert calls <= 6, calls
+
+    def test_nothing_of_the_text_survives_when_nothing_else_works(self) -> None:
+        # The last candidate is the tag alone, which cannot extend a key: it is a
+        # fixed point of the scan, and the message above was scrubbed on its own
+        # before it was sent.
+        safe, broken = break_credential_seam("ends in AKIAIOSF", "ODNN7EXAMPLE", _default_redactor)
+        assert broken
+        assert not joins_to_a_credential("ends in AKIAIOSF", safe, _default_redactor)

@@ -43,7 +43,7 @@ from kiro_crew.constants import (
     strip_control_comments,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import break_credential_seam, redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -190,6 +190,19 @@ def _display_safe(text: str) -> str:
     up scanning for less than the stream did.
     """
     safe, _ = redact_for_display(text or "", _default_redactor)
+    return safe
+
+
+def _break_seam(prior: str, text: str) -> str:
+    """Withhold what a reader could rejoin with the message above *text*.
+
+    A cut is graded by the renderer that makes it, but the message above is then
+    frozen while the text below it can still be replaced -- an options expansion,
+    a footer, a presentation snapshot -- and the pair a reader ends up with is not
+    the pair anyone asked about. Asked again at each sink, against the frozen text,
+    so the answer belongs to whoever wrote the head.
+    """
+    safe, _ = break_credential_seam(prior, text, _default_redactor)
     return safe
 
 
@@ -981,6 +994,13 @@ class TelegramRenderer(Renderer):
         # text; a rotation seals _buf into its message and starts _buf fresh.
         self._stream_mid: int | None = None
         self._shown = ""
+        # The message ABOVE the one being written: frozen text a reader can put
+        # beside whatever lands next. Each sink re-grades against it, because a
+        # graded cut says nothing about a head some later branch replaces.
+        # ``_landed_text`` is what the CURRENT message carries, promoted to
+        # ``_frozen_above`` when a fresh one opens.
+        self._frozen_above = ""
+        self._landed_text = ""
         self._last_edit = 0.0
         self._seal_count = 0  # rotations so far == index into _steer_texts for chips
         # Redaction placeholders in text that actually LANDED, tallied per
@@ -1283,6 +1303,9 @@ class TelegramRenderer(Renderer):
 
     def _open_new_message(self) -> None:
         """Next render creates a fresh message instead of editing the old one."""
+        # Whatever this message last carried is now frozen above the next one, so
+        # it becomes the text the next send has to be safe beside.
+        self._frozen_above, self._landed_text = self._landed_text, ""
         self._stream_mid = None
         self._shown = ""
 
@@ -1357,6 +1380,11 @@ class TelegramRenderer(Renderer):
         # A control-tag line still arriving is held off the frame the same way.
         seg = strip_control_comments(seg, hide_partial=True)
         body = await self._safe_body(seg)
+        # Same question as the seal asks, at the other sink: this frame sits under
+        # a frozen message, and a reader reads straight through the gap between
+        # them. Live frames are throttled, so this runs at most once per throttle
+        # window and costs one scan while the seam is clean.
+        body = _break_seam(self._frozen_above, body)
         stall = self._stall_mark()
         # The tool footer wins: it names what is happening, which is strictly
         # more informative than "nothing has happened".
@@ -1376,6 +1404,7 @@ class TelegramRenderer(Renderer):
             return
         self._last_edit = now
         self._shown = text
+        self._landed_text = text
         if self._stream_mid is None:
             mid = await self._client.send_message(
                 self._chat_id,
@@ -1651,11 +1680,21 @@ class TelegramRenderer(Renderer):
         # milliseconds — holding the frame lock across it would block the typing
         # task too, and holding the loop would block every other conversation.
         text = await asyncio.to_thread(_display_safe, text)
+        # The message above is frozen and this text may have been rewritten since
+        # any cut was graded (an options expansion, a chip, a presentation
+        # change), so the pair is re-asked here rather than trusted. The withheld
+        # run is replaced by the redactor's own tag, so `_tally_redactions` counts
+        # it and the turn's notice reports it like any other redaction.
+        text = await asyncio.to_thread(_break_seam, self._frozen_above, text)
         if footer:
             # A quoted line under the answer rather than a separate message: the
             # footer is metadata about the turn, and a second bubble for it would
             # cost a notification and a rate-limit slot the answer needs.
             text = f"{text}\n\n> {footer}"
+        # What this seal puts on screen, so the next message can be graded beside
+        # it. Recorded before the send: a send that fails leaves the check reading
+        # text the user never saw, which only makes the next frame more careful.
+        self._landed_text = text
         async with self._frame_lock:
             try:
                 # --- Rich Message path: tables detected → sendRichMessage (Bot API 10.1+) ---

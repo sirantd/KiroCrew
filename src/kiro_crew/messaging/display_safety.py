@@ -208,6 +208,55 @@ def safe_split_offset(text: str, limit: int, redactor: Callable[[str], str]) -> 
     return 0
 
 
+#: Stands in for the characters withheld at a seam a reader could otherwise
+#: rejoin. The same tag the credential redactor emits, so a piece carrying it is
+#: already a fixed point of the scan (``test_display_split_safety.py`` pins that)
+#: and the breaker cannot introduce something that scans as a secret itself.
+CREDENTIAL_SEAM_TAG = "[REDACTED: credential]"
+
+
+def break_credential_seam(
+    prior: str, text: str, redactor: Callable[[str], str]
+) -> tuple[str, bool]:
+    """Make *text* safe to show directly under *prior*, which is already on screen.
+
+    A boundary is graded by whoever CREATES it. A renderer that cuts its output
+    grades its own cut, but the message above is then frozen while the text below
+    it can still be replaced -- a presentation snapshot, an options expansion, a
+    footer -- and the pair the reader ends up with is not the pair anyone asked
+    about. *prior* cannot be taken back, so the only text left to fix is *text*.
+
+    The failure direction is to WITHHOLD: leading characters of *text* are
+    replaced by :data:`CREDENTIAL_SEAM_TAG` until
+    :func:`joins_to_a_credential` is false. Losing characters beats showing a key,
+    and the tag says out loud that something was held back rather than leaving a
+    silent gap.
+
+    Candidates step back EXPONENTIALLY (nothing withheld, then 1, 2, 4, 8 ...
+    characters), the same cost bound :func:`safe_split_offset` takes: the smallest
+    withholding is not needed, only one that works, and the tag alone is always
+    available as the last candidate. So this costs O(log len(*text*)) redaction
+    passes when a seam is open, and the ONE :func:`joins_to_a_credential` call
+    that clears it when nothing is wrong -- which is every ordinary message.
+
+    Returns:
+        ``(safe_text, broken)``. ``broken`` is True when text was withheld, so a
+        caller can count it the way it counts any other redaction.
+    """
+    if not prior or not text or not joins_to_a_credential(prior, text, redactor):
+        return text, False
+    drop, step = 0, 0
+    while drop < len(text):
+        candidate = CREDENTIAL_SEAM_TAG + text[drop:]
+        if not joins_to_a_credential(prior, candidate, redactor):
+            return candidate, True
+        step = 1 if step == 0 else step * 2
+        drop = step
+    # Nothing of *text* survives. The tag alone cannot extend a key: it is a fixed
+    # point of the scan, and *prior* was scrubbed on its own before it was sent.
+    return CREDENTIAL_SEAM_TAG, True
+
+
 def redact_for_display(text: str, redactor: Callable[[str], str]) -> tuple[str, bool]:
     """Redact *text* against what the platform will DISPLAY, not just the bytes.
 

@@ -77,12 +77,14 @@ from kiro_crew.discord.transport_dispatch import (
 )
 from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
+from kiro_crew.messaging.display_safety import joins_to_a_credential
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
     legacy_dashboard_mirror_key,
 )
 from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
+from kiro_crew.messaging.renderer import _default_redactor
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.monitoring.completion import MonitorCompletionHook
@@ -1167,6 +1169,62 @@ class TestRotationSplitting:
                 ), f"authored characters deleted: {where}"
         # The sweep must not go vacuous.
         assert rotated > 300 and frames > 1000, (rotated, frames)
+
+
+class TestARewrittenHeadIsRegradedAgainstTheSealedFrame:
+    """A boundary is graded by whoever creates it, not only by the rotation.
+
+    ``_rotate_on_length`` seals frames and keeps a remainder live. That remainder
+    is the text the boundary was judged on, and two branches then REPLACE it: the
+    table-card snapshot and the ``apply_options_cap`` expansion both assign the
+    delivery snapshot after a frame has already sealed. The sealed frame is on
+    screen and cannot be taken back, so the pair the reader actually gets is the
+    sealed frame beside a head nobody asked about -- and a key whose first half
+    ended the sealed message and whose second half opens the replacement is
+    readable on screen while each message alone scrubs clean.
+    """
+
+    #: Neither half is a credential alone, which is why each message's own scan
+    #: cannot see this and the PAIR is what has to be checked.
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def _renderer(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: limit)
+        # Live frames are throttled and re-rendered by design; holding them back
+        # leaves ``cli.sent`` as exactly the frozen messages, in order.
+        monkeypatch.setattr("kiro_crew.discord.renderer._EDIT_THROTTLE_S", 1e9)
+        return r, cli
+
+    @pytest.mark.asyncio
+    async def test_a_head_rewritten_after_a_seal_carries_no_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r, cli = self._renderer(monkeypatch, 30)
+        r._buf = [f"first para {self._HEAD_HALF}\n\nsecond para"]
+        await r._rotate_on_length()
+
+        frozen = [t for t, _ in cli.sent]
+        assert frozen == [f"first para {self._HEAD_HALF}"], frozen
+        # Premise: the boundary the ROTATION itself made severs nothing, so this
+        # test is about the rewrite and not about where the cut fell.
+        assert not joins_to_a_credential(frozen[-1], "".join(r._buf), _default_redactor)
+
+        # The branch under test: the live head is replaced after the seal.
+        r._delivery_text = f"{self._TAIL_HALF} and the rest"
+        await r._seal_current()
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        for message in screen:
+            assert _default_redactor(message) == message, f"redacted alone: {message}"
+        assert not joins_to_a_credential(
+            screen[-2], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
 
 
 class TestOptionComponents:
