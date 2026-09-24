@@ -127,12 +127,43 @@ Manual release and an automatic capture stop share the composer's stop protectio
 they freeze the release caret and disarm semantic submission while results drain.
 The drain keeps a way out of its own: Escape discards the released utterance,
 releases the single-microphone claim and disarms the late result, so a wait behind
-a cold model is a wait and not a locked composer. `useVoiceInput` reports that
-window as `draining`, apart from the transcription flag it is folded into, because
+a cold model is a wait and not a locked composer. It also takes the dictated run
+back out of the draft, identified by the span the write occupied rather than by
+what that text says: a wait this long is typed into, and a phrase that merely
+reads like the dictation is not the dictation. The span is RECORDED when the write
+happens rather than reconstructed at the discard: the insertion point is
+deliberately rebased once the release has happened, so a later derivation would
+read a caret that did not produce the write, report that nothing was displaced, and
+rebuild a value the composer never held. What a dictation displaces it displaces
+once, on its first write, so the consumed selection and the far-side separator are
+carried forward while the run's offsets follow each correction.
+`locateDictationSpan` re-derives the offset through whatever the user has edited
+since -- everything between the written value's and the current
+value's common prefix and suffix is that edit, so an edit wholly on either side of
+the span leaves the span itself intact and its new offset follows by arithmetic.
+Which side the edit fell on is not always decidable: an insertion repeating the
+run's own characters makes both readings produce the same string, so BOTH candidate
+offsets are checked and two holding offsets answer no-match. An edit that reaches
+into the span, a span whose text no longer sits at the
+offset, and an ambiguous pair all leave the composer untouched: a residue is a cost
+the user can see and fix, and deleting authored text is not. The removal gives back
+the selection the write consumed, because dictating over selected words deletes
+them, and the separator the write added on its far side where that separator is
+still there.
+`useVoiceInput` reports that window as `draining`, apart from the transcription
+flag it is folded into, because
 only a streaming drain still holds the audio a discard can throw away. The discard
 is also the only gesture the window accepts: the microphone button picks its action
 from whether capture is live, so during the drain it would open a second dictation
-rather than end the pending one.
+rather than end the pending one. Switching the composer to another session discards
+a streaming dictation outright, whether capture is still live or the utterance is
+already released: the switch drops the streaming final one step earlier, so a
+commit delivers nothing and a session left running holds the microphone and
+refuses dictation in every slot with no surface able to release it -- the drain's
+exit belongs to the composer that owns the capture. A batch capture is still
+committed by the switch, and a batch transcription already in flight is left to
+finish: one blob reaches the transcriber and its single final is routed back to
+the slot that dictated it.
 Late final corrections preserve text the user types after capture has stopped.
 Every actual capture end, including a fatal server frame, synchronously fires
 the composer's once-only capture-stop protection before deferred socket-close
