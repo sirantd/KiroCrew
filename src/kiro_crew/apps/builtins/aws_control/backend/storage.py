@@ -43,6 +43,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
@@ -593,6 +594,119 @@ def inline_content_type(key: str) -> str:
     return ""
 
 
+#: The body spelling that makes the CLI child read OUR descriptor instead of
+#: re-resolving a name. ``/dev/stdin`` is a symlink to ``/proc/self/fd/0`` on
+#: Linux and a character device with the same meaning on macOS, so the child
+#: opens whatever descriptor it inherited as fd 0 -- here, the descriptor this
+#: process opened and checked. The Linux sandbox is a user + mount namespace
+#: that bind-mounts empty directories over the trees it hides (see
+#: ``sandbox.wrap_argv``); it does not remount ``/proc`` or ``/dev``, and
+#: Seatbelt remounts nothing, so the spelling survives both backends.
+_DESCRIPTOR_BODY = "/dev/stdin"
+
+#: Whether the CLI can be handed a descriptor rather than a name for its body.
+#: Windows has no ``/dev/stdin``; that platform takes the pinned-name arm in
+#: :func:`put_file`, which is sound there for a reason POSIX cannot borrow -- a
+#: held directory handle blocks a rename of the directory and of every directory
+#: above it, so the name cannot be re-pointed while we hold it.
+_CAN_PASS_BODY_DESCRIPTOR = platform_compat.IS_POSIX
+
+
+def _verified_body_fd(local_path: str) -> int:
+    """Open *local_path* for upload and return a descriptor proven to be its file.
+
+    Three checks, each stopping a different substitution, all taken on the
+    DESCRIPTOR rather than on the name -- which is the point: a check on a name
+    describes whatever that name resolved to at the moment of the check, and the
+    upload resolves it again.
+
+    * ``O_NOFOLLOW`` refuses a symlink AT the name, so the upload cannot be
+      redirected to another file by planting a link.
+    * ``S_ISREG`` refuses a FIFO or a device. A FIFO is the worse of the two: the
+      CLI's own open would BLOCK until a writer appeared, and whatever that
+      writer sent would become the object's bytes.
+    * ``st_nlink == 1`` refuses a hard link, which defeats the other two by
+      construction -- it is a genuine regular file, reached under the expected
+      name, with no link for ``O_NOFOLLOW`` to reject, while pointing at another
+      file's inode. ``os.link("~/.aws/credentials", "<staging>/archive.tar.gz")``
+      is the whole attack, and the link COUNT is the only thing that sees it.
+
+    The owner check is separate from all three: a file this process did not write
+    has no business being uploaded under the owner's key even when it is a
+    perfectly ordinary regular file.
+
+    ``O_NONBLOCK`` is on the open itself so the FIFO case is REFUSED rather than
+    hanging here in place of hanging in the child.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    if platform_compat.IS_POSIX:
+        flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(local_path, flags)
+    except OSError as exc:
+        # ELOOP is the symlink refusal; the rest (ENOENT, EACCES, ENXIO) are
+        # ordinary and say the same thing to the caller -- these bytes are not
+        # uploadable, so nothing is sent.
+        raise AWSError(
+            f"the upload body could not be opened as a regular file of its own: {exc.strerror}"
+        ) from exc
+    try:
+        _assert_uploadable(fd)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _assert_uploadable(fd: int) -> os.stat_result:
+    """Refuse *fd* unless it is a regular file, singly named, and the owner's.
+
+    For a descriptor this function OPENED from a name. See
+    :func:`_assert_uploadable_handle` for the other case, which deliberately makes
+    fewer checks rather than more.
+    """
+    info = _assert_uploadable_handle(fd)
+    if info.st_nlink != 1:
+        raise AWSError(
+            "the upload body has more than one name, so it may be a hard link to another "
+            "file; refusing rather than uploading bytes that were never staged here"
+        )
+    if platform_compat.IS_POSIX and info.st_uid != os.getuid():
+        raise AWSError(
+            "the upload body is owned by another user, so this process did not stage it; "
+            "refusing rather than uploading a file it does not own"
+        )
+    return info
+
+
+def _assert_uploadable_handle(fd: int) -> os.stat_result:
+    """Refuse *fd* unless it is a regular file. The only check a HANDED-OVER fd gets.
+
+    A caller that created its payload exclusively and has held the descriptor ever
+    since has already established which inode this is, and holding it is what keeps
+    that true: no rename, unlink or hard link can make a descriptor point somewhere
+    else. So the link count says nothing here, and re-checking it would be actively
+    wrong in both directions -- a same-UID process that merely UNLINKS the staging
+    name leaves the held inode at zero links, and one that adds a second name
+    leaves it at two, and in both cases the bytes about to be sent are still the
+    ones the caller built and measured. Refusing them would let anyone who can
+    write the staging directory cancel a scheduled backup by touching a name
+    nothing reads any more.
+
+    ``S_ISREG`` is kept because it is about the descriptor's own kind rather than
+    about its names: a pipe or a character device handed here would make the upload
+    send an unbounded stream under a size taken from ``fstat``, which is a
+    correctness failure whatever its provenance.
+    """
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise AWSError(
+            "the upload body is not a regular file, so the bytes that would be sent are "
+            "not this file's; refusing rather than uploading whatever it resolves to"
+        )
+    return info
+
+
 def put_file(
     profile: str,
     region: str,
@@ -603,6 +717,7 @@ def put_file(
     *,
     account: str,
     timeout: int = 600,
+    body_fd: int | None = None,
 ) -> str:
     """Upload one local file to ``section/key``, pinned to the bucket's owner.
 
@@ -610,6 +725,23 @@ def put_file(
     A caller that does not care may ignore it; backup retention records it, because
     on a versioned bucket the version id is the only thing identifying WHICH bytes
     under a key an uploader wrote.
+
+    **The bytes uploaded are one inode's, and it is the inode this function
+    checked.** Every payload here is staged in a directory a same-UID process can
+    write, so a NAME handed to the CLI is a name that gets resolved again: a size
+    taken from one resolution, the CLI's ``--body`` open from another, and a
+    caller's own fingerprint from a third are three answers about three moments,
+    and a process that replaces the file between any two of them makes the object
+    carry bytes nothing checked -- off-host, unattended, with no recall. So the
+    file is opened once (:func:`_verified_body_fd`), the size is taken from
+    ``fstat`` on that descriptor, and the body is read THROUGH it.
+
+    *body_fd* lets a caller that has already opened and checked the payload hand
+    that same descriptor over, so its own measurements and this upload describe
+    one inode rather than two resolutions that agreed. It stays the caller's to
+    close. Omitted, this opens and checks the file itself -- which is what makes
+    every caller safe without changing, and it is the shape the label sidecar and
+    the library push use.
 
     ``s3api put-object`` rather than ``s3 cp``: the high-level ``aws s3`` commands
     do not accept ``--expected-bucket-owner`` (checked against their own help
@@ -626,38 +758,108 @@ def put_file(
     surface depends on the browser trusting this header. An extension
     ``mimetypes`` cannot place keeps the S3 default rather than guessing.
     """
-    size = os.path.getsize(local_path)
-    if size > _MAX_PINNED_TRANSFER_BYTES:
-        raise AWSError(
-            f"{size} bytes exceeds the {_MAX_PINNED_TRANSFER_BYTES}-byte limit for a "
-            "single owner-pinned upload; refusing rather than transferring without "
-            "the bucket-owner check"
+    owned_fd = -1
+    if body_fd is None:
+        owned_fd = _verified_body_fd(local_path)
+        fd = owned_fd
+    else:
+        # A handed-over descriptor gets the KIND check and not the name checks.
+        # The caller created it exclusively and has held it since, and holding a
+        # descriptor is what makes its inode fixed -- so a link count taken here
+        # would describe how many names the inode happens to have now, which is
+        # something a same-UID process can change at will without touching a byte
+        # of it. See :func:`_assert_uploadable_handle`.
+        fd = body_fd
+        _assert_uploadable_handle(fd)
+    try:
+        size = os.fstat(fd).st_size
+        if size > _MAX_PINNED_TRANSFER_BYTES:
+            raise AWSError(
+                f"{size} bytes exceeds the {_MAX_PINNED_TRANSFER_BYTES}-byte limit for a "
+                "single owner-pinned upload; refusing rather than transferring without "
+                "the bucket-owner check"
+            )
+        if _CAN_PASS_BODY_DESCRIPTOR:
+            body = _DESCRIPTOR_BODY
+            stdin_fd: int | None = fd
+            visible: tuple[str, ...] = ()
+            # The descriptor arrives at whatever offset its last reader left. On
+            # Linux the child's ``open("/dev/stdin")`` gets a fresh file
+            # description starting at 0, but a character-device spelling need not,
+            # so the position is set here rather than assumed -- an upload that
+            # started mid-file would send a truncated object and record it as the
+            # whole archive.
+            os.lseek(fd, 0, os.SEEK_SET)
+        else:
+            # Windows. No ``/dev/stdin``, so the CLI is given the name -- and what
+            # makes that sound here is the caller's PINNED directory rather than
+            # anything this function can do: a directory with an open handle can
+            # be neither renamed nor deleted, nor can any directory above it, so
+            # the name cannot be re-pointed at a planted junction between our
+            # checks and the child's open. The identity of the file that name
+            # reaches is re-verified after the call against the descriptor above,
+            # so a substitution that happened anyway is reported rather than
+            # recorded as a successful upload of our bytes.
+            body = local_path
+            stdin_fd = None
+            visible = ()
+        args = [
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            section_key(section, key),
+            "--body",
+            body,
+        ]
+        content_type = inline_content_type(key)
+        if content_type:
+            args += ["--content-type", content_type]
+        args += ["--expected-bucket-owner", account]
+        # `--output json` for the same reason the version delete pins it: the parse
+        # below would otherwise become a no-op on a machine whose ~/.aws/config sets
+        # `output = text`, and this caller needs the response, not just the exit code.
+        args += ["--output", "json"]
+        out = _checked(
+            args,
+            profile,
+            action="s3:PutObject",
+            timeout=timeout,
+            extra_visible_dirs=visible,
+            stdin_fd=stdin_fd,
         )
-    args = [
-        "s3api",
-        "put-object",
-        "--bucket",
-        bucket,
-        "--key",
-        section_key(section, key),
-        "--body",
-        local_path,
-    ]
-    content_type = inline_content_type(key)
-    if content_type:
-        args += ["--content-type", content_type]
-    args += ["--expected-bucket-owner", account]
-    # `--output json` for the same reason the version delete pins it: the parse
-    # below would otherwise become a no-op on a machine whose ~/.aws/config sets
-    # `output = text`, and this caller needs the response, not just the exit code.
-    args += ["--output", "json"]
-    out = _checked(
-        args,
-        profile,
-        action="s3:PutObject",
-        timeout=timeout,
-    )
-    return _put_version_id(out)
+        if not _CAN_PASS_BODY_DESCRIPTOR:
+            _assert_same_file(fd, local_path)
+        return _put_version_id(out)
+    finally:
+        if owned_fd >= 0:
+            os.close(owned_fd)
+
+
+def _assert_same_file(fd: int, local_path: str) -> None:
+    """Refuse unless *local_path* still names the file *fd* holds.
+
+    Only the pinned-name arm needs this, and it DETECTS rather than prevents: the
+    bytes are already in the bucket by the time it runs. It is worth having
+    anyway, because the alternative is recording a successful upload of bytes this
+    process never read -- a restore would then hand those bytes back as the
+    owner's own archive, which is the outcome the record exists to make impossible.
+    """
+    held = os.fstat(fd)
+    try:
+        landed = os.stat(local_path)
+    except OSError as exc:
+        raise AWSError(
+            f"the upload body could not be re-checked after the transfer: {exc.strerror}"
+        ) from exc
+    if (landed.st_dev, landed.st_ino) != (held.st_dev, held.st_ino):
+        raise AWSError(
+            "the upload body was replaced during the transfer, so the object now in the "
+            "bucket may not be the file that was checked"
+        )
+    if landed.st_nlink != 1:
+        raise AWSError("the upload body was linked elsewhere during the transfer")
 
 
 def _put_version_id(out: str) -> str:

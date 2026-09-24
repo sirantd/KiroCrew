@@ -532,7 +532,13 @@ class TestObjectIO:
         assert argv[:2] == ["s3api", "put-object"]
         assert argv[argv.index("--bucket") + 1] == "b"
         assert argv[argv.index("--key") + 1] == "drive/a.txt"
-        assert argv[argv.index("--body") + 1] == str(local)
+        # The body is the DESCRIPTOR this call opened and checked, not the name it
+        # was given: a name is resolved again by the CLI child, and a same-UID
+        # process that replaced the file in between would have had its bytes
+        # uploaded instead. The descriptor is handed over as the child's stdin,
+        # which is what `/dev/stdin` reads.
+        assert argv[argv.index("--body") + 1] == storage._DESCRIPTOR_BODY
+        assert kwargs["stdin_fd"] is not None
         assert argv[argv.index("--expected-bucket-owner") + 1] == "111122223333"
         assert kwargs["action"] == "s3:PutObject"
 
@@ -580,9 +586,14 @@ class TestObjectIO:
         # put-object is ONE request, so an oversized body cannot be sent this way.
         # The alternative would be `s3 cp`'s multipart, which cannot carry the
         # owner check -- so this refuses instead of transferring unpinned.
+        #
+        # The ceiling is measured on the DESCRIPTOR being uploaded rather than on
+        # the name, so the number checked and the bytes sent cannot disagree; the
+        # test lowers the ceiling instead of faking a size, which is the same
+        # decision with nothing stubbed.
         local = tmp_path / "big.tar.gz"
-        local.write_bytes(b"x")
-        monkeypatch.setattr(storage.os.path, "getsize", lambda p: 6 * 1024 * 1024 * 1024)
+        local.write_bytes(b"x" * 16)
+        monkeypatch.setattr(storage, "_MAX_PINNED_TRANSFER_BYTES", 4)
         with mock.patch.object(storage, "_checked", return_value="{}") as checked:
             with pytest.raises(storage.AWSError) as exc:
                 storage.put_file(

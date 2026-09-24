@@ -459,6 +459,43 @@ an archive-level comparison reports "changed" every night. Reading it from the p
 rather than by a second walk of the source also means it cannot disagree with what would
 actually be sent, and that a redaction switch changes the fingerprint.
 
+**Every read of the archive comes from ONE descriptor, and so does the upload.** The
+archive is staged in a temporary directory, which excludes other USERS and not the
+same-UID agent this module's sandbox notes describe planting links in the shared temp
+root -- so each step that re-resolved the archive's NAME was a step at which a
+substituted file could be measured or sent instead. `backup._pinned_staging` holds the
+staging directory open, `backup._create_pinned_archive_fd` creates the archive relative
+to that descriptor with `O_EXCL | O_NOFOLLOW` (an entry already at the name fails the
+create rather than becoming what the tar writes through), and the entry-set digest, the
+recorded size, the body digest and `storage.put_file`'s body all come from that one
+descriptor. The snapshot path takes the same hold through
+`backup._open_pinned_archive_fd`, which is an `O_NOFOLLOW` open plus an `fstat`
+requiring a singly-named regular file this process owns, because `snapshot_main` and
+`snapshot.prepare_redacted_copy` create their own files. `backup._PreadReader` is what
+lets two readers share the descriptor: `os.dup` would share the file OFFSET and leave
+the upload positioned at the end, so the archive is read by explicit offset instead.
+
+`storage.put_file` carries the other half. It takes `body_fd` from a caller that has
+already opened and checked its payload, and otherwise opens `local_path` itself
+(`storage._verified_body_fd`) -- which is what protects the callers with no fingerprint
+of their own, the label sidecar and the library push. The body reaches the AWS CLI as
+`--body /dev/stdin` with that descriptor passed as the child's stdin
+(`engine.run_aws`'s `stdin_fd`), so the child resolves no path at all. Three checks
+stand on the descriptor rather than on the name, each stopping a different
+substitution: `O_NOFOLLOW` a symlink, `st_nlink == 1` a hard link (which defeats the
+other two by construction, being a genuine regular file under the expected name), and
+`S_ISREG` a FIFO -- whose own open would otherwise BLOCK until a writer appeared and
+then upload whatever it sent. A HANDED-OVER descriptor is checked for its kind only:
+holding a descriptor is what fixes its inode, so a link count there would describe how
+many names the inode happens to carry now, which a same-UID process can change without
+touching a byte -- and refusing on it would let anyone who can write the staging
+directory cancel a scheduled backup by unlinking a name nothing reads any more.
+Windows has no `/dev/stdin`, so it passes the name and relies on the pinned directory
+handle, which blocks a rename or delete of the directory and of every directory above
+it; the file's identity is re-verified against the held descriptor afterwards, which
+DETECTS rather than prevents and exists so a substitution is not recorded as a
+successful upload of our bytes.
+
 Two normalizations are part of the digest's definition, each measured against the real
 engine rather than assumed. `_VOLATILE_MANIFEST_FIELDS` drops `created_at` from
 `MANIFEST.json`, the one field `snapshot.py` rewrites on a rebuild of an unchanged tree;
