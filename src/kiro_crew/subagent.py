@@ -97,6 +97,13 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.process_identity import (  # noqa: F401 - resolved by run.py/terminal.py via bind_component_globals
+    ProcessHandle,
+    failure_name,
+    kill_verified_process,
+    process_handle_of,
+    process_survived,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -536,6 +543,18 @@ _STEER_STARTUP_POLL_SECS = 0.5
 # latency is irrelevant next to permanent wedging.
 _WAVE_STUCK_SECS = 1800
 _RESET_TIMEOUT = 30.0  # max seconds for session reset in finally block
+
+
+def _with_kill_failure(error: str, kill_failed: str) -> str:
+    """The run's error text with the force-stop's reported failure appended.
+
+    Same suffix the cron reaper writes into a job's ``last_error``
+    (``…; kill failed: <reason>``), so the two audit trails read alike.
+    """
+    suffix = f"kill failed: {kill_failed}"
+    return f"{error}; {suffix}" if error else suffix
+
+
 _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
@@ -2652,6 +2671,17 @@ class SubagentManager:
         # makes that inference unnecessary. Removed by the same ``finally`` that sets
         # the event, so a missing entry always means "nothing left to wait for".
         self._teardown_gates: dict[str, asyncio.Event] = {}
+        #: run id -> the kill handles of every process its session key named,
+        #: RETAINED across the reset that pops the session from the map (see
+        #: :class:`kiro_crew.process_identity.ProcessHandle`).
+        #: Written by :meth:`_retain_process_handles` from whichever teardown path
+        #: reaches the reset first -- the run's own ``finally`` or the reaper --
+        #: and read by the other on a session-map miss, so a force-stop that
+        #: arrives while the first reset is hanging can still name, verify and
+        #: signal the process. Cleared when the path that holds it has decided
+        #: (the handles were consumed by the kill, or the survivor check found
+        #: the processes gone); an entry that outlives its run is one small record.
+        self._process_handles: dict[str, list[ProcessHandle]] = {}
         #: parent session key -> event pulsed whenever one of its runs reaches a
         #: terminal report. Created on demand by :meth:`completion_event` and
         #: dropped by :meth:`release_completion_event`, so the only entries are
@@ -3719,8 +3749,19 @@ class SubagentManager:
     ) -> None:
         return await self._terminal._force_reap_impl(agent_id, info, elapsed, reason=reason)
 
-    async def _sigkill_session(self, session_key: str) -> None:
-        return await self._terminal._sigkill_session_impl(session_key)
+    async def _sigkill_session(self, session_key: str, handle: ProcessHandle | None) -> str | None:
+        return await self._terminal._sigkill_session_impl(session_key, handle)
+
+    async def _sigkill_sessions(self, session_key: str, handles: list[ProcessHandle]) -> str | None:
+        return await self._terminal._sigkill_sessions_impl(session_key, handles)
+
+    def _retain_process_handles(self, agent_id: str, session_key: str) -> list[ProcessHandle]:
+        return self._terminal._retain_process_handles_impl(agent_id, session_key)
+
+    def _retain_process_handle(self, agent_id: str, session_key: str) -> ProcessHandle | None:
+        """The first of :meth:`_retain_process_handles` -- the run's own process -- or None."""
+        handles = self._retain_process_handles(agent_id, session_key)
+        return handles[0] if handles else None
 
     def notify_injection_failed(
         self, info: SubagentInfo, reason: str = "delivery timed out"
