@@ -5927,7 +5927,9 @@
         "confirm_after_failure": "Riprova",
         "working": "Autorizzazione e attivazione in corso...",
         "failed": "Non è stato possibile attivare «{{app}}», ma l'autorizzazione potrebbe essere già salvata. Scegli Riprova, oppure apri Impostazioni → Sicurezza → App di terze parti attendibili per verificarla e rimuoverla.",
-        "failed_generic": "Non è stato possibile attivare «{{app}}» e nulla è stato modificato. Scegli Riprova, oppure controlla i log di {{productName}}."
+        "failed_generic": "Non è stato possibile attivare «{{app}}» e nulla è stato modificato. Scegli Riprova, oppure controlla i log di {{productName}}.",
+        "failed_desktop_unsupported": "Questa app non può essere installata nella versione desktop di {{productName}}.",
+        "failed_desktop_unsupported_help": "Ha bisogno di pacchetti Python che la build desktop non può aggiungere; chiedi all'autore dell'app di includerli con l'app, oppure usa l'installazione gateway."
       },
       "registryTier": {
         "curated": "Verificato dal team",

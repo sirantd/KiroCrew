@@ -67,6 +67,8 @@ from kiro_crew.apps.manifest import (
     AppManifest,
     app_name_error,
     is_reserved_app_name,
+    requirements_in_tree,
+    runtime_provisions_requirements,
 )
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
@@ -5837,6 +5839,7 @@ async def _clone_build_app(
     subdirectory: str = "",
     entry_repo: str = "",
     commit: str = "",
+    self_managed: bool = False,
 ) -> dict[str, Any]:
     """Clone an app repo, gate its identity, then run its build.
 
@@ -5851,6 +5854,12 @@ async def _clone_build_app(
     *index_originated* is forwarded to :func:`_git_clone_or_pull` to pick the
     credential posture (credential-free + strict sandbox for repos whose URL
     came from an external registry index — see that function's docstring).
+
+    *self_managed* is the registry entry's resource ownership (``resources:
+    "app"``), forwarded to :func:`_run_app_build` for the desktop gate, where it
+    is required; ``install_from_registry`` -- the one caller that reads the
+    entry -- always passes it, and the default names the gateway-managed
+    install the way *index_originated*'s names the catalog posture.
 
     Returns ``{"ok": True, "pkg_dir": <Path>}`` on success or
     ``{"ok": False, "error": ...}`` on failure/refusal.
@@ -5882,6 +5891,7 @@ async def _clone_build_app(
             subdirectory=subdirectory,
             entry_repo=entry_repo,
             commit=commit,
+            self_managed=self_managed,
             pending_cleanup=pending_cleanup,
             restorable_stale=restorable_stale,
         )
@@ -6087,6 +6097,7 @@ async def _clone_build_app_locked(
     subdirectory: str = "",
     entry_repo: str = "",
     commit: str = "",
+    self_managed: bool = False,
     pending_cleanup: list[Path],
     restorable_stale: list[Path] | None = None,
 ) -> dict[str, Any]:
@@ -6100,6 +6111,8 @@ async def _clone_build_app_locked(
     can read the move-aside state, and every test constructs one too; an
     optional-with-``None`` shape would only invite a caller to drop the list
     and silently lose that state, so there is no default to fall back to.
+    *self_managed* is the registry entry's resource ownership, forwarded to the
+    desktop gate in :func:`_run_app_build` (see :func:`_clone_build_app`).
     """
     credential_target = git_url
     if _git_target_is_unsupported(credential_target):
@@ -6212,9 +6225,15 @@ async def _clone_build_app_locked(
     # manifest at clone time, and under a require-signature policy that content
     # must not build or install. Same fail-closed policy call, different
     # artifact.
+    # The typed view, built ONCE: the admission gate below and the build's
+    # desktop gate must judge the same normalized manifest the runtime later
+    # loads from (`manager.py` hands the hook loaders
+    # `AppManifest.from_json_file(...).to_dict()`), so a second, differently
+    # normalized reading of these bytes is exactly the disagreement to avoid.
+    cloned_app_manifest = AppManifest.from_dict(cloned_manifest)
     denied = app_admission_denied(
         app_name,
-        manifest=AppManifest.from_dict(cloned_manifest),
+        manifest=cloned_app_manifest,
         action="install_from_registry",
     )
     if denied:
@@ -6259,7 +6278,13 @@ async def _clone_build_app_locked(
     # `app_source` is already the containment-checked join of `subdirectory`
     # under the clone root (the identity gate above fails closed on an escaping
     # value), so it is safe to run the build command there.
-    result = await _run_app_build(app_source, app_name, log_lines)
+    #
+    # `cloned_app_manifest` is the manifest the identity and admission gates just
+    # judged — passed rather than re-read so the build decides from the bytes
+    # those gates accepted, normalized once, the way the runtime's loaders see it.
+    result = await _run_app_build(
+        app_source, app_name, log_lines, manifest=cloned_app_manifest, self_managed=self_managed
+    )
     if result["ok"]:
         result["pkg_dir"] = pkg_dir
         # Surface the pre-clone checkout state so the caller's LATER gates
@@ -6336,10 +6361,186 @@ async def _clone_build_app_locked(
     return result
 
 
+def _requirements_owned_by_the_runtime(
+    manifest: AppManifest, app_root: Path, *, self_managed: bool
+) -> bool:
+    """True when the runtime provisions this app's root ``requirements.txt`` out
+    of process and nothing of the app's Python imports into the gateway.
+
+    This is the RUNTIME'S OWN condition, not an approximation of it: the
+    out-of-process half is :func:`runtime_provisions_requirements`, the predicate
+    both provisioners themselves call (``apps/backend.py`` at the spawn of a
+    FILE-style ``backend.entryPoint``, ``apps/bridges.py`` at the registration of
+    a stdio ``mcpServers`` entry), so a shape they refuse -- a module-style,
+    dotted entry point, which executes trusted package code and never has an
+    app-dir requirements file installed for it -- fails here too instead of
+    passing an install whose dependencies land nowhere.
+
+    The in-process half is this gate's own: a declared ``backend.hooks`` field is
+    imported INTO the gateway process (``lifecycle.py``, ``route_registry.py``),
+    which the deps tree never reaches, so an app declaring one has Python that
+    must import from the gateway's interpreter after all -- waiving for it would
+    install the app "successfully" with its hook imports broken and its routes
+    degraded, the silent-broken install the loud refusal exists to prevent.
+
+    *self_managed* is the registry entry's resource ownership (``resources:
+    "app"``), which no manifest field carries and which decides whether either
+    provisioner ever RUNS for this app: ``install_from_registry`` registers a
+    self-managed app from its manifest alone -- no source is copied into the app
+    directory, ``bridges.py`` skips every registration for it, and the app
+    launches itself -- so the runtime never sees its ``requirements.txt``. On a
+    source install the build step's ``pip install -r`` was the only thing that
+    installed that file, and that step is exactly what the bundled interpreter
+    cannot run: waiving for a self-managed app would report a successful install
+    whose dependencies landed nowhere, so it keeps the refusal regardless of what
+    its manifest declares. Required rather than defaulted, for the same reason
+    *manifest* is on :func:`_run_app_build`: the permissive value must be stated
+    by a caller that knows the entry, never inherited.
+
+    Answers from the TYPED manifest, which is what decides what actually loads:
+    ``manager.py`` hands the loaders ``AppManifest.from_json_file(...).to_dict()``,
+    so a declaration ``BackendConfig.from_dict`` normalizes away is a hook the
+    loaders never see either, and ``bridges.py`` reads ``manifest.mcpServers`` from
+    the same typed object. *app_root* is the checkout the entry-point shape is
+    judged against -- the tree ``install_app`` copies into the app directory the
+    spawn later resolves the same name under.
+    """
+    if self_managed:
+        return False
+    # `hooks.to_dict()` omits every blank field, so an empty dict IS "declares no
+    # in-gateway hook", in the same emission the loaders are fed.
+    if manifest.backend.hooks.to_dict():
+        return False
+    return runtime_provisions_requirements(manifest, app_root)
+
+
+#: Machine code carried beside the desktop refusal on the install result. The
+#: dashboard keys its plain-language copy on it: the condition is permanent for
+#: this gateway (retrying cannot change what the bundled interpreter can install),
+#: so the consent modal drops its retry instruction for exactly this code.
+DESKTOP_BUILD_STEP_UNSUPPORTED = "desktop_build_step_unsupported"
+
+_DESKTOP_BUILD_REFUSAL = (
+    "Python apps that require a build step are not supported in the desktop app: "
+    "its bundled interpreter is inside the signed application bundle and cannot "
+    "install packages"
+)
+
+
+def _desktop_build_refusal(build_dir: Path, manifest: AppManifest, *, self_managed: bool) -> str:
+    """The desktop app's build-step refusal for this checkout, or ``""`` when it may install.
+
+    The ONE owner of that verdict. :func:`_run_app_build` asks it before planning
+    any Python build command, and :func:`install_from_registry` asks it again on
+    the FINAL checkout -- after the build and ``setup.onInstall`` have run with
+    write access -- so the waiver the build granted is re-derived from what
+    actually registers rather than trusted across a script that can add
+    ``backend.hooks`` or drop the out-of-process consumer it was granted for.
+    Both callers are coroutines and run it through ``asyncio.to_thread``: the
+    layout probes below are filesystem stats, and ``KIROCREW_HOME`` can sit on a
+    network mount that stalls, which on the event loop would freeze the gateway
+    and its liveness heartbeat with it.
+
+    Judges the same layout the build detects, in the same order: nothing on a
+    gateway that is not the bundled interpreter; nothing when ``package.json``
+    selects the JavaScript build (the Python files are not examined then); the
+    refusal for ``pyproject.toml`` / ``setup.py``, which install INTO this
+    interpreter; the refusal for a ``requirements.txt`` the runtime does not
+    provision (:func:`_requirements_owned_by_the_runtime`, which *self_managed*
+    -- the registry entry's resource ownership -- feeds) or will not READ
+    (:func:`~kiro_crew.apps.manifest.requirements_in_tree`, the provisioner's
+    own acceptance rule: a link escaping the app root, a dangling one, a
+    non-file); ``""`` for one it does, and for a checkout with no Python build
+    files at all. ``install_app`` copies the tree with ``symlinks=True``, so
+    the link judged here in the checkout is the link the runtime meets in the
+    app directory.
+
+    Presence is ``lexists``, the provisioner's own notion: a dangling
+    ``requirements.txt`` link is "present but not a readable regular file" to
+    ``provision_app_deps``, which refuses it and does not spawn the backend --
+    so with a consumer declared it is refused here rather than waived into an
+    install whose backend never starts. With NO consumer nothing of ours would
+    ever read it, and the build's own detection (``is_file``, on every host)
+    sees no file: it passes, as it does on a source install.
+    """
+    if not platform_compat.is_bundled_interpreter():
+        return ""
+    if (build_dir / "package.json").is_file():
+        return ""
+    if (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file():
+        return _DESKTOP_BUILD_REFUSAL
+    requirements = build_dir / "requirements.txt"
+    if not os.path.lexists(requirements):
+        return ""
+    if not _requirements_owned_by_the_runtime(manifest, build_dir, self_managed=self_managed):
+        # A readable requirements.txt with nothing of ours to provision it is
+        # the silent-broken install; a dangling link with no consumer is what the
+        # build's detection already calls "no file".
+        return _DESKTOP_BUILD_REFUSAL if requirements.is_file() else ""
+    if requirements_in_tree(build_dir, requirements) is None:
+        return _DESKTOP_BUILD_REFUSAL
+    return ""
+
+
+#: The files whose presence decides the desktop gate's verdict and the build's
+#: detection, in the order both read them.
+_DESKTOP_LAYOUT_FILES = ("package.json", "pyproject.toml", "setup.py", "requirements.txt")
+
+
+def _desktop_layout_present(app_source: Path) -> frozenset[str]:
+    """The desktop gate's layout inputs present under *app_source* right now.
+
+    Presence is ``lexists``: a dangling link is a present entry to the gate and
+    to the provisioner alike. Taken before ``setup.onInstall`` runs, so a
+    refusal after it can tell what the script created from what was there.
+    """
+    return frozenset(
+        name for name in _DESKTOP_LAYOUT_FILES if os.path.lexists(app_source / name)
+    )
+
+
+def _remove_script_created_layout(
+    app_source: Path, present_before: frozenset[str], log_lines: list[str]
+) -> None:
+    """Remove the layout files ``setup.onInstall`` created in a pre-existing checkout.
+
+    Companion to :func:`_unpoison_rejected_checkout` for the final desktop
+    refusal: ``git reset --keep`` restores tracked files, but a file the script
+    CREATED is untracked and survives it, and a surviving ``pyproject.toml`` /
+    ``setup.py`` makes every retry refuse at the build gate -- before the script
+    a fixed remote would have corrected ever runs again. Removes exactly the
+    entries in :data:`_DESKTOP_LAYOUT_FILES` that were absent in
+    *present_before* and are present now, by fixed leaf name under the
+    containment-checked *app_source*, with ``unlink`` (never following a link,
+    so a link the script planted removes the link alone; a directory of that
+    name is left and logged). Files that existed before the script -- the user's
+    own content included -- are never touched. Best-effort, like the rollback it
+    follows: a failure is logged, and the refusal stands regardless.
+    """
+    for name in _DESKTOP_LAYOUT_FILES:
+        if name in present_before:
+            continue
+        path = app_source / name
+        if not os.path.lexists(path):
+            continue
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            log_lines.append(
+                f"WARNING: could not remove {name} created by the install script: {exc}; "
+                "a retry may keep refusing until the source is repaired"
+            )
+        else:
+            log_lines.append(f"Removed {name}, created by the install script, from the checkout")
+
+
 async def _run_app_build(
     build_dir: Path,
     app_name: str,
     log_lines: list[str],
+    *,
+    manifest: AppManifest,
+    self_managed: bool,
 ) -> dict[str, Any]:
     """Build a cloned app using a sensible default for its ecosystem.
 
@@ -6350,6 +6551,22 @@ async def _run_app_build(
         ``setup.py`` /
         ``requirements.txt``  → ``pip install .`` (or ``-r requirements.txt``)
       - otherwise             → no build step (source is used as-is)
+
+    *manifest* is the CLONED ``app.json``, typed — the same object the admission
+    gate judged, and normalized the way the runtime's own loaders see it. It
+    decides one thing only: whether a bundled interpreter may pass a
+    requirements-only app through to the runtime's own provisioning (see
+    :func:`_requirements_owned_by_the_runtime`). Required rather than
+    defaulted, so a caller states what the app declares instead of inheriting a
+    verdict; an empty ``AppManifest`` is the honest value for "declares nothing",
+    and it refuses.
+
+    *self_managed* is the registry entry's resource ownership (``resources:
+    "app"``), the other input of that verdict: the runtime provisions only the
+    apps it installs and spawns itself, and a self-managed app is registered from
+    its manifest alone, so its ``requirements.txt`` keeps the refusal. Required
+    for the same reason -- ``False`` is the permissive value and must be stated by
+    the caller that read the entry.
 
     The app's own ``setup.onInstall`` script (run later by
     ``install_from_registry``) can perform any additional steps.  A missing
@@ -6374,6 +6591,40 @@ async def _run_app_build(
                 pass
         else:
             log_lines.append("npm not found on PATH — skipping JavaScript build step")
+    elif platform_compat.is_bundled_interpreter():
+        # The desktop gate decides for the bundled interpreter, ahead of the
+        # `is_file` detection the pip branch below uses, because it decides on
+        # the provisioner's own notion of presence (`lexists`): a dangling
+        # requirements.txt link that a declared consumer would try to read is
+        # refused here exactly as `provision_app_deps` refuses it at spawn,
+        # where `is_file` would have called it "no build step" and installed an
+        # app whose backend never starts. What the refusal is about, and why a
+        # runtime-provisioned requirements.txt is waived, is the comment on the
+        # pip branch below; `_desktop_build_refusal` owns the verdict, and
+        # `install_from_registry` asks it again on the FINAL checkout, after
+        # `setup.onInstall` has run, so a script that rewrites the manifest cannot
+        # keep a waiver judged on the manifest that entered it. Off-loop: its
+        # layout probes stat the checkout, which can sit on a stalling network
+        # mount.
+        refusal = await asyncio.to_thread(
+            _desktop_build_refusal, build_dir, manifest, self_managed=self_managed
+        )
+        if refusal:
+            return {
+                "ok": False,
+                "name": app_name,
+                "error": refusal,
+                "code": DESKTOP_BUILD_STEP_UNSUPPORTED,
+            }
+        if (build_dir / "requirements.txt").is_file():
+            log_lines.append(
+                "requirements.txt is provisioned at runtime into this app's own deps "
+                "directory (for its backend entry point or stdio MCP server), so no "
+                "install-time pip step runs on the bundled interpreter"
+            )
+            return {"ok": True}
+        # Nothing here that would build (or a requirements.txt entry nothing
+        # reads): no build step, reported below like any source-as-is checkout.
     elif (
         (build_dir / "pyproject.toml").is_file()
         or (build_dir / "setup.py").is_file()
@@ -6412,16 +6663,47 @@ async def _run_app_build(
         # platform_compat.is_bundled_interpreter() — the single owner of the
         # packaging-layout sentinel — so a bundler rename breaks its pinned test
         # instead of silently un-matching an inline check here.
-        if platform_compat.is_bundled_interpreter():
-            return {
-                "ok": False,
-                "name": app_name,
-                "error": (
-                    "Python apps that require a build step are not supported in "
-                    "the desktop app: its bundled interpreter is inside the "
-                    "signed application bundle and cannot install packages"
-                ),
-            }
+        #
+        # What that refusal is ABOUT is the gateway's own import path, so it
+        # applies to what would have to land there: `pyproject.toml` / `setup.py`
+        # install INTO this interpreter (`pip install .`). A root requirements.txt
+        # the RUNTIME provisions out of process is a different dependency:
+        # `backend.py::provision_app_deps` (at the spawn of a `backend.entryPoint`)
+        # and `bridges.py::_maybe_provision_backendless_deps` (at the
+        # registration of a stdio `mcpServers` entry) both install that same file
+        # with `pip install --target` into the app's own deps dir, which works on
+        # the bundled interpreter and never touches the bundle. Refusing it here
+        # would block exactly the app classes the runtime serves, so it passes
+        # the gate and NOTHING is pip-installed at install time — the runtime owns
+        # it. This is a capability check that matches what the runtime can do,
+        # not a widening of any boundary: the same file, on the same
+        # interpreter, is already provisioned by the runtime.
+        #
+        # The waiver is the runtime's own condition, mirrored in
+        # `_requirements_owned_by_the_runtime`: the shared provisioning predicate
+        # says an out-of-process consumer is declared in a shape the provisioners
+        # actually serve (a FILE-style entry point, or a stdio server — one
+        # without `url`; a module-style, dotted entry point is never provisioned
+        # and keeps the refusal) AND no `backend.hooks` field is, because a hook
+        # is imported INTO this process, which the app deps tree deliberately
+        # never reaches — AND the registry entry is gateway-managed, because the
+        # provisioners run only for apps the gateway installs and spawns itself;
+        # a self-managed entry (`resources: "app"`) is registered from its
+        # manifest alone, so nothing would ever install its file — AND the file
+        # is one the provisioner will read: a regular file, or a link that
+        # strictly resolves inside the app root (`requirements_in_tree`, the
+        # provisioner's own fast-refusal rule, shared); a link escaping the root
+        # is refused at spawn, so it is refused here.
+        #
+        # requirements.txt BESIDE pyproject.toml/setup.py keeps the refusal (the
+        # non-bundled branch below runs `pip install .` for that layout, so the
+        # gateway-import dependency is the one that decides), and a
+        # requirements.txt with NO out-of-process consumer keeps it too — nothing
+        # would provision it, so a pass would be the silent-broken install.
+        #
+        # All of that is decided by the bundled-interpreter branch ABOVE this one,
+        # so this branch is the non-bundled build only, and pip runs here.
+        #
         # A missing `pip` module is a soft skip, exactly like a missing npm
         # (see the docstring). `sys.executable` is the gateway interpreter, and a
         # venv created with `--without-pip` — or any minimal runtime — has no `pip`
@@ -6994,6 +7276,9 @@ async def install_from_registry(
             subdirectory=subdirectory,
             entry_repo=repo,
             commit=commit,
+            # The registry entry's resource ownership feeds the desktop gate: the
+            # runtime provisions only the apps it installs and spawns itself.
+            self_managed=is_self_managed,
         )
         if not build_result["ok"]:
             # A pre-build refusal (identity/admission gate inside
@@ -7172,6 +7457,15 @@ async def install_from_registry(
 
         install_script = (manifest_data.get("setup") or {}).get("onInstall", "")
 
+        # Which of the desktop gate's layout inputs exist BEFORE the install
+        # script runs. The script has write access to the checkout, and a file it
+        # creates is untracked, so the post-refusal `git reset --keep` leaves it in
+        # a pre-existing checkout -- where a created `pyproject.toml` would make
+        # every retry refuse at the BUILD gate, before the script that could be
+        # fixed ever runs again. The refusal below removes what the script created
+        # and nothing that was already there.
+        layout_before = await asyncio.to_thread(_desktop_layout_present, app_source)
+
         # Step 2: Run install script
         if install_script:
             log_lines.append(f"Running install script: {install_script}")
@@ -7346,6 +7640,71 @@ async def install_from_registry(
                     "error": f"blocked by admission policy: {denied}",
                 }
                 return outcome
+
+        # DESKTOP GATE, final pass — the build judged the requirements waiver on
+        # the manifest that ENTERED the install script, and the script ran with
+        # write access to the checkout: it can add `backend.hooks` (imported into
+        # this process, which the app deps tree never reaches) or drop the entry
+        # point / stdio server the waiver was granted for. Whatever is on disk
+        # NOW is what registers and what the runtime later loads from, so the
+        # same verdict is re-derived from it, by the same owner, with the same
+        # ownership input (`is_self_managed`: a self-managed entry is registered
+        # from its manifest alone and is never provisioned, so it keeps the
+        # refusal). With no script the inputs are the build's and the verdict
+        # repeats; a changed checkout is refused with the build's own sentence
+        # and rolled back exactly like the post-script admission denial above —
+        # nothing is enabled. Off-loop like the app.json read above: the verdict
+        # stats the checkout.
+        desktop_refusal = await asyncio.to_thread(
+            _desktop_build_refusal,
+            app_source,
+            AppManifest.from_dict(manifest_data),
+            self_managed=is_self_managed,
+        )
+        if desktop_refusal:
+            log_lines.append(f"Refusing install: {desktop_refusal}")
+            try:
+                sel().log_api_access(
+                    caller="app_install_from_registry",
+                    operation="desktop_build_gate_final",
+                    outcome="rejected",
+                    resources=f"name={name!r}",
+                    error=desktop_refusal,
+                )
+            except Exception as exc:  # audit failure must never mask the refusal
+                logger.debug("SEL audit failed for %s final desktop gate: %s", name, exc)
+            await _unpoison_rejected_checkout(
+                name,
+                app_source_dir(name),
+                log_lines,
+                checkout_preexisted=bool(build_result.get("_checkout_preexisted")),
+                pre_pull_commit=str(build_result.get("_pre_pull_commit", "") or ""),
+                manifest_relpath=(f"{subdirectory}/app.json" if subdirectory else "app.json"),
+                manifest_snapshot=build_result.get("_pre_update_manifest"),
+                restore_from=_restorable_or_none(
+                    build_result.get("_pending_stale_cleanup"),
+                    build_result.get("_restorable_stale"),
+                ),
+            )
+            # The reset above restores TRACKED files; a layout file the script
+            # CREATED is untracked and would survive it in a pre-existing checkout
+            # -- and `pyproject.toml` or `setup.py` left behind makes every retry
+            # refuse at the build gate before the script can run again. Remove
+            # exactly the layout inputs that were absent before the script and are
+            # present now; a fresh checkout was deleted whole above. Fixed leaf
+            # names under the containment-checked `app_source`, unlinked without
+            # following, so a link the script planted removes the link alone.
+            if build_result.get("_checkout_preexisted"):
+                await asyncio.to_thread(
+                    _remove_script_created_layout, app_source, layout_before, log_lines
+                )
+            outcome = {
+                "ok": False,
+                "name": name,
+                "error": desktop_refusal,
+                "code": DESKTOP_BUILD_STEP_UNSUPPORTED,
+            }
+            return outcome
 
         # Provenance is pinned from the FINAL state — after the build, the
         # install script, and the last identity/admission gates: the exact

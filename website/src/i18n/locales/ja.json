@@ -5718,7 +5718,9 @@
         "confirm_after_failure": "再試行",
         "working": "信頼して有効化しています…",
         "failed": "「{{app}}」をオンにできませんでしたが、信頼はすでに保存されている可能性があります。「再試行」を選ぶか、設定 → セキュリティ → 信頼済みサードパーティーアプリを開いて確認し、削除してください。",
-        "failed_generic": "「{{app}}」をオンにできず、何も変更されませんでした。「再試行」を選ぶか、{{productName}} のログを確認してください。"
+        "failed_generic": "「{{app}}」をオンにできず、何も変更されませんでした。「再試行」を選ぶか、{{productName}} のログを確認してください。",
+        "failed_desktop_unsupported": "このアプリは {{productName}} のデスクトップ版にはインストールできません。",
+        "failed_desktop_unsupported_help": "デスクトップ版では追加できない Python パッケージが必要です。アプリの作者にアプリへ同梱してもらうか、ゲートウェイ版のインストールを使ってください。"
       },
       "registryTier": {
         "curated": "チーム確認済み",

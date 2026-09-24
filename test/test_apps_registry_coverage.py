@@ -24,12 +24,14 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from conftest import requires_symlinks
 from kiro_crew.apps import registry
+from kiro_crew.apps.manifest import AppManifest
 from kiro_crew.platform import PlatformCompositionError
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,32 @@ def pip_importable(monkeypatch):
         return real_find_spec(name, *args, **kwargs)
 
     monkeypatch.setattr(registry.importlib.util, "find_spec", _with_pip)
+
+
+@pytest.fixture()
+def bundled_interpreter(monkeypatch):
+    """Pin the gateway interpreter as the desktop app's BUNDLED one.
+
+    The install-time Python gate forks on
+    ``platform_compat.is_bundled_interpreter()`` — the single owner of the
+    packaging-layout sentinel — so the fork is exercised by stubbing that
+    function rather than by faking a bundle path per test.
+    """
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: True)
+
+
+def _asgi_backend(entry: str = "server.py", **backend: Any) -> AppManifest:
+    """A cloned manifest declaring an out-of-process backend entry point.
+
+    Built through ``AppManifest.from_dict`` — the same normalization the runtime
+    applies before the hook loaders ever see a manifest — because that is the view
+    the install-time gate answers from.
+    """
+    return AppManifest.from_dict(
+        {"name": "demo", "backend": {"entryPoint": entry, "type": "asgi", **backend}}
+    )
 
 
 class _FakeProc:
@@ -2157,7 +2185,7 @@ class TestRunAppBuild:
     @pytest.mark.asyncio
     async def test_no_recognized_ecosystem_means_no_build(self, tmp_path):
         log: list[str] = []
-        result = await registry._run_app_build(tmp_path, "demo", log)
+        result = await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False)
         assert result == {"ok": True}
         assert "No build step detected — using source as-is" in log
 
@@ -2166,7 +2194,7 @@ class TestRunAppBuild:
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
         log: list[str] = []
-        result = await registry._run_app_build(tmp_path, "demo", log)
+        result = await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False)
         assert result == {"ok": True}
         assert any("npm not found on PATH" in line for line in log)
 
@@ -2178,7 +2206,7 @@ class TestRunAppBuild:
         monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/npm")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         log: list[str] = []
-        assert await registry._run_app_build(tmp_path, "demo", log) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [["/usr/bin/npm", "install"]]
         assert log[-1] == "build succeeded"
 
@@ -2191,7 +2219,7 @@ class TestRunAppBuild:
         spawned = _fake_sandbox(
             monkeypatch, [_FakeProc(returncode=0), _FakeProc(returncode=0)]
         )
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [
             ["/usr/bin/npm", "install"],
             ["/usr/bin/npm", "run", "build"],
@@ -2202,7 +2230,7 @@ class TestRunAppBuild:
         (tmp_path / "package.json").write_text("{ not json", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/npm")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [["/usr/bin/npm", "install"]]
 
     @pytest.mark.asyncio
@@ -2211,7 +2239,7 @@ class TestRunAppBuild:
     ):
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
@@ -2221,7 +2249,7 @@ class TestRunAppBuild:
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
@@ -2230,7 +2258,7 @@ class TestRunAppBuild:
     ):
         (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
@@ -2242,7 +2270,7 @@ class TestRunAppBuild:
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
@@ -2268,10 +2296,448 @@ class TestRunAppBuild:
         bundled.write_text("", encoding="utf-8")
         monkeypatch.setattr(registry.sys, "executable", str(bundled))
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        result = await registry._run_app_build(tmp_path, "demo", [])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
         assert result["ok"] is False
         assert "bundled interpreter" in result["error"]
         assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_backend_entry_point_requirements_pass_the_bundled_gate(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A root requirements.txt for an OUT-OF-PROCESS backend is not a
+        gateway-import dependency, so the desktop gate must let it through.
+
+        ``apps/backend.py::provision_app_deps`` installs exactly this file with
+        ``pip install --target`` into the app's own deps dir at backend start,
+        which works on the bundled interpreter. Refusing it here blocked an app
+        class the runtime serves. Nothing is pip-installed AT INSTALL TIME — the
+        runtime owns it — so no build command may be planned either.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert any("provisioned at runtime" in line and "requirements.txt" in line for line in log)
+
+    @pytest.mark.asyncio
+    async def test_pyproject_still_refused_on_the_bundled_interpreter(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A declared backend entry point does not rescue ``pyproject.toml``:
+        ``pip install .`` targets the GATEWAY's interpreter, which is the write
+        into the signed bundle the refusal exists to prevent."""
+        (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_setup_py_still_refused_on_the_bundled_interpreter(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_requirements_without_an_out_of_process_consumer_stay_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """No ``backend.entryPoint`` and no stdio ``mcpServers`` entry means
+        nothing spawns for this app, so neither runtime provisioner would ever
+        install the file — a pass would report success for an install that put
+        the dependencies nowhere, the broken-install shape the loud refusal
+        prevents.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo"}), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_requirements_beside_pyproject_stay_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The refusal wins when both are present: the non-bundled branch would
+        run ``pip install .`` for this layout, so the gateway-import dependency
+        is the one that decides."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_manifest_declaring_nothing_is_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Fail-closed: ``{}`` is what a caller passes for "declares nothing", and
+        it must not read as "no hooks declared, so allow"."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
+        assert result["ok"] is False
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_declared_hooks_keep_the_refusal_even_with_an_entry_point(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``backend.hooks`` runs INSIDE the gateway process.
+
+        A manifest may declare both an entry point and hooks, and the deps tree
+        the backend runner provisions never joins the gateway's import path
+        (module_loader loads a hook straight into this process). Waiving the
+        refusal on the entry point alone would install such an app "successfully"
+        with its hook imports broken and its routes degraded — the silent-broken
+        install the loud refusal exists to prevent.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        for hook in ("routes", "on_startup", "on_shutdown"):
+            spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+            result = await registry._run_app_build(
+                tmp_path,
+                "demo",
+                [],
+                manifest=_asgi_backend(hooks={hook: "backend.hooks:fn"}),
+                self_managed=False,
+            )
+            assert result["ok"] is False, hook
+            assert "bundled interpreter" in result["error"]
+            assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_blank_hook_fields_are_not_a_declared_hook(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``hooks: {}`` — and an EMPTY field — declares no in-gateway code, so
+        the waiver still applies: the check is on a declared hook, not on the key.
+
+        A whitespace-only field is the other way round and is refused: the typed
+        view keeps it, so ``lifecycle.py`` would take it as a hook path, fail to
+        resolve it and mark the app degraded. That app has in-gateway Python as
+        far as the runtime is concerned, so the gate must not waive for it.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path,
+            "demo",
+            [],
+            manifest=_asgi_backend(hooks={"routes": "", "on_startup": ""}),
+            self_managed=False,
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+        blank = _asgi_backend(hooks={"on_startup": "  "})
+        assert blank.backend.hooks.to_dict() == {"on_startup": "  "}
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=blank, self_managed=False)
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_the_gate_reads_hooks_the_way_the_loaders_are_fed(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A hooks value the manifest view drops is a hook that never loads.
+
+        ``manager.py`` hands the hook loaders
+        ``AppManifest.from_json_file(...).to_dict()``, and
+        ``BackendConfig.from_dict`` drops a non-object ``hooks`` — so for a
+        manifest like this one NOTHING is imported into the gateway, and the gate
+        must agree with that rather than refuse an app the runtime would run
+        hookless. Pinned because the opposite reading (refuse whatever looks
+        unreadable in the raw bytes) is the tempting one, and it would disagree
+        with the only view that decides.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        manifest = _asgi_backend(hooks="backend.hooks:fn")
+        assert manifest.backend.hooks.to_dict() == {}, "the typed view must drop it"
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=manifest, self_managed=False)
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_stdio_mcp_server_app_passes_the_bundled_gate(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The waiver is the runtime's OWN condition, not the entry point.
+
+        ``bridges.py::_maybe_provision_backendless_deps`` provisions a root
+        requirements.txt for an app whose only Python is a stdio ``mcpServers``
+        entry — the same ``pip install --target`` into the app's deps dir, so the
+        same out-of-process consumer. Refusing it while waiving the entry-point
+        shape would be a point patch on the reported symptom.
+        """
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {"name": "demo", "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}}}
+        )
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", log, manifest=manifest, self_managed=False)
+        assert result == {"ok": True}
+        assert spawned == []
+        assert any("requirements.txt" in line for line in log)
+
+    @pytest.mark.asyncio
+    async def test_a_url_only_mcp_server_is_not_an_out_of_process_consumer(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A ``url`` server is remote: nothing spawns for it, so the runtime
+        provisions nothing (``bridges.py`` counts only entries WITHOUT ``url``),
+        and the gate must agree — refused, like any requirements.txt with no
+        consumer."""
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {"name": "demo", "mcpServers": {"remote": {"url": "https://example.test/mcp"}}}
+        )
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=manifest, self_managed=False)
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_stdio_app_with_hooks_stays_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Hooks import into the gateway process regardless of what else the app
+        ships, so a stdio server does not rescue an app that also declares one."""
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {
+                "name": "demo",
+                "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}},
+                "backend": {"hooks": {"on_startup": "backend.hooks:start"}},
+            }
+        )
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=manifest, self_managed=False)
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_module_style_entry_point_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Neither provisioner installs requirements.txt for a MODULE-style entry.
+
+        A dotted, extensionless ``backend.entryPoint`` with no file of that name
+        runs as ``python -m`` from trusted package code; ``backend.py`` skips
+        ``provision_app_deps`` for it and ``bridges.py`` returns before provisioning
+        (trust boundary: an app-dir requirements file must never load ahead of a
+        trusted module). Waiving on the entry point's mere presence would report a
+        successful install whose dependencies land nowhere -- the same silent-broken
+        install as a pass with no consumer at all -- so the shape the provisioners
+        refuse is refused here, by the predicate they share.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path,
+            "demo",
+            [],
+            manifest=_asgi_backend("kiro_crew.apps.builtins.demo.server"),
+            self_managed=False,
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_self_managed_entry_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Neither provisioner runs for a self-managed app, whatever it declares.
+
+        A registry entry with ``resources: "app"`` is registered from its manifest
+        alone: ``install_from_registry`` copies no source into the app directory,
+        ``bridges.py`` skips every registration for it, and the app launches
+        itself. On a source install the build step's ``pip install -r`` was the
+        only thing that installed its requirements.txt, and that step is what the
+        bundled interpreter cannot run -- so the very manifest that waives for a
+        gateway-managed entry (``test_backend_entry_point_requirements_pass_the_bundled_gate``)
+        refuses here. Ownership is a registry fact the manifest does not carry,
+        which is why it is a separate, required input to the verdict.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=True
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_requirements_symlink_escaping_the_app_root_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The runtime refuses to READ a requirements.txt that resolves outside the
+        app root (``provision_app_deps``: "out-of-root symlinked requirements are
+        not installed") and the backend does not spawn -- so the waiver, which
+        exists because the runtime provisions the file, must not apply to a link
+        the runtime will refuse. ``install_app`` copies with ``symlinks=True``, so
+        the link in the checkout is the link in the app directory. Waiving would
+        report a successful install with nothing installed, and let the gate
+        treat bytes outside the app directory as the app's own.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        app_root = tmp_path / "app"
+        app_root.mkdir()
+        (app_root / "requirements.txt").symlink_to(outside / "requirements.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            app_root, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_an_in_tree_requirements_symlink_is_waived_like_the_runtime_reads_it(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``requirements.txt -> requirements/prod.txt`` is layout the provisioner
+        accepts (a link whose strict resolution stays inside the app root), so the
+        gate accepts it too: refusing it would re-create the refused-what-the-
+        runtime-serves defect for that layout."""
+        (tmp_path / "requirements").mkdir()
+        (tmp_path / "requirements" / "prod.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "requirements.txt").symlink_to(Path("requirements") / "prod.txt")
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert any("provisioned at runtime" in line for line in log)
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_dangling_requirements_link_with_a_consumer_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``provision_app_deps`` treats a present-but-unreadable requirements.txt
+        (a dangling link) as a provisioning FAILURE and does not spawn the
+        backend, so the waiver -- granted because the runtime provisions the file
+        -- must not pass an app whose backend will never start. Presence is the
+        provisioner's ``lexists``, not the build detector's ``is_file``."""
+        (tmp_path / "requirements.txt").symlink_to(tmp_path / "gone.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_dangling_requirements_link_nothing_reads_is_no_file(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """With no consumer, nothing of ours ever reads the entry, and the build's
+        own detection (``is_file``, on every host) sees no Python build files: it
+        passes, exactly as the same checkout does on a source install."""
+        (tmp_path / "requirements.txt").symlink_to(tmp_path / "gone.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo"}), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_dotted_entry_point_that_names_a_file_is_file_style(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The shape test is the spawn's own: a file with the literal dotted name
+        under the app root makes the entry a FILE, which the spawn provisions."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "server.main").write_text("", encoding="utf-8")
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend("server.main"), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_carries_its_machine_code(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Every desktop refusal names its condition by code, beside the sentence.
+
+        The dashboard's consent modal keys its plain-language copy on the code
+        (the condition is permanent for this gateway, so the retry instruction is
+        dropped), and a client is meant to act on a code rather than regex-match
+        prose. Pinned on both refusal layouts so neither can lose it.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        no_consumer = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo"}), self_managed=False
+        )
+        assert no_consumer["code"] == "desktop_build_step_unsupported"
+        (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        gateway_import = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert gateway_import["code"] == "desktop_build_step_unsupported"
+        assert gateway_import["error"] == no_consumer["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_source_install_still_pip_installs_the_requirements(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
+        """The gate change is scoped to the BUNDLED interpreter: an ordinary
+        source install keeps installing requirements.txt at install time, so a
+        hooks-only app on a normal host is unaffected."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
     async def test_build_output_is_streamed_into_the_log(self, tmp_path, monkeypatch):
@@ -2282,7 +2748,7 @@ class TestRunAppBuild:
             [_FakeProc(returncode=0, stdout_lines=[b"added 1 package\n", b"done\n"])],
         )
         log: list[str] = []
-        await registry._run_app_build(tmp_path, "demo", log)
+        await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False)
         assert "added 1 package" in log and "done" in log
 
     @pytest.mark.asyncio
@@ -2290,7 +2756,7 @@ class TestRunAppBuild:
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/npm")
         _fake_sandbox(monkeypatch, [_FakeProc(returncode=7)])
-        result = await registry._run_app_build(tmp_path, "demo", [])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
         assert result["ok"] is False
         assert result["name"] == "demo"
         assert "build failed (exit 7)" in result["error"]
@@ -2313,7 +2779,7 @@ class TestRunAppBuild:
             killed.append(proc.pid)
 
         monkeypatch.setattr(registry, "_kill_process_group", _kill)
-        result = await registry._run_app_build(tmp_path, "demo", [])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
         assert result["ok"] is False
         assert "build timed out" in result["error"]
         assert killed == [31337]

@@ -5927,7 +5927,9 @@
         "confirm_after_failure": "Réessayer",
         "working": "Confiance accordée et activation...",
         "failed": "« {{app}} » n'a pas pu être activée, mais la confiance est peut-être déjà enregistrée. Choisis Réessayer, ou ouvre Paramètres → Sécurité → Applications tierces de confiance pour vérifier et la retirer.",
-        "failed_generic": "« {{app}} » n'a pas pu être activée, et rien n'a été modifié. Choisis Réessayer, ou consulte les journaux de {{productName}}."
+        "failed_generic": "« {{app}} » n'a pas pu être activée, et rien n'a été modifié. Choisis Réessayer, ou consulte les journaux de {{productName}}.",
+        "failed_desktop_unsupported": "Cette app ne peut pas être installée dans la version de bureau de {{productName}}.",
+        "failed_desktop_unsupported_help": "Elle a besoin de paquets Python que la version de bureau ne peut pas ajouter ; demande à l’auteur de l’app de les livrer avec l’app, ou utilise l’installation par passerelle."
       },
       "registryTier": {
         "curated": "Vérifié par l'équipe",

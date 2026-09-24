@@ -5927,7 +5927,9 @@
         "confirm_after_failure": "Reintentar",
         "working": "Concediendo confianza y activando...",
         "failed": "No se pudo activar “{{app}}”, pero la confianza quizá ya esté guardada. Elige Reintentar, o abre Ajustes → Seguridad → Aplicaciones de terceros de confianza para comprobarlo y quitarla.",
-        "failed_generic": "No se pudo activar “{{app}}” y no se cambió nada. Elige Reintentar, o revisa los registros de {{productName}}."
+        "failed_generic": "No se pudo activar “{{app}}” y no se cambió nada. Elige Reintentar, o revisa los registros de {{productName}}.",
+        "failed_desktop_unsupported": "Esta app no se puede instalar en la versión de escritorio de {{productName}}.",
+        "failed_desktop_unsupported_help": "Necesita paquetes de Python que la versión de escritorio no puede añadir; pide al autor de la app que los incluya con la app, o usa la instalación del gateway."
       },
       "registryTier": {
         "curated": "Revisado por el equipo",
