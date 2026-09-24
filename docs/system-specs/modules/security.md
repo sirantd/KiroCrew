@@ -133,21 +133,36 @@ that directory can `link(2)` it and keep reading after the publish rename. The h
 above cannot see that window, because it runs before a spawn and the window opens during
 one. This is the same treatment, and the same reason, as `live-target-staging`,
 `md-notebook-staging` and `aws-control-staging`. The staging directory is validated rather
-than trusted on each publish: a symlink, or a group- or world-accessible directory, is
-refused rather than repaired.
+than trusted on each publish: a symlink or non-directory is refused, and so is a group- or
+world-WRITABLE directory whose mode `chmod` cannot narrow, because another local account
+could otherwise replace the staged file between the payload write and the publish link and
+install a signing key of its choosing. A directory that is merely group- or world-READABLE
+is narrowed with `chmod` and warned about when that does not stick: a read bit leaks the
+temps' names and grants no substitution, and it is the `dir_mode=0755` default of a real
+mount class. Refusing costs no persisted key, because a caller whose retry budget the
+refusal exhausts reaches its own in-place fallback.
 
 A temp written before that directory existed is an artefact already on disk, which
 masking forward cannot reach, so both launchers sweep
 `.token_signing.key.*.tmp` from every crew-home spelling
 (`sandbox._sweep_legacy_auth_store_temps`) and refuse the spawn if one cannot be removed.
+A match is only removed once it is known not to be the key inode's last name: with the key
+present at its own name and a different inode it is removed outright; sharing the key's inode
+it gets `fsync_dir` on the root first, refusing where the device refuses that; and with the
+key ABSENT nothing is removed and the spawn refuses, because that state cannot be told apart
+from a staged write that never published, so removing risks destroying a key an operator can
+still recover by renaming while leaving it would hand the agent a cleartext key.
 That sweep is bounded to names carrying the leaf, and the bound is load-bearing rather than
 conservative: the data home is shared and `atomic_write` stages `tmp<random>.tmp` there for
 unrelated stores, so a wider pattern would unlink another component's in-flight temp between
 its `mkstemp` and its rename. A pre-upgrade `refresh_chains.json` temp carries that
-leaf-less name and so cannot be told apart from a live one; it is not swept, and remains
-behind the keystone-artifact suffix fence, which covers a `.tmp` or `.lock` name in a
-keystone leaf's own directory and is what protects any artifact still loose in the data-home
-root.
+leaf-less name and so cannot be told apart from a live one, so it is not swept. The
+keystone-artifact suffix rule covers a `.tmp` or `.lock` name in a keystone leaf's own
+directory, but it lives in `security.paths` and gates the agent's FILE TOOLS only: no OS
+mask binds a `tmp<random>.tmp` name in the sandbox-visible data-home root, so a shell inside
+the namespace can open one and read the consumed-JTI, revoked-chain and `chain_peers` state
+it holds. That is a stated residual, not a closed hole. It affects only a home carrying a
+temp from the earlier layout, nothing recreates one, and removing the file closes it.
 
 Memory V2 separates members' learning and work context; it does not promise
 confidentiality between agents running as the same host operator. One stable

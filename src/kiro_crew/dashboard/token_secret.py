@@ -118,14 +118,34 @@ def auth_store_staging_dir(home: Path) -> Path:
     validates its own: the name sits in the data-home root, so a directory found there is
     not necessarily one this process created.
 
-    Refuses rather than repairs, so a directory nobody here created is never silently
-    adopted:
+    Refuses the two shapes that defeat the mask, and repairs the one that does not:
 
-    * not a directory (a symlink included, via ``lstat``) -- following it would stage the
-      full key or chain state wherever it points, outside both the mask and the fence;
-    * group- or world-accessible where modes exist -- the payload is written owner-only,
-      but a wider directory mode lets another account enumerate the temps' names, and a
-      writable one lets them pre-plant a name.
+    * not a directory (a symlink included, via ``lstat``) -- REFUSED. Following it would
+      stage the full key or chain state wherever it points, outside both the mask and the
+      fence, which is the exposure this directory exists to close.
+    * cannot be locked to its owner ON WINDOWS -- REFUSED. There
+      :func:`platform_compat.restrict_dir_to_owner` writes an inheriting owner-only DACL,
+      which no POSIX mode test can express, so a directory a foreign principal can write
+      would otherwise pass unexamined and that principal could replace a staged file
+      between the write and the publish.
+    * group- or world-WRITABLE on POSIX where the narrowing does not stick -- REFUSED.
+      Another local account can replace the staged file between ``atomic_write`` and the
+      publish ``os.link``, which installs a signing key it chose. Nothing downstream would
+      notice: the publishing process returns its own bytes while every later boot reads the
+      substituted file as authoritative. A mount that cannot express modes can still
+      hard-link, so "the mode did not stick" does not imply the publish will fail.
+    * group- or world-READABLE or executable on POSIX -- narrowed, and WARNED when the
+      narrowing does not stick. A wider read bit lets another local account enumerate the
+      temps' names, so it is worth closing, but it moves no byte and grants no
+      substitution. This is the ``dir_mode=0755`` class of mount (CIFS, vfat, exFAT),
+      which is a real configuration rather than a hostile one.
+
+    Refusing drops no persisted record, because each caller reaching a refusal answers it
+    rather than returning silently. The signing key routes through its in-place writer. The
+    refresh store marks itself degraded, and its own reader fails closed on that mark, so a
+    spent or revoked token is REFUSED rather than accepted -- it does not publish a full copy
+    of the chain state through the state file's own sandbox-visible directory, which is the
+    exposure this staging directory exists to close.
 
     ``EXDEV`` is not a concern for the caller that publishes with ``os.link``: this is a
     subdirectory of the key's own parent, so the staged file and its destination are
@@ -145,11 +165,49 @@ def auth_store_staging_dir(home: Path) -> Path:
             errno.ENOTDIR,
             f"{staging} is not a directory; refusing to stage a gateway auth store through it",
         )
-    if os.name != "nt" and st.st_mode & 0o077:
+    # Owner-only on BOTH platforms, through the directory-shaped helper. Its Windows
+    # arm writes an inheriting owner-only DACL, which no mode test can express, so a
+    # POSIX-only check would leave a Windows staging directory a foreign principal can
+    # write -- and that principal could then replace a staged file between the write
+    # and the publish. Its POSIX arm is the same owner-only narrowing the mode split
+    # below measures. The helper is fail-loud, and on Windows it writes only when the
+    # directory's own descriptor does not already match, so the ordinary publish pays
+    # nothing.
+    try:
+        platform_compat.restrict_dir_to_owner(staging)
+    except OSError as exc:
+        if os.name == "nt":
+            raise OSError(
+                errno.EPERM,
+                f"{staging} could not be locked to its owner ({exc}); refusing to stage a "
+                "gateway auth store through it. Another account that can write this "
+                "directory can replace the staged file between the write and the publish "
+                "link, which installs a signing key or refresh state it chose. Grant only "
+                "this account access to it, or remove it, then restart the gateway.",
+            ) from exc
+        # POSIX falls through: the mode test below can SEE what survived, and it
+        # separates the bit that permits substitution from the bit that only leaks
+        # names. Refusing on the read bit too would fail an ordinary mount.
+    else:
+        st = os.lstat(staging)
+    if os.name != "nt" and st.st_mode & 0o022:
         raise OSError(
             errno.EPERM,
-            f"{staging} is not owner-only (mode {stat.S_IMODE(st.st_mode):o}); "
-            "chmod 700 it or remove it, then restart the gateway",
+            f"{staging} is group- or world-WRITABLE (mode {stat.S_IMODE(st.st_mode):o}) and "
+            "the mode could not be narrowed; refusing to stage a gateway auth store through "
+            "it. Another local account can replace the staged file between the write and the "
+            "publish link, which installs a signing key it chose as the one that signs every "
+            "dashboard token. chmod 700 it or remove it, then restart the gateway.",
+        )
+    if os.name != "nt" and st.st_mode & 0o055:
+        logger.warning(
+            "gateway auth-store staging directory %s is readable beyond its owner (mode %o) "
+            "and could not be narrowed; other local accounts can list the publish temps' "
+            "names. The bytes stay owner-only and the directory is still masked in every "
+            "agent namespace and fenced from the file tools. chmod 700 it to close the "
+            "listing.",
+            staging,
+            stat.S_IMODE(st.st_mode),
         )
     return staging
 
@@ -388,6 +446,12 @@ def _load_or_create_secret() -> bytes:
         # transient failure leaves it False and never reaches code that creates
         # the destination empty.
         link_unsupported = False
+        # Set when the staging directory itself is unusable for the whole budget. Its only
+        # job is to reach the same in-place fallback: that writer needs no staging
+        # directory, so a validator refusal must not be the reason no key is ever
+        # persisted. Kept separate from link_unsupported so neither flag claims a
+        # filesystem property the other observed.
+        staging_unusable = False
 
         for _attempt in range(_CREATE_MAX_ATTEMPTS):
             # 1) Fast path: an already-populated key file. Read the persisted
@@ -453,15 +517,41 @@ def _load_or_create_secret() -> bytes:
             # and this file sits one level below that.
             #
             # The ".tmp" suffix matches the shape atomic_write's own mkstemp temp
-            # uses, and keeps any stray artifact left loose in the data-home root
-            # behind the keystone fence. What makes THIS file unreachable is the
-            # directory holding it, not its name. test_token_auth.py pins the
-            # staged path against the real predicate so a rename cannot silently
-            # leave the fence behind.
-            staged = auth_store_staging_dir(key_path.parent) / (
-                f".{key_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
-            )
+            # uses. What makes THIS file unreachable is the directory holding it,
+            # not its name: the keystone-artifact suffix rule belongs to
+            # security.paths, which gates the agent's FILE TOOLS, so it does not
+            # stop a shell inside the namespace from opening a path it can see.
+            # test_token_auth.py pins the staged path against the real predicate
+            # so a rename cannot silently leave the fence behind.
+            #
+            # Resolved inside the retry budget: this validator can fail for a
+            # transient reason, and a failure that escaped the loop would skip
+            # the in-place fallback below and leave no persisted key at all.
             key = os.urandom(_MIN_KEY_BYTES)
+            try:
+                staging_dir = auth_store_staging_dir(key_path.parent)
+            except OSError:
+                # Nothing was created, so there is no candidate to remove. A failure that
+                # persists for the whole budget must still reach the in-place fallback:
+                # _create_key_in_place writes key_path directly and needs no staging
+                # directory, so the alternative is an ephemeral secret on every boot while a
+                # working path existed.
+                staging_unusable = True
+                logger.debug(  # nosemgrep: python-logger-credential-disclosure -- logs the path only, never key bytes
+                    "token signing key staging directory unusable for %s; retrying",
+                    key_path,
+                )
+                time.sleep(_CREATE_BACKOFF_SECONDS)
+                continue
+            staged = staging_dir / (f".{key_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp")
+            # This attempt HAS a staging directory, so an earlier attempt's lookup failure was
+            # transient and must not still be speaking for the loop. The flag decides whether
+            # the in-place fallback -- which creates the destination empty and so carries the
+            # truncation window this function exists to remove -- is allowed at all, and the
+            # policy below admits it only for a home that genuinely cannot stage. Leaving a
+            # stale True here would widen that to any home that faltered once and then
+            # recovered, which is the opposite of what the surrounding comment promises.
+            staging_unusable = False
             try:
                 # restrict_to_owner (rather than mode=0o600 alone) is what
                 # _enforce_owner_only applies today, and the helper applies it
@@ -576,7 +666,7 @@ def _load_or_create_secret() -> bytes:
         # one, leaving the pair unable to validate each other's tokens -- the
         # divergence the exclusive create exists to prevent. So the loser loops,
         # reads the winner's bytes, and returns those instead.
-        if link_unsupported:
+        if link_unsupported or staging_unusable:
             for _attempt in range(_CREATE_MAX_ATTEMPTS):
                 try:
                     existing = key_path.read_bytes()

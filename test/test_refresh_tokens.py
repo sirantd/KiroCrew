@@ -11,6 +11,7 @@ files that don't yet exist for this surface).
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import json
 import os
 import time
@@ -507,6 +508,112 @@ def test_tr_u_16_persistence_roundtrip(tmp_path: Path):
     mgr2 = RefreshStateManager(state_path=state_file)
     assert mgr2.is_consumed("jti1") is True
     assert mgr2.is_chain_revoked("c2") is True
+
+
+def test_tr_u_16b_unusable_staging_dir_degrades_the_store(tmp_path, monkeypatch):
+    """A refused staging directory must neither publish unmasked nor fail silently.
+
+    Publishing through the state file's own directory would put a full copy of the chain
+    state at a sandbox-visible name for the length of the write, which is the exposure the
+    staging directory exists to close. Dropping the write silently is no better: the caller
+    has already reported a successful rotation or logout, so the next start would load a
+    store missing that revocation and read it as nothing revoked.
+
+    Degrading is both answers at once, and the existing reader fails closed on it -- so a
+    spent token is REFUSED rather than accepted.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    def _refused(_home):
+        raise OSError(errno.ENOTDIR, "staging directory is not usable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+    mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    assert not state_file.exists(), (
+        "the state file was published through its own unmasked directory; that is the write "
+        "window the staging directory exists to close"
+    )
+    reason = mgr.degraded_reason()
+    assert reason, (
+        "the record was dropped with the store still reporting itself trustworthy, so the "
+        "next start would read the missing revocation as nothing revoked"
+    )
+    assert "not persisted" in reason
+
+
+def test_tr_u_16d_a_dropped_consumption_is_REPORTED_to_its_caller(tmp_path, monkeypatch):
+    """Degrading the store is not enough: the caller about to publish must learn it failed.
+
+    ``degraded_reason`` gates validation in THIS process only. The record that retires the
+    presented jti is in memory, so the restart the store's own warning asks for loads a file
+    that never saw it and clears the degradation along with it -- and the token this call was
+    meant to burn authenticates again, with its replacement pair already delivered. So the
+    return value has to carry the failure, or no caller can decline to publish.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    def _refused(_home):
+        raise OSError(errno.ENOTDIR, "staging directory is not usable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    mgr = RefreshStateManager(state_path=tmp_path / "rt.json")
+    persisted = mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    assert persisted is False, (
+        "the consumption was reported as successful while it existed only in memory, so a "
+        "caller would publish a replacement pair and leave the presented token spendable "
+        "after the next start"
+    )
+
+
+def test_tr_u_16e_a_consumption_that_lands_reports_success(tmp_path):
+    """The other direction, so the flag measures persistence and not merely 'was called'."""
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+
+    persisted = mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    assert persisted is True
+    assert state_file.exists(), "nothing was written, so the True above measures nothing"
+
+
+def test_tr_u_16c_a_later_successful_write_clears_the_degraded_mark(tmp_path, monkeypatch):
+    """Degraded is a statement about the last write, not a latch."""
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    calls = {"n": 0}
+    real = rt.auth_store_staging_dir
+
+    def _first_call_fails(home):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.ENOTDIR, "staging directory is not usable")
+        return real(home)
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _first_call_fails)
+
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+    mgr.mark_consumed("a", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}")
+    assert mgr.degraded_reason(), "the first, failed write did not degrade the store"
+
+    mgr.mark_consumed("b", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}")
+    assert mgr.degraded_reason() == "", (
+        "the store stayed degraded after a write landed, so one transient failure would "
+        "reject every refresh until a restart"
+    )
+    assert state_file.exists()
 
 
 def test_tr_u_17_persistence_file_mode_0600(tmp_path: Path):

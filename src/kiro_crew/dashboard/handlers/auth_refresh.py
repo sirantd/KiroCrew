@@ -686,7 +686,7 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # Wrap mark_consumed in to_thread: it does sync file I/O
     # (atomic-rename write to ~/.kiro/crew/refresh_chains.json) — must
     # not block the event loop.
-    await asyncio.to_thread(
+    persisted = await asyncio.to_thread(
         state.mark_consumed,
         jti,
         chain_id=chain_id,
@@ -700,6 +700,28 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         # blank -- absent must stay distinguishable from bound-but-lost.
         peer_key=bound_peer_key,
     )
+
+    if not persisted:
+        # The consumption is in memory only. Publishing the pair here would retire this jti
+        # for the running process while leaving it spendable on disk, so the next start --
+        # which is what the store's own warning tells the operator to do -- would accept the
+        # token this request was supposed to burn, with the replacement pair already in the
+        # client's hands. Refusing costs the client one retry; publishing costs the guarantee
+        # that a rotated refresh token is single-use.
+        logger.error(
+            "auth_refresh: refusing to publish a rotated pair for chain %s because the "
+            "consumption did not persist; the presented token stays valid and the client "
+            "may retry.",
+            chain_id[:8],
+        )
+        return web.json_response(
+            {
+                "error": "The refresh state could not be persisted, so this token was not "
+                "rotated. Retry in a moment.",
+                "code": "refresh_state_unavailable",
+            },
+            status=503,
+        )
 
     if require_peer:
         # The signed claim, not a second whois result, is authoritative. The

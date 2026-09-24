@@ -234,6 +234,12 @@ class RefreshStateManager:
         # ``validate_refresh_token`` refuses every rotation until the file is
         # repaired -- see ``_record_list`` for why empty is not a safe reading.
         self._corrupt_keys: tuple[str, ...] = ()
+        # Why a write could not be published, or "" when the last one landed. A record this
+        # store accepted but could not persist is the same class of untrustworthy as one it
+        # could not READ: the next start would load a store missing that revocation and read
+        # it as "nothing revoked". So it degrades the store rather than logging and moving
+        # on, and validation fails closed until a later write succeeds.
+        self._persist_failure: str = ""
         self._state_path = state_path
         self._load()
 
@@ -247,8 +253,12 @@ class RefreshStateManager:
         ip: str,
         replacement: str,
         peer_key: str = "",
-    ) -> None:
+    ) -> bool:
         """Record that ``jti`` was used to mint ``replacement``.
+
+        Returns whether the record was PERSISTED. A caller that publishes a replacement pair
+        must treat ``False`` as a failure and withhold it: the in-memory state says the jti is
+        spent, but nothing on disk does, so the next start would accept it again.
 
         ``replacement`` is the JSON-encoded payload we returned to the
         client (so the multi-tab grace window can return the same pair).
@@ -273,6 +283,14 @@ class RefreshStateManager:
             self._grace_replacements[chain_id] = (jti, time.time(), ip, replacement)
         self.evict_expired()
         self._persist()
+        # Whether the consumption REACHED DISK, for a caller about to publish a replacement
+        # pair on the strength of it. Degrading the store is not enough on its own:
+        # ``degraded_reason`` gates validation in THIS process, while the record that was
+        # meant to retire this jti is only in memory -- so a restart loads a file that never
+        # saw it, clears the degradation with it, and the spent token authenticates again.
+        # The caller has to be able to decline to publish, which it cannot do if this reports
+        # success either way.
+        return not self._persist_failure
 
     def is_consumed(self, jti: str) -> bool:
         with self._lock:
@@ -302,16 +320,27 @@ class RefreshStateManager:
     def degraded_reason(self) -> str:
         """Why this store cannot be trusted, or ``""`` when it can.
 
-        Non-empty when a persisted record list was present but unreadable, which
-        would otherwise read as "no revocations, no consumed jtis, no device
-        bindings" -- i.e. as every control being satisfied. Callers fail closed on
-        it, mirroring how ``validate_refresh_token`` already treats an unreadable
-        revocation counter.
+        Non-empty in two cases, and they are the same failure seen from either side.
+
+        A persisted record list was present but unreadable, which would otherwise read as
+        "no revocations, no consumed jtis, no device bindings" -- i.e. as every control
+        being satisfied.
+
+        Or a record this store ACCEPTED could not be published. The caller above has already
+        reported a successful rotation or logout by then, so a silent failure means the next
+        start loads a store missing that revocation and reads it the same way. Reporting it
+        here is what turns a lost write into a refusal instead of a bypass.
+
+        Callers fail closed on it, mirroring how ``validate_refresh_token`` already treats an
+        unreadable revocation counter.
         """
         with self._lock:
-            if not self._corrupt_keys:
-                return ""
-            return "unreadable persisted state: " + ", ".join(self._corrupt_keys)
+            reasons = []
+            if self._corrupt_keys:
+                reasons.append("unreadable persisted state: " + ", ".join(self._corrupt_keys))
+            if self._persist_failure:
+                reasons.append(self._persist_failure)
+            return "; ".join(reasons)
 
     def chain_peer(self, chain_id: str) -> str:
         """The peer key ``chain_id`` is bound to, or ``""`` when unbound.
@@ -579,12 +608,37 @@ class RefreshStateManager:
                 # file tools as a whole directory, so no name inside it is
                 # reachable either way. Both steps are atomic renames, so the
                 # destination is never partial.
-                staged = auth_store_staging_dir(self._state_path.parent) / (
+                payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+                try:
+                    staging = auth_store_staging_dir(self._state_path.parent)
+                except OSError as exc:
+                    # Publishing through the state file's own directory instead would put a
+                    # full copy of the chain state at a sandbox-visible, same-uid writable
+                    # name for the length of the write -- the exposure the staging directory
+                    # exists to close -- so this does not fall back there. Dropping the write
+                    # silently is not the alternative either: the caller has already reported
+                    # a successful rotation or logout. Degrading the store is both, and the
+                    # existing reader fails closed on it, so a spent or revoked token is
+                    # REFUSED rather than accepted after the next start.
+                    self._persist_failure = (
+                        "auth-store staging directory unusable, so the last record was not "
+                        f"persisted ({exc})"
+                    )
+                    logger.warning(  # nosemgrep: python-logger-credential-disclosure -- the rule fires on the "refresh_tokens:" prefix; the arguments are the state-file path and an OSError, never a record value.  # noqa: E501  # fmt: skip
+                        "refresh_tokens: auth-store staging directory unusable for %s (%s); "
+                        "the record was NOT persisted and this store is now degraded, so "
+                        "every refresh validation fails closed until a later write lands. "
+                        "Repair the staging directory and restart the gateway.",
+                        self._state_path,
+                        exc,
+                    )
+                    return
+                staged = staging / (
                     f"{self._state_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
                 )
                 atomic_write(
                     staged,
-                    json.dumps(data, separators=(",", ":")).encode("utf-8"),
+                    payload,
                     restrict_to_owner=True,
                     restrict_on_error="warn",
                 )
@@ -595,9 +649,20 @@ class RefreshStateManager:
                     # linger holding a full copy of the chain state.
                     staged.unlink(missing_ok=True)
                     raise
+                # The record is on disk, so this store is trustworthy again whatever an
+                # earlier write did.
+                self._persist_failure = ""
             except OSError as e:
-                logger.warning(
-                    "refresh_tokens: failed to persist state to %s (%s)",
+                # An ordinary write fault -- a full disk, a read-only home -- reaches here.
+                # The caller has already reported a successful rotation or logout, so the
+                # record cannot simply be dropped: the next start would load a store missing
+                # it and read that as nothing revoked. Degrade instead, so the existing
+                # fail-closed reader refuses rather than accepting a spent token.
+                self._persist_failure = f"the last record was not persisted ({e})"
+                logger.warning(  # nosemgrep: python-logger-credential-disclosure -- the rule fires on the "refresh_tokens:" prefix; the arguments are the state-file path and an OSError, never a record value.  # noqa: E501  # fmt: skip
+                    "refresh_tokens: failed to persist state to %s (%s); this store is now "
+                    "degraded, so every refresh validation fails closed until a later write "
+                    "lands",
                     self._state_path,
                     e,
                 )
