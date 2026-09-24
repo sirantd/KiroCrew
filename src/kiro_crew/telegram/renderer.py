@@ -43,7 +43,12 @@ from kiro_crew.constants import (
     strip_control_comments,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import (
+    redact_across_delivery,
+    redact_for_display,
+    safe_split_offset,
+    severs_a_credential,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -681,6 +686,18 @@ def _shrunk_limit(current: int, rendered_cap: int, worst: int) -> int:
     return nxt if nxt < current else _MIN_SPLIT_LIMIT
 
 
+def _delivered_form(source: str) -> str:
+    """What a seal actually SENDS for ``source``, as a credential scan must see it.
+
+    Mirrors ``_segment_text`` followed by ``_seal_current``'s own ``strip``. A cut is
+    graded before the seal runs, so grading the raw chunk grades text the reader
+    never gets: the facing edges of two chunks can be whitespace, a steering marker
+    or a horizontal rule, all of which disappear here -- and once they do, the two
+    messages sit flush against each other on screen.
+    """
+    return _strip_hr(_strip_steering(source)).strip()
+
+
 def _rendered_len(source: str) -> int:
     """Length of ``source`` once converted to Telegram HTML."""
     return len(_md_to_telegram_html(source))
@@ -980,6 +997,11 @@ class TelegramRenderer(Renderer):
         # no-op edits). _last_edit throttles edits. _buf = the CURRENT segment's
         # text; a rotation seals _buf into its message and starts _buf fresh.
         self._stream_mid: int | None = None
+        #: Text of the last segment SEALED, and of the last one that is beyond
+        #: editing. Every delivery is graded against the latter, because a seam graded
+        #: once at the cut was graded over a tail that has since grown.
+        self._last_landed: str = ""
+        self._delivered_closed: str = ""
         self._shown = ""
         self._last_edit = 0.0
         self._seal_count = 0  # rotations so far == index into _steer_texts for chips
@@ -1224,7 +1246,20 @@ class TelegramRenderer(Renderer):
                 if spans[0][0] == 0:
                     return  # the whole buffer is protected — do not rotate at all
                 held = raw[spans[0][0] :]
-                for chunk in _split_markdown_bounded(raw[: spans[0][0]], rendered_cap):
+                # Each sealed chunk is redacted alone, so a key written with markup
+                # through a cut matches nothing in any one chunk and the reader's
+                # client rejoins them on screen. Grade the DELIVERED form: the seal
+                # strips steering, horizontal rules and surrounding whitespace, and
+                # two edges that whitespace kept apart become adjacent there.
+                chunks = _split_markdown_bounded(raw[: spans[0][0]], rendered_cap)
+                graded = [_delivered_form(p) for p in (*chunks, held)]
+                if await asyncio.to_thread(severs_a_credential, graded, _default_redactor):
+                    # Hold the whole buffer: this branch has no source-slice cut to
+                    # fall back on, and the next rotation grades it again over more
+                    # text. Splitter output does not concatenate back to its input,
+                    # so rejoining a prefix of the chunks is not an option.
+                    return
+                for chunk in chunks:
                     self._buf = [chunk]
                     await self._seal_current(extract_uploads=False)
                     self._open_new_message()
@@ -1271,6 +1306,43 @@ class TelegramRenderer(Renderer):
             tail = chunks[-1].rstrip()
             if tail.endswith("```"):
                 chunks[-1] = tail[:-3].rstrip("\n")
+        # The cut lands on the RAW buffer's budget and each sealed chunk is redacted
+        # on its own, so a key written with markup through the cut matches nothing in
+        # any one chunk while the reader's client renders the markup away and reads
+        # them as one key down the screen. Grade the DELIVERED form, which the seal
+        # strips.
+        graded = [_delivered_form(p) for p in chunks]
+        if await asyncio.to_thread(severs_a_credential, graded, _default_redactor):
+            # Cut where the reader cannot rejoin rather than where the budget lands.
+            # Both sides are SOURCE slices: splitter output does not concatenate back
+            # to its input (fences are closed and reopened), so rejoining chunks
+            # would hand the user text the model never wrote.
+            #
+            # The offset is bounded by the SOURCE budget, and escaping inflates, so a
+            # safe head can still render past the HTML cap. Shrink the budget by the
+            # inflation actually observed and look again, which is the same loop the
+            # splitter itself runs -- a safe cut that fits is worth more than giving
+            # up on the rotation, since a deferral holds the whole buffer.
+            budget, head = limit, ""
+            while True:
+                offset = safe_split_offset(raw, budget, _default_redactor)
+                head = raw[:offset]
+                worst = _rendered_len(head)
+                if not offset or worst <= rendered_cap:
+                    break
+                if budget <= _MIN_SPLIT_LIMIT:
+                    offset = 0
+                    break
+                budget = _shrunk_limit(budget, rendered_cap, worst)
+            slices = [head, raw[offset:]]
+            if not offset or await asyncio.to_thread(
+                severs_a_credential, [_delivered_form(p) for p in slices], _default_redactor
+            ):
+                # Deliver NOTHING: the withheld text rides the next rotation, and the
+                # final seal re-splits and seals an over-cap segment chunk by chunk.
+                self._buf = [raw + protocol_suffix]
+                return
+            chunks = slices
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
@@ -1282,7 +1354,14 @@ class TelegramRenderer(Renderer):
         self._buf = [(chunks[-1] if chunks else "") + protocol_suffix]
 
     def _open_new_message(self) -> None:
-        """Next render creates a fresh message instead of editing the old one."""
+        """Next render creates a fresh message instead of editing the old one.
+
+        This is also where the message just written stops being editable, so it
+        becomes the text every later delivery is graded against: while it is still
+        the live bubble an edit REPLACES it, and grading a message against its own
+        earlier content would compare it with itself.
+        """
+        self._delivered_closed = self._last_landed
         self._stream_mid = None
         self._shown = ""
 
@@ -1651,6 +1730,14 @@ class TelegramRenderer(Renderer):
         # milliseconds — holding the frame lock across it would block the typing
         # task too, and holding the loop would block every other conversation.
         text = await asyncio.to_thread(_display_safe, text)
+        # The message ABOVE this one is on screen and cannot be recalled, so its
+        # boundary with this text is graded HERE and not only where the cut was made:
+        # that grade ran over a tail which has since grown, and canonicalising is
+        # non-local. Off the loop for the same reason the redaction above is.
+        text = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, text, _default_redactor
+        )
+        self._last_landed = text
         if footer:
             # A quoted line under the answer rather than a separate message: the
             # footer is metadata about the turn, and a second bubble for it would

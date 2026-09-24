@@ -63,7 +63,7 @@ legacy metadata do not override a canonical execution.
 | `messaging/approval.py` | Two channel-neutral approval styles behind one INTERACTIVE `decider`, both deny-by-default on timeout (recording `last_deny_cause = approval_timeout` for the driver, below) and keyed `session_key`+`request_id`. **Typed reply** (`TEXT_APPROVAL_TIMEOUT_S`, the verdict vocabulary, `TextReplyApprovalDecider`) for a `max_buttons=0` channel, with Trust recorded as the session's own approval policy rather than a second trust store. **Widget awaiter** (`PendingApprovals` + `SessionApprovalDecider`) for a press whose correlation id and per-prompt nonce travel a round trip this module cannot see (a Webex Adaptive Card over the device websocket); a typed answer has no nonce, a press has no free text |
 | `messaging/driver.py` deny cause | A decider MAY carry `last_deny_cause` (`""` for a human's own answer, `constants.DENY_CAUSE_APPROVAL_TIMEOUT` when its prompt expired). After a denial the driver reads it and, for the timeout cause, awaits `deny_notice.steer_refusal_notice` BEFORE `reject_tool` (capability-gated on `provider.supports_steer`, bounded by `STEER_NOTICE_BOUND_SECS`, best-effort), so the model is told the prompt expired unanswered instead of reading kiro-cli's generic "User denied tool execution" as a human refusal. Cancellation mid-steer still answers the wire through a shielded, strongly referenced orphan reject. Every shipped decider records the cause: `TextReplyApprovalDecider`, `SessionApprovalDecider` (via `PendingApprovals.decide_with_cause`), `DiscordApprovalDecider`, `SlackApprovalDecider`, `TelegramApprovalDecider`, `TeamsApprovalDecider`. A plain callable without the attribute is a causeless denial, as before |
 | `messaging/driver.py` `deny_all_tools` | Rejects EVERY permission request ahead of every approve path. The approval ladder cannot express "this sender is not the operator" on its own: the PreToolUse hook may answer `auto_approve` and the Trust/YOLO predicates approve and short-circuit, both BEFORE the ladder is consulted, so setting the mode to `interactive` without a decider is not sufficient. Defaults False |
-| `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel |
+| `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` -- credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel. `joins_to_a_credential` / `severs_a_credential` / `safe_split_offset` answer the cut question a cap forces: would the reader rejoin a key across this boundary |
 | `messaging/markup.py` | `strip_thinking_tags` / `flatten_pipe_tables` / `flatten_mermaid_body`: Markdown reductions for a surface that renders none of the source form (a `<thinking>` block, a pipe table needing a monospace grid, a `mermaid` fence needing an image). Emits Markdown, never a channel dialect, so each channel's own inline converter finishes the job. Stdlib-only leaf |
 | `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer. `split_markdown_bytes` wraps it for a byte-capped platform, measuring the produced chunks and shrinking the character budget until they fit, with the `chunk_utf8_bytes` primitive as the floor. Also exports `iter_fence_spans`, the same fence machine viewed as character spans over a whole message |
 | `messaging/outbound_files.py` | `extract_local_refs` (+ `extract_local_refs_off_loop`) — pulls local markdown image references out of an outbound reply into `OutboundFile` payloads carrying the validated bytes, with `Rejection` reasons for everything refused. Also `iter_local_refs` / `hide_local_refs`, the text-only scan a streaming channel uses to keep the markup off live frames. Channel-neutral; the upload stays per-transport |
@@ -1777,6 +1777,77 @@ before the split. Discord gets that from the shared `split_markdown_safe`, whose
 final chunk is deliberately left open as the live buffer; Telegram still carries
 its own splitter. Raw markers never reach posted text; each renderer keeps a
 defensive raw-marker parser only for callers that bypass `TurnDriver`.
+
+**A length rotation may not sever a credential the reader's client will rejoin.**
+The cut is chosen on the RAW buffer's budget while each rotated message is redacted
+ALONE, so a key the model wrote with markup through the cut matches nothing in any one
+message -- and the reader's client renders the markup away and reads the pieces as one
+key, one message under the other. It needs no markup at all on either channel: a
+plain unmarked key crossing the cut leaks the same way, because the pieces are only
+ever scanned apart. This is the same hazard WeCom's `_push` answers with
+`safe_split_offset`, at the other shape a cap takes.
+
+So the whole delivery sequence is graded before anything is sent.
+`display_safety.severs_a_credential` takes the ordered pieces -- the splitter's chunks,
+plus the held image tail where one is retained -- redacts each alone, and then asks
+whether a key appears anyway. It reads the sequence two ways, because neither
+subsumes the other: the WHOLE sequence put together, and each boundary against
+everything after it. The first is what catches a key whose MARKUP spans an entire
+piece rather than whose characters do -- `AKIA[KEYTAIL](http://host/<long>)` cut into
+three reveals nothing in any neighbouring pair, since the link needs the closing
+bracket that sits in the third piece, while the full join collapses the url to its
+label and puts that label against `AKIA`. Piece length is therefore no defence:
+canonicalising DROPS a link's target, so a piece of any size can vanish entirely. The
+second reading survives a pattern needing a trailing boundary, where the reader sees a
+message break that the whole-sequence join does not.
+
+Pieces are graded AS DELIVERED, not as the splitter produced them. Telegram's seal
+sends `_segment_text().strip()`, and `_strip_steering` and `_strip_hr` each end in a
+strip of their own, so `_delivered_form` applies that chain before grading: two chunks
+whose facing edges are whitespace, a steering marker or a horizontal rule are held
+apart in the raw text and sit flush together on screen, where `AKIAIOSF` and
+`    ODNN7EXAMPLE` read as one key that no credential pattern tolerating no whitespace
+would have matched. Discord grades through `_strip_steering` for the same reason, and
+its table-card branch grades the chunks unchanged, because a presentation snapshot is
+delivered verbatim.
+
+When the sequence is unsafe the cut moves rather than the budget: `safe_split_offset`
+picks an offset that severs nothing, that head goes out alone, and the remainder is
+retained. Both are SOURCE slices, never rejoined chunks -- `split_markdown_safe` does
+not concatenate back to its input, since a chunk is rstripped and a fence is closed at
+the seal and reopened in the next chunk, so rejoining would glue one paragraph's last
+word onto the next or invent a fence run the model never wrote, and that corrupted
+buffer is what the user is eventually sent. Three answers mean **deliver nothing this
+rotation**: an offset of `0` (every sampled candidate unsafe), a safe head that still
+grades unsafe once the retained remainder is in view, and, on Telegram, a safe head
+that renders past the HTML cap. Telegram's upload-hold branch has no source-slice cut
+to fall back on and so simply holds the whole buffer. Withholding is always available
+and is the safe direction: the text rides the next rotation, and the final seal
+redacts the whole segment intact.
+
+**A seam's safety cannot be decided once.** The grade above runs where the cut is
+made, over the text present THEN, and canonicalising is non-local: characters arriving
+later change how earlier ones render. A message ending `...AKIA` beside a live tail of
+`[KEYTAIL` grades clean, because the link has no closing bracket yet, and once that
+message is sent it is beyond recall -- then the bracket and url arrive, the url
+collapses onto the label, and the reader reads one key down the screen. Streaming
+growth reaches this without any writer replacing anything.
+
+So every delivery is graded again, against the message already on screen.
+`display_safety.redact_across_delivery` takes the closed message and the pending text,
+and when the join reveals a key it redacts the join as one string and returns
+everything past the surviving prefix of the delivered side. The remedy has to act on
+the PENDING side because that is the only side still in hand; the placeholder lands
+where the match began, leaving the half already shown stranded on its own, which is not
+a credential. Withholding is not an alternative: the text must go out eventually, and a
+later seal redacts only its own segment, so deferring would ship the completion
+untouched.
+
+The text graded against is the last message beyond EDITING, promoted in
+`_open_new_message` -- while a message is still the live frame an edit replaces it, and
+grading it against its own earlier content would compare it with itself. Discord hangs
+this on `_land_sealed`, the one place every sealed payload passes through; Telegram on
+`_seal_text`, which redacts once ahead of all three of its sinks.
 
 ## Session privacy modes (`privacy_mode.py`)
 

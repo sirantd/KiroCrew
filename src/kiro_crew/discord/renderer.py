@@ -68,7 +68,12 @@ from kiro_crew.discord.client import (
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import (
+    redact_across_delivery,
+    redact_for_display,
+    safe_split_offset,
+    severs_a_credential,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -79,6 +84,7 @@ from kiro_crew.messaging.outbound_files import (
 )
 from kiro_crew.messaging.renderer import (
     Renderer,
+    _default_redactor,
     apply_options_cap,
     chunk_text,
     count_redaction_tags,
@@ -518,6 +524,11 @@ class DiscordRenderer(Renderer):
         # Delivery transforms never enter the canonical protocol buffer. A
         # snapshot exists only when outbound presentation differs from source.
         self._delivery_text: str | None = None
+        #: Text of the last message that LANDED, and of the last one that can no
+        #: longer be edited. Every delivery is graded against the latter, because a
+        #: seam graded once at the cut was graded over a tail that has since grown.
+        self._last_landed: str = ""
+        self._delivered_closed: str = ""
         self._last_tool = ""
         # Transient tool-activity footer ("🔧 {tool}…") shown ONLY on live
         # streaming frames — never stored in _buf, so seals/finals stay clean.
@@ -802,6 +813,18 @@ class DiscordRenderer(Renderer):
                 if await asyncio.to_thread(protected_ref_spans, candidate):
                     return
             chunks = await asyncio.to_thread(split_markdown_safe, candidate, limit)
+            # Card text is model text, and this branch cuts it on the same length
+            # budget, so its boundaries carry the same hazard as the source path's.
+            # A presentation snapshot is delivered verbatim, so the chunks ARE what
+            # the reader gets.
+            if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor):
+                offset = safe_split_offset(candidate, limit, _default_redactor)
+                slices = [candidate[:offset], candidate[offset:]]
+                if not offset or await asyncio.to_thread(
+                    severs_a_credential, slices, _default_redactor
+                ):
+                    return
+                chunks = slices
             for chunk in chunks[:-1]:
                 self._buf = []
                 self._delivery_text = chunk
@@ -835,6 +858,32 @@ class DiscordRenderer(Renderer):
             dirty_cut = any(len(line) > limit for line in split_source.splitlines(True))
             if dirty_cut or lost:
                 self._segment_uploads_safe = False
+        # The splitter cuts the RAW buffer on a length budget and each chunk is
+        # redacted alone, so a key written with markup through the cut matches
+        # nothing in any one chunk while the reader's client renders the markup away
+        # and reads them as one key down the screen. Grade what would actually be
+        # DELIVERED -- the seal strips steering markers, so an unstripped chunk is
+        # not the text the reader gets.
+        graded = [_strip_steering(piece) for piece in (*sealed, tail)]
+        if await asyncio.to_thread(severs_a_credential, graded, _default_redactor):
+            # Cut where the reader cannot rejoin rather than where the budget lands.
+            # The head and the retained remainder are SOURCE slices: splitter output
+            # does not concatenate back to its input (a chunk is rstripped, a fence
+            # is closed and reopened), so rejoining chunks would hand the user text
+            # the model never wrote.
+            offset = safe_split_offset(split_source, limit, _default_redactor)
+            head = split_source[:offset]
+            rest = split_source[offset:] + raw[len(split_source) :]
+            regraded = [_strip_steering(head), _strip_steering(rest)]
+            if not offset or await asyncio.to_thread(
+                severs_a_credential, regraded, _default_redactor
+            ):
+                # Deliver NOTHING: withheld text rides the next rotation, and the
+                # final seal redacts the whole segment as one string.
+                self._buf = [raw + protocol_suffix]
+                self._delivery_text = None
+                return
+            sealed, tail = [head], rest
         for ch in sealed:
             self._buf = [ch]
             self._delivery_text = None
@@ -844,7 +893,14 @@ class DiscordRenderer(Renderer):
         self._delivery_text = None
 
     def _open_new_message(self) -> None:
-        """Next render creates a fresh message instead of editing the old one."""
+        """Next render creates a fresh message instead of editing the old one.
+
+        This is also where the message just written stops being editable, so it
+        becomes the text every later delivery is graded against: while it is still
+        the live frame an edit REPLACES it, and grading a message against its own
+        earlier content would compare it with itself.
+        """
+        self._delivered_closed = self._last_landed
         self._stream_mid = None
         self._shown = ""
 
@@ -1003,6 +1059,13 @@ class DiscordRenderer(Renderer):
         components: list[dict] | None,
     ) -> bool:
         """Edit first, then send; fail softly so recovery can restore markup."""
+        # The message ABOVE this one is already on screen and cannot be recalled, so
+        # its boundary with this text is graded here rather than once at the cut: a
+        # seam graded when the cut was made was graded over a tail that has since
+        # grown, and canonicalising is non-local.
+        text = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, text, _default_redactor
+        )
         self._seals_attempted += 1
         try:
             if self._stream_mid is not None:
@@ -1011,6 +1074,7 @@ class DiscordRenderer(Renderer):
                 ):
                     self._seals_landed += 1
                     self._tally_redactions(text)
+                    self._last_landed = text
                     return True
                 # A missing live message falls through to a fresh send.
                 self._stream_mid = None
@@ -1023,6 +1087,7 @@ class DiscordRenderer(Renderer):
             if landed:
                 self._seals_landed += 1
                 self._tally_redactions(text)
+                self._last_landed = text
             return landed
         except Exception:
             logger.warning("discord: sealing the segment failed", exc_info=True)

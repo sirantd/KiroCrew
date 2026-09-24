@@ -23,7 +23,7 @@ keeps its own (possibly session-scoped) redactor.
 from __future__ import annotations
 
 import re
-from typing import Callable
+from typing import Callable, Sequence
 
 from kiro_crew.preview_text import drop_format_chars
 
@@ -206,6 +206,89 @@ def safe_split_offset(text: str, limit: int, redactor: Callable[[str], str]) -> 
         step = 1 if step == 0 else step * 2
         offset = limit - step
     return 0
+
+
+def severs_a_credential(pieces: Sequence[str], redactor: Callable[[str], str]) -> bool:
+    """Would a reader shown *pieces* in order see a key that none of them holds?
+
+    A renderer whose cap forces one buffer into several messages redacts each message
+    ALONE, so a credential the split severed matches nothing in any single message --
+    and the reader's client renders the markup away and reads the pieces one under
+    the other, in order, as one text.
+
+    Two readings, because neither subsumes the other:
+
+    * **the whole sequence**, every piece redacted alone and then put together. This
+      is what catches a key whose MARKUP spans an entire piece rather than whose
+      characters do: cut ``AKIA[KEYTAIL](http://host/<long>)`` into three and no
+      neighbouring pair canonicalises to anything (the link needs its closing
+      bracket, which is in the third piece), while the full join collapses the url
+      to the label and puts the label against ``AKIA``. Piece length is no defence
+      here -- canonicalising DROPS a link's target, so a piece of any size can
+      vanish entirely.
+    * **each boundary against everything after it**, which is the reading that
+      survives a pattern needing a trailing boundary: the reader sees a message
+      break where the whole-sequence join sees the next character, so a key
+      completed at the end of one piece must be caught even when later text would
+      spoil the match.
+
+    Every piece is put through the same redaction the sender will apply and then
+    reduced to what the platform SHOWS, exactly as :func:`joins_to_a_credential`
+    does for a single cut -- of which this is the n-piece case. Soundness rests on
+    the same property: ``redact_for_display`` is already a fixed point for one
+    string, so whatever either reading finds is produced by putting pieces together
+    and by nothing else. One piece therefore answers False: there is no boundary.
+
+    Callers must pass the pieces AS DELIVERED, not as the splitter produced them. A
+    renderer that strips steering markers, horizontal rules or surrounding
+    whitespace on the way out delivers something shorter than it graded, and two
+    pieces whose facing edges are whitespace become adjacent on screen -- where
+    ``AKIAIOSF`` and ``    ODNN7EXAMPLE`` read as one key that no credential pattern
+    tolerating no whitespace would have matched.
+
+    True means the split is unusable and the caller must cut somewhere else (see
+    :func:`safe_split_offset`) or deliver nothing at all.
+    """
+    safe = [redact_for_display(piece, redactor)[0] for piece in pieces]
+    readings = [
+        canonicalize_display("".join(safe)),
+        "".join(canonicalize_display(piece) for piece in safe),
+    ]
+    for index in range(len(safe) - 1):
+        rest = "".join(safe[index + 1 :])
+        readings.append(canonicalize_display(safe[index] + rest))
+        readings.append(canonicalize_display(safe[index]) + canonicalize_display(rest))
+    return any(redactor(reading) != reading for reading in readings)
+
+
+def redact_across_delivery(delivered: str, pending: str, redactor: Callable[[str], str]) -> str:
+    """*pending*, with whatever completes a key against *delivered* taken out.
+
+    A seam is graded when the cut is made, over the text present THEN. That is not a
+    decision that keeps: canonicalising is non-local, so characters arriving later
+    can change how earlier ones render. A message ending ``...AKIA`` beside a live
+    tail of ``[KEYTAIL`` grades clean -- the link has no closing bracket yet -- and
+    once it is sent it cannot be recalled; the bracket then arrives and the reader
+    reads one key down the screen.
+
+    So the boundary is graded again at every delivery, against the message already
+    on screen. When the join reveals a key, the remedy has to act on the PENDING
+    side, because that is the only side still in hand. The join is redacted as one
+    string and everything past the surviving prefix of *delivered* is what goes out:
+    the placeholder lands where the match began, so the half already shown is left
+    stranded on its own, which is not a credential.
+
+    Withholding is NOT an alternative here. The text must be delivered eventually,
+    and a later seal redacts only its own segment -- it cannot see the half that is
+    already gone -- so deferring would ship the completion untouched.
+    """
+    if not delivered or not severs_a_credential([delivered, pending], redactor):
+        return pending
+    joined = redact_for_display(delivered + pending, redactor)[0]
+    keep, bound = 0, min(len(joined), len(delivered))
+    while keep < bound and joined[keep] == delivered[keep]:
+        keep += 1
+    return joined[keep:]
 
 
 def redact_for_display(text: str, redactor: Callable[[str], str]) -> tuple[str, bool]:
