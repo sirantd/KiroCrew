@@ -60,6 +60,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_TIMEOUT,
+    SLACK_NAMESPACE,
     STEER_NOTICE_BOUND_SECS,
     is_control_tag_tail,
     strip_control_comments,
@@ -3115,17 +3116,27 @@ async def maybe_route_linked_thread(
         _dashboard_state._background_tasks.add(_chat_task)  # type: ignore[attr-defined]
         _chat_task.add_done_callback(_dashboard_state._background_tasks.discard)  # type: ignore[attr-defined]
     else:
-        # circular import: session_control pulls in dashboard modules at module level.
-        from kiro_crew.dashboard.session_control import containment_meta
+        # circular import: the dashboard pulls in Slack modules at module level.
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+        from kiro_crew.messaging.link import ChannelLink
 
-        # Stamp the admission-time containment. A linked slot records
-        # linked=True here, so its own channel's queued messages keep draining;
-        # only a constraint that appears AFTER this enqueue drops the entry.
-        _linked_slot.queue_append(
+        # The dashboard's one queue producer, so the entry gets what every queued
+        # send gets -- the admission-time containment stamp (a linked slot records
+        # linked=True, so only a constraint appearing AFTER this enqueue drops the
+        # entry), the crew-log line, the queue card and the durable write -- and
+        # the thread rides the entry as its origin: the drain drops a queued
+        # message whose link was released while it waited (``/unlink``, a relink
+        # elsewhere) instead of answering it into a session the thread has left,
+        # and tells this thread so (``channel_busy.notify_channel_origin_dropped``).
+        queue_for_next_turn(
+            _dashboard_state,  # type: ignore[arg-type]
+            _linked_slot,
             text,
-            meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
             directive_user_origin=True,
-            directive_channel_origin=True,
+            channel_origin=True,
+            channel_address=ChannelLink(
+                channel_type=SLACK_NAMESPACE, channel_id=channel, thread_id=reply_ts
+            ).to_dict(),
         )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(

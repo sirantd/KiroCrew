@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from kiro_crew.messaging.session_resume import RoutingDecision
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.commands import COMMAND_SPEC, build_help_text, parse_command
 from kiro_crew.teams.transport_dispatch import (
@@ -731,3 +733,189 @@ class _AddressedClient(_Client):
 
 async def _true() -> bool:
     return True
+
+
+class TestABusyResumedSession:
+    """A message into a resumed dashboard session that is mid-turn: who holds the
+    turn decides where it waits, and a gateway command never waits at all."""
+
+    def _resumed(self, d: TeamsDispatcher) -> None:
+        d._session_resume.route = AsyncMock(  # type: ignore[method-assign]
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_channels_own_turn_takes_the_channels_own_queue(self) -> None:
+        """No dashboard turn holds the slot, so the resumed key's queue is this
+        channel's to fill and to drain -- the pre-existing path, kept."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert [t for _, t, _ in sessions.queues["dashboard:chat-1"]] == ["and the weather?"]
+        assert any("Queued" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_running_dashboard_turn_takes_the_message_instead(self, monkeypatch) -> None:
+        """When the DASHBOARD holds the resumed session's turn the message goes to the
+        slot's own queue; this channel's queue, whose drain only a Teams turn runs,
+        stays empty."""
+        from kiro_crew.dashboard import channel_busy
+
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        handed: list[tuple[str, str, bool, dict, str]] = []
+
+        def _hand(
+            state, session_key: str, text: str, *, has_attachments: bool, origin, principal: str
+        ) -> str:
+            handed.append((session_key, text, has_attachments, origin.to_dict(), principal))
+            return channel_busy.HANDOFF_QUEUED
+
+        monkeypatch.setattr(channel_busy, "hand_to_dashboard_turn", _hand)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        # The conversation rides along, so the drain can address a drop notice to
+        # it, with the identity this dispatcher admitted.
+        assert handed == [
+            (
+                "dashboard:chat-1",
+                "and the weather?",
+                False,
+                {"channel_type": "teams", "channel_id": "CONV", "thread_id": None},
+                _EMAIL,
+            )
+        ]
+        assert sessions.queues == {}
+        assert any("dashboard" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_attachments_are_refused_while_the_dashboard_drives(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import channel_busy
+
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        monkeypatch.setattr(
+            channel_busy,
+            "hand_to_dashboard_turn",
+            lambda *a, **k: channel_busy.HANDOFF_ATTACHMENTS_REFUSED,
+        )
+
+        await d.handle_message(_inbound("see attached"))
+
+        assert sessions.queues == {}
+        assert any("attachments" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/sessions other issue", "/new", "/stop", "/help"])
+    async def test_a_command_typed_while_the_resumed_turn_is_busy_is_executed(
+        self, command: str
+    ) -> None:
+        """The gateway runs the command; the busy turn never sees it as a queue
+        entry or a steer."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        d._session_resume.show_picker = AsyncMock()  # type: ignore[method-assign]
+        d._session_resume.leave_resumed_session = AsyncMock(  # type: ignore[method-assign]
+            return_value="dashboard:chat-1"
+        )
+
+        await d.handle_message(_inbound(command))
+
+        if command.startswith("/sessions"):
+            d._session_resume.show_picker.assert_awaited_once()
+            assert d._session_resume.show_picker.await_args.args[-1] == "other issue"
+        assert sessions.queues == {}
+
+    @pytest.mark.asyncio
+    async def test_a_queued_resumed_entry_replays_in_that_session(self) -> None:
+        """The channel's own turn queued it on the resumed key, so the drain must
+        replay it THERE. A replay runs with commands off, which also turns routing
+        off, so only the marker the entry carries can name that session -- without it
+        the replay re-derives the native key and answers in the wrong transcript."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+
+        await d.handle_message(_inbound("and the weather?"))
+        assert "dashboard:chat-1" in sessions.queues
+
+        # The turn finished: drain it with the session idle, as the tail does, and
+        # the conversation still resumes that session.
+        sessions._busy = False
+        d._session_resume.resumed_session = (  # type: ignore[method-assign]
+            lambda conversation_id: "dashboard:chat-1"
+        )
+        ran: list[str] = []
+        d._run_turn = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda *a, **kw: ran.append(kw.get("resumed_key") or "")
+        )
+        await d._drain_queue("dashboard:chat-1", _inbound(""))
+
+        assert ran == ["dashboard:chat-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_replay_is_dropped_once_the_conversation_left_that_session(self) -> None:
+        """`/unlink`, `/new` or a rebind landed while the entry waited. Replaying it
+        there would answer into a session the user left, and natively it would run in
+        a session that never accepted it, so it is dropped and said so."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        sessions._busy = False
+        # The binding is gone by drain time.
+        d._session_resume.resumed_session = lambda conversation_id: None  # type: ignore[method-assign]
+        d._run_turn = AsyncMock()  # type: ignore[method-assign]
+        await d._drain_queue("dashboard:chat-1", _inbound(""))
+
+        d._run_turn.assert_not_awaited()
+        assert any("Dropped a queued message" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_message_between_a_plans_stages_waits_in_the_slot_queue(
+        self, monkeypatch
+    ) -> None:
+        """A dashboard plan releases the session lease between its stages while the
+        plan is still live. `is_busy` alone reads that gap as idle and would start a
+        rival turn, so the dashboard's own predicate decides too."""
+        from kiro_crew.dashboard import channel_busy
+
+        sessions = _Sessions(_Provider(), busy=False)
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        handed: list[str] = []
+
+        monkeypatch.setattr(
+            channel_busy, "dashboard_turn_in_progress", lambda state, session_key: True
+        )
+
+        def _hand(
+            state, session_key: str, text: str, *, has_attachments: bool, origin, principal: str
+        ) -> str:
+            handed.append(text)
+            return channel_busy.HANDOFF_QUEUED
+
+        monkeypatch.setattr(channel_busy, "hand_to_dashboard_turn", _hand)
+        d._run_turn = AsyncMock()  # type: ignore[method-assign]
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert handed == ["and the weather?"]
+        d._run_turn.assert_not_awaited()
+        assert sessions.queues == {}

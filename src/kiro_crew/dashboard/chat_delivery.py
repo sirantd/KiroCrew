@@ -728,6 +728,31 @@ async def steer_into_running_turn(
 #: spelled in two places.
 TURN_ACTOR_META_KEY = "turnActor"
 
+#: Queue-entry ``meta`` key marking text that came from a CHANNEL conversation.
+#:
+#: The provenance flags (``_directive_channel_origin`` beside it) never reach
+#: disk, so a restored entry drains with none -- and text a channel handed off
+#: would then regain the composer's command word: ``/workflow deploy`` typed into
+#: a linked conversation, queued behind a busy dashboard turn, would run on the
+#: dashboard owner's authority after a gateway restart. This marker rides
+#: ``meta``, which IS persisted, and the drain folds it into the turn's
+#: channel-origin provenance (:func:`chat_runner._start_next_queued_turn`).
+#:
+#: Trusting it from an editable file is safe where trusting the flags is not,
+#: because it can only take authority AWAY: a channel-origin turn has no command
+#: word and no LINKED exemption. Forging it downgrades an entry to prose; deleting
+#: it is a capability the editor already has by deleting the entry. Never read
+#: any other way than through :func:`channel_text_marked`: only the exact value
+#: ``True`` counts, so a truthy shape (``"yes"``, ``1``) from a hand-edited line
+#: is not a marker.
+CHANNEL_TEXT_META_KEY = "channel_text"
+
+
+def channel_text_marked(entry: Any) -> bool:
+    """Whether a queue entry's ``meta`` carries the channel-text marker (exactly ``True``)."""
+    meta = entry.get("meta") if isinstance(entry, dict) else None
+    return isinstance(meta, dict) and meta.get(CHANNEL_TEXT_META_KEY) is True
+
 
 def queue_for_next_turn(
     state: "DashboardState",
@@ -739,11 +764,25 @@ def queue_for_next_turn(
     attachments: dict[str, list[str]] | None = None,
     decision_strip: dict | None = None,
     turn_actor: str = "",
+    channel_origin: bool = False,
+    channel_address: dict[str, Any] | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
+
+    *channel_origin* marks the entry ``_directive_channel_origin``: the text was
+    typed into a CHANNEL conversation bound to this session (``channel_busy``),
+    so a directive the drained turn derives from it keeps channel authority
+    rather than inheriting the dashboard owner's. Default False keeps every
+    composer and app send exactly as before.
+
+    *channel_address* is that conversation, serialized (``ChannelLink.to_dict``),
+    stamped under ``channel_busy.CHANNEL_ORIGIN_META_KEY``: the drain drops the
+    entry once the conversation stops resuming the session and tells the
+    conversation so. Queue plumbing like the containment stamp -- the drain keeps
+    it off the row it writes.
 
     *send_id* is the client-minted ``meta.sendId`` the plain send path persists
     on its user row, already passed through ``normalize_send_id`` by the caller.
@@ -789,10 +828,17 @@ def queue_for_next_turn(
         meta.update(attachments)
     if decision_strip:
         meta["decisions_strip"] = decision_strip
+    if channel_address:
+        # Key literal rather than imported: channel_busy imports this module.
+        meta["channel_origin"] = dict(channel_address)
+    if channel_origin:
+        # Persisted where the flag beside it is not: see CHANNEL_TEXT_META_KEY.
+        meta[CHANNEL_TEXT_META_KEY] = True
     qid = slot.queue_append(
         message,
         meta=meta,
         directive_user_origin=directive_user_origin,
+        directive_channel_origin=channel_origin,
     )
     # Append-only session ledger. The session id comes off the client the running
     # turn published on the slot -- a message is only queued because a turn IS

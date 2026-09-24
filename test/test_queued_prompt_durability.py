@@ -1477,6 +1477,52 @@ class TestRestoredEntriesCarryNoHumanAuthority:
         assert restored[0].get("_directive_user_origin") is None
         assert restored[0].get("_directive_channel_origin") is None
 
+    @pytest.mark.asyncio
+    async def test_a_restored_channel_entry_still_drains_as_channel_text(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The flags never reach disk, so a restored entry drains with none -- and
+        text a CHANNEL handed off would then regain the composer's command word:
+        `/workflow deploy` typed into a linked conversation, queued behind a busy
+        turn, would run on the dashboard owner's authority after a restart. The
+        producer persists a marker that can only take authority away
+        (``CHANNEL_TEXT_META_KEY``), and the drain reads it back into the turn."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state(tmp_path)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        queue_for_next_turn(
+            state, slot, "/workflow deploy", directive_user_origin=True, channel_origin=True
+        )
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert [q["content"] for q in restored._queue] == ["/workflow deploy"]
+        assert restored._queue[0].get("_directive_channel_origin") is None
+        runs: list[dict] = []
+
+        def _run(state_, slot_, message, **kwargs):
+            runs.append({"message": message, **kwargs})
+            return MagicMock()
+
+        monkeypatch.setattr(cr, "_run_chat", _run)
+        monkeypatch.setattr(cr, "spawn_guarded_turn", lambda *a, **kw: MagicMock())
+
+        assert await cr._start_next_queued_turn(state, restored) is True
+
+        assert runs and runs[0]["message"] == "/workflow deploy"
+        assert runs[0]["_turn_provenance_restored"] is True
+        assert (
+            runs[0]["_directive_channel_origin"] is True
+        ), "a restored channel entry regained the composer's command word"
+        assert runs[0]["_directive_user_origin"] is False
+
 
 class TestTheTwoByteBudgetsAgree:
     """A durably-written queue must survive its own round trip.
@@ -1731,6 +1777,133 @@ class TestRestoredEntriesCarryNoSenderStamp:
 
         assert send_origin_slot(stamp) == "sender-slot"
         assert send_origin_tab(stamp) == sender._tab_id
+
+
+class TestRestoredEntriesCarryNoChannelStamp:
+    """A restored entry names no channel conversation, so the drop notice has nowhere to go.
+
+    ``channel_busy`` stamps a handed-off entry with the channel conversation it came
+    from, and the drain sends that conversation a drop notice addressed from the
+    stamp alone -- the stamp names a WRITE TARGET, like the sender stamp above.
+    Carried back off the editable metadata line, an edited stamp would turn a file
+    write into a message on whatever allow-listed conversation it names, from a
+    slot that was never bound to that conversation. Stripping costs one notice: a
+    hand-off that outlives a restart drains as an unstamped entry.
+    """
+
+    _VICTIM = {"channel_type": "discord", "channel_id": "victim-c1", "thread_id": None}
+
+    def test_the_channel_stamp_is_stripped_on_restore(self) -> None:
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+
+        restored = sanitize_restored_queue(
+            [
+                {
+                    "id": "q1",
+                    "content": "hi",
+                    "meta": {CHANNEL_ORIGIN_META_KEY: dict(self._VICTIM), "sendId": "s-1"},
+                }
+            ]
+        )
+        assert CHANNEL_ORIGIN_META_KEY not in restored[0]["meta"]
+        assert restored[0]["meta"] == {"sendId": "s-1"}
+
+    def test_a_forged_stamp_resolves_to_no_address(self) -> None:
+        # The end of the chain the strip breaks: with the key carried, the drain
+        # reads an address here and sends the drop notice to it.
+        from kiro_crew.dashboard.channel_busy import (
+            CHANNEL_ORIGIN_META_KEY,
+            channel_binding_released,
+            channel_origin_address,
+        )
+
+        restored = sanitize_restored_queue(
+            [{"id": "q1", "content": "hi", "meta": {CHANNEL_ORIGIN_META_KEY: dict(self._VICTIM)}}]
+        )
+        assert channel_origin_address(restored[0].get("meta")) is None
+        # And without the stamp the entry is not a channel hand-off any more: an
+        # unmirrored slot does not release it.
+        assert channel_binding_released({"mirrored": False}, restored[0].get("meta")) is False
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_stamp_never_reaches_a_send_at_the_drain(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Persist, restore, drain with a rejection: the rejection stands, the
+        conversation the stamp named is sent nothing."""
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard import channel_busy
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+
+        state = _make_state(tmp_path)
+        # An ordinary unmirrored slot: the store answers "no mirror link".
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        slot.queue_append("hi", meta={CHANNEL_ORIGIN_META_KEY: dict(self._VICTIM)})
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert [q["content"] for q in restored._queue] == ["hi"]
+        # The rejection: the slot is linked at the drain and the restored entry
+        # carries no admission snapshot, so it fails closed against ``linked``.
+        restored.linked_session_key = "discord:elsewhere:gen0"
+        told: list[tuple[str, dict, str]] = []
+
+        async def _notify(
+            st, session_key: str, origin, *, reason: str, principal: str = ""
+        ) -> bool:
+            told.append((session_key, origin.to_dict(), reason))
+            return True
+
+        monkeypatch.setattr(channel_busy, "notify_channel_origin_dropped", _notify)
+
+        cr._drop_stale_admissions(state, restored)
+        await _asyncio.sleep(0)  # the notice is fire-and-forget
+
+        assert restored._queue == [], "the restored entry should have been rejected"
+        assert told == [], "a restored entry's persisted channel stamp reached a send"
+
+    @pytest.mark.asyncio
+    async def test_a_restored_hand_off_drains_as_an_unstamped_entry(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The cost of the strip, stated: on an unmirrored slot the entry is not a
+        channel hand-off any more, so it is neither released nor reported -- it
+        waits like composer text."""
+        import asyncio as _asyncio
+
+        from kiro_crew.dashboard import channel_busy
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+
+        state = _make_state(tmp_path)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        slot.queue_append("hi", meta={CHANNEL_ORIGIN_META_KEY: dict(self._VICTIM)})
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        told: list[str] = []
+
+        async def _notify(
+            st, session_key: str, origin, *, reason: str, principal: str = ""
+        ) -> bool:
+            told.append(session_key)
+            return True
+
+        monkeypatch.setattr(channel_busy, "notify_channel_origin_dropped", _notify)
+
+        cr._drop_stale_admissions(state, restored)
+        await _asyncio.sleep(0)
+
+        assert [q["content"] for q in restored._queue] == ["hi"]
+        assert told == []
 
 
 class TestAStaleQueueSnapshotIsNotCommitted:

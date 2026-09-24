@@ -96,12 +96,14 @@ from kiro_crew.context_management import (
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.chat_delivery import (
+    CHANNEL_TEXT_META_KEY,
     STEER_STATE_CONSUMED,
     STEER_STATE_REQUEUED,
 )
 from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY as _TURN_ACTOR_META_KEY
 from kiro_crew.dashboard.chat_delivery import (
     attachment_meta,
+    channel_text_marked,
     find_written_steer_row,
 )
 from kiro_crew.dashboard.chat_folders import (
@@ -121,6 +123,7 @@ from kiro_crew.dashboard.chat_title import (
 from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
     _MAX_TOOL_PURPOSE,
+    CHANNEL_COMMAND_UNAVAILABLE,
     ResetCause,
     _append_compaction_notice,
     _apply_incognito_prefix,
@@ -141,6 +144,8 @@ from kiro_crew.dashboard.chat_utils import (
     build_recovery_requeue,
     chat_done_payload,
     chunk_generation,
+    dashboard_command_word,
+    displayable_channel_command,
     drained_to_thread,
     effective_session_key,
     expire_slack_options,
@@ -151,6 +156,7 @@ from kiro_crew.dashboard.chat_utils import (
     parse_workflow_command,
     remember_slack_options,
     slack_mirror_is_paused,
+    suppressed_channel_command,
     user_text_span,
 )
 from kiro_crew.dashboard.handlers import (
@@ -4058,6 +4064,30 @@ def cross_surface_withheld(state: Any, slot: Any) -> bool:
     return any(newly_held_constraints(now, admission) for admission in fences.values())
 
 
+async def _publish_cross_surface_reply(state: Any, slot: Any, session_key: str, text: str) -> bool:
+    """The fenced channel-neutral publication: ask the steer-audience fence, then
+    deliver through :func:`_deliver_cross_surface_reply`.
+
+    Every text a turn in THIS module publishes to a linked non-Slack channel goes
+    through here -- the completed reply and the linked-conversation command
+    refusal -- so the fence (:func:`cross_surface_withheld`) is consulted at one
+    site and a new publisher in this module cannot be added without inheriting it
+    (``test_session_control`` pins the callers). The plan-halt notice in
+    ``chat_orchestrator`` calls the transport leg directly and predates the fence.
+    Withheld means the transcript keeps the text and the channel gets nothing, the
+    same outcome the reply leg has always had. Returns whether it published.
+    """
+    if cross_surface_withheld(state, slot):
+        logger.info(
+            "withholding cross-surface reply for %s: %d unresolved steer audience fence(s)",
+            session_key,
+            len(slot._steer_audience_fences),
+        )
+        return False
+    await _deliver_cross_surface_reply(state, session_key, text)
+    return True
+
+
 async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_text: str) -> None:
     """Deliver a completed dashboard reply to a linked NON-Slack channel.
 
@@ -4071,7 +4101,8 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     push is per-TARGET rather than blanket answers that in ``send_message`` itself
     — WeCom pushes through ``aibot_send_msg`` but only into a conversation the user
     has already written to. Best-effort: a delivery failure never disrupts the
-    dashboard turn.
+    dashboard turn. Callers publish through :func:`_publish_cross_surface_reply`,
+    which owns the fence; this function is the transport leg only.
     """
     if not assistant_text:
         return
@@ -7577,7 +7608,9 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
     if not slot._queue:
         return
     # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard import channel_busy as _cb
     from kiro_crew.dashboard import session_control as _sc
+    from kiro_crew.dashboard.chat_utils import slot_history_key
 
     now = _sc.containment_snapshot(state, slot, on_probe_failure=True)
     _mirror_unverified = bool(now.get("mirror_unverified"))
@@ -7599,6 +7632,15 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
             q.get("meta"),
             directive_user_origin=q.get("_directive_user_origin") is True,
         )
+        # A message handed off from a channel conversation bound to this session
+        # (``channel_busy``) rides on that binding: it is the entry's reply route
+        # and the reason it was accepted. The binding is the slot's mirror link,
+        # so a mirror that is GONE at the drain -- the conversation `/unlink`ed or
+        # rotated away while the entry waited -- must drop the entry rather than
+        # answer it into a session the user left. Not a constraint for any other
+        # entry: composer text loses nothing when a mirror disappears.
+        if _cb.channel_binding_released(now, q.get("meta")):
+            changed.append(_cb.CHANNEL_UNLINKED_CONSTRAINT)
         if changed:
             doomed.append((q, changed))
     for q, changed in doomed:
@@ -7643,6 +7685,31 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
             mirror_unverified=_mirror_unverified,
         )
         _sc.audit_queued_drop(slot, q["id"], changed, origin=_origin)
+        # A CHANNEL conversation that handed this entry off (``channel_busy``) has
+        # no sender slot for the notice above and does not read this transcript;
+        # it is told through its own transport, addressed from the entry's stamp
+        # because the binding it rode in on may be exactly what is gone. Fire and
+        # forget: the send walks the governed ladder off-loop and this sweep must
+        # stay synchronous between the snapshot and the dequeue. Held on the
+        # state's background set until done -- a pending task nobody references
+        # is collectable, and the notice is that conversation's only word.
+        _address = _cb.channel_origin_address(_meta)
+        if _address is not None:
+            _notice_task = asyncio.create_task(
+                _cb.notify_channel_origin_dropped(
+                    state,
+                    slot_history_key(slot),
+                    _address,
+                    reason=_sc.describe_containment_change(
+                        changed, mirror_unverified=_mirror_unverified
+                    ),
+                    principal=_cb.channel_origin_principal(_meta),
+                )
+            )
+            _bg = getattr(state, "_background_tasks", None)
+            if isinstance(_bg, set):
+                _bg.add(_notice_task)
+                _notice_task.add_done_callback(_bg.discard)
         _log = logger.warning if _mirror_unverified and "mirrored" in changed else logger.info
         _log(
             "Dropped queued entry %s for slot %s at drain re-validation " "(newly held: %s%s)",
@@ -8108,8 +8175,12 @@ async def _start_next_queued_turn(
     # Channel authority is the narrower credential boundary. If batching combines
     # channel and dashboard entries, the whole turn must retain that boundary so a
     # directive derived from either message cannot inherit dashboard-owner secrets.
+    # The persisted marker counts beside the in-memory flag: a restored entry has
+    # no flags, and channel text must not regain the composer's command word after
+    # a restart (see ``chat_delivery.CHANNEL_TEXT_META_KEY``).
     directive_channel_origin = bool(consumed) and any(
-        item.get("_directive_channel_origin") is True for item in consumed
+        item.get("_directive_channel_origin") is True or channel_text_marked(item)
+        for item in consumed
     )
     if slot._stopping and not is_system_injection:
         slot.append(
@@ -8216,9 +8287,14 @@ async def _start_next_queued_turn(
                 _drained_send_ids.append(_sid)
             # The admission-time containment snapshot is queue plumbing,
             # consumed by _drop_stale_admissions above; it says nothing about the
-            # ROW, so it must not ride into the persisted transcript meta.
+            # ROW, so it must not ride into the persisted transcript meta. The
+            # channel-origin address (``channel_busy.CHANNEL_ORIGIN_META_KEY``)
+            # and the channel-text marker are plumbing of the same kind, for the
+            # same sweep and the drain's own provenance reduction.
             _drained_meta.update(
-                (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
+                (k, v)
+                for k, v in _item_meta.items()
+                if k not in (QUEUED_CONTAINMENT_META_KEY, "channel_origin", CHANNEL_TEXT_META_KEY)
             )
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
@@ -9320,6 +9396,10 @@ async def _run_chat(
             **containment_meta(state, slot),
             **(extra_meta or {}),
         }
+        if _directive_channel_origin:
+            # The in-memory flag below covers this process; the marker covers a
+            # recovery entry that outlives a restart (CHANNEL_TEXT_META_KEY).
+            _recovery_meta[CHANNEL_TEXT_META_KEY] = True
         if payload == RecoveryPayload.ORIGINAL and isinstance(_current_replay_message, dict):
             # ORIGINAL replays must preserve the triggering row's attachment
             # lists. The provider prompt already carries the full markers, but
@@ -9864,12 +9944,54 @@ async def _run_chat(
     _is_synthetic = _synthetic_payload or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
 
     # ── Slash commands: detect early, before session acquisition ──
-    first_word = message.split()[0] if message.strip() else ""
+    # Empty for a CHANNEL-origin turn: that text is prose here, never a dashboard
+    # or harness command (see ``dashboard_command_word``).
+    first_word = dashboard_command_word(message, channel_origin=_directive_channel_origin)
     _is_cc_provider = is_claude_code(KiroCrewConfig.load().agent.provider)
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
     # must NOT be forwarded to the harness as a command.
     is_slash = is_harness_slash_command(first_word, cc_provider=_is_cc_provider)
+
+    # A channel-origin turn whose leading token the dashboard WOULD have run as a
+    # command is refused and its author told, not streamed to the model as prose:
+    # the person in the linked conversation typed a command and would otherwise
+    # wait for an outcome (a compaction, a quick prompt) that never comes. Same
+    # shape as the blocked-command refusal below; the notice also travels to the
+    # conversation that typed it, since that user does not read this transcript.
+    _channel_command = suppressed_channel_command(
+        message, channel_origin=_directive_channel_origin, cc_provider=_is_cc_provider
+    )
+    if _channel_command:
+        # Named, not repeated: under ``claude_code`` the token is the channel
+        # user's own text, and every surface below is one the intercept already
+        # redacts their message for (``displayable_channel_command``).
+        _shown_command = displayable_channel_command(_channel_command)
+        sel().log_tool_invocation(
+            session_key=session_key,
+            agent=slot.agent or "kirocrew",
+            source="dashboard",
+            tool_name=_shown_command,
+            tool_kind="slash_command",
+            outcome="blocked",
+            metadata={"slot": slot.key, "reason": "channel_origin"},
+        )
+        _channel_notice = CHANNEL_COMMAND_UNAVAILABLE.format(command=_shown_command)
+        slot.append("assistant", _channel_notice, "msg msg-a")
+        state.push_slots_update()
+        await _deliver_linked_slack_message(state, slot, sessions, session_key, _channel_notice)
+        # Same fenced publication site as the turn's own reply: a peer steer admitted
+        # under another containment withholds this notice from the channel too.
+        await _publish_cross_surface_reply(state, slot, session_key, _channel_notice)
+        # Leave through the queue-cycle hand-off the turn's tail uses, not a bare
+        # return: a channel hand-off is QUEUED by design, so this refusal is reached
+        # from the drain with entries possibly behind it, and a return here would
+        # strand them until an unrelated message drained the slot -- a later message
+        # could then run ahead of them. The successor starts, or the cycle ends with
+        # its terminal ``done``.
+        if not (slot._queue and await _start_next_queued_turn(state, slot)):
+            await _finish_queue_cycle(state, slot)
+        return
 
     # Block dangerous/local-only commands before acquiring a session
     if first_word in _BLOCKED_SLASH_COMMANDS:
@@ -17272,17 +17394,10 @@ async def _run_chat(
         # withheld: it has no mirrored question, whereas every requeue site runs
         # downstream of the user-message leg above, so a recovery reply always has
         # a preceding question on the linked surface — withholding it would strand
-        # that question unanswered.
+        # that question unanswered. The steer-audience fence is asked inside
+        # ``_publish_cross_surface_reply``, the one publication site.
         if not is_slash:
-            if cross_surface_withheld(state, slot):
-                logger.info(
-                    "withholding cross-surface reply for %s: %d unresolved steer "
-                    "audience fence(s)",
-                    session_key,
-                    len(slot._steer_audience_fences),
-                )
-            else:
-                await _deliver_cross_surface_reply(state, session_key, assistant_text)
+            await _publish_cross_surface_reply(state, slot, session_key, assistant_text)
     except asyncio.CancelledError:
         _crew_log_error = "CancelledError"
         _persist_partial_reply()

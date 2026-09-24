@@ -413,6 +413,47 @@ class TestCommands:
         d._session_restricted.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_replay_whose_binding_moves_after_the_lookup_is_dropped_before_the_prompt(
+        self,
+    ) -> None:
+        """A drain replay pinned to a resumed session passes the admission-time
+        lookup, then `/unlink` (or a rebind) lands while the turn awaits its session.
+        The shared pipeline's closing gate re-reads the binding right before the
+        prompt opens: the replay neither runs nor persists in the session the
+        conversation has just left, and the conversation is told it was dropped."""
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="ran anyway"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        conv = FakeConvLog()
+        d = _dispatcher(sessions, FakeCtx(), client, conv_log=conv)
+        binding = ["dashboard:chat-1"]
+        d._session_resume.resumed_session = lambda conversation_id: binding[0]  # type: ignore[method-assign]
+        real_get = sessions.get_or_create
+
+        async def _get(key, **kw):
+            result = await real_get(key, **kw)
+            binding[0] = None  # the conversation left the session mid-acquisition
+            return result
+
+        sessions.get_or_create = _get  # type: ignore[method-assign]
+
+        await d.handle_message(
+            _inbound("queued text"),
+            drain=False,
+            interpret_commands=False,
+            resumed_session_key="dashboard:chat-1",
+        )
+
+        assert sessions.begin_turns == 0, "the prompt was opened in the abandoned session"
+        assert sessions.successes == []
+        assert conv.appended == []
+        assert sessions.released == ["dashboard:chat-1"]
+        assert not any("ran anyway" in content for (_, content, _) in client.sent)
+        assert any("Dropped" in content for (_, content, _) in client.sent)
+
+    @pytest.mark.asyncio
     async def test_new_bumps_gen_and_acks(self) -> None:
         sessions = FakeSessions(FakeProvider([]))
         client = FakeClient()

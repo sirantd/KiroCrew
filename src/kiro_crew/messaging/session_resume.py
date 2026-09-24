@@ -150,6 +150,31 @@ class ResumeReleaseError(RuntimeError):
     """A resumed binding removal could not be made durable."""
 
 
+class ReplayBindingChanged(Exception):
+    """A queued replay's conversation stopped resuming the session it was accepted for.
+
+    Raised from a dispatcher's closing gate -- the yield-free step right before the
+    prompt opens -- when the binding read there differs from the key the entry
+    names. The admission-time lookup ran before the turn's awaits (callback
+    admission, session acquisition, attachment I/O, context build), and an
+    ``/unlink`` or a rebind landing in any of them would otherwise run and persist
+    the replay in a session the conversation has left.
+    """
+
+
+def check_replay_binding(current: str | None, expected: str | None) -> None:
+    """The closing-gate half of a pinned replay's binding check.
+
+    *expected* is the resumed key the entry names, ``None`` for a native turn (no
+    check); *current* is the binding the conversation holds NOW. A mismatch raises
+    :class:`ReplayBindingChanged`, which the dispatcher turns into the same drop
+    notice the admission-time lookup uses. Synchronous on purpose: it runs inside
+    the driver's closing gate, which must not yield.
+    """
+    if expected is not None and current != expected:
+        raise ReplayBindingChanged
+
+
 @dataclass(frozen=True)
 class SessionChoice:
     """One offered session: its canonical key and the label the user sees."""
@@ -194,6 +219,7 @@ async def refused_resume_is_restricted(
     *,
     resolve: Callable[[], Awaitable[RoutingDecision]],
     is_restricted: Callable[[str], Awaitable[bool]],
+    resumed_session_key: str | None = None,
 ) -> bool:
     """Resolve every possible resume target before persisting a refused message.
 
@@ -202,6 +228,11 @@ async def refused_resume_is_restricted(
     update-pause spool cannot persist content belonging to a temporary or
     incognito conversation. Any resolution failure denies persistence: losing
     one restart notice is reversible, while writing restricted content is not.
+
+    ``resumed_session_key`` is the session a queued entry was accepted for. A
+    drain replays with commands off, and a commands-off turn does not route, so
+    ``resolve`` answers nothing for it: the entry's own key is then the only
+    word that its target is restricted, and it is checked like the rest.
     """
     try:
         decision = await resolve()
@@ -209,6 +240,7 @@ async def refused_resume_is_restricted(
             return True
         candidates = (
             native_session_key,
+            resumed_session_key,
             decision.resumed_key,
             decision.adopt_key,
             decision.described.key if decision.described is not None else None,

@@ -674,7 +674,7 @@ Gateway shutdown runs channel teardown and `SessionManager.close_all()` concurre
 
 **Adoption is opt-in per channel** via `ChannelTurn.inbound_route: InboundRoute`. Every adopted pre-turn dispatcher claims callback admission before card/command interception and reuses that refusal route. WhatsApp's native event callback and Weixin's per-message long-poll segment additionally register their upstream receive task in the live client `_handler_tasks` set before transport authorization, media, context-token, or governance awaits; the gateway census and final restart drain traverse those sets. Handler-task channels use `admit_inbound_callback`, keeping an open callback counted until its owning task finishes. Inline-loop channels use `hold_inbound_callback`, keeping only the current dispatch counted rather than pinning the long-lived poll task busy forever. In either shape, a callback arriving after update admission closes is spooled before any pre-turn side effect. The route is declared at the channel's dispatch site, where it still holds its normalized envelope, because `ChannelTurn.conversation_id` is a session ATTRIBUTION id (`"weixin:{user}"`), not a reply target. `InboundRoute.text` is the message the USER sent, never `ChannelTurn.user_text` — WhatsApp's rules mode prepends the group's private operating rules to the model prompt, and the restart notice quotes the entry verbatim. A channel that transforms its prompt MUST set it, and there is no fallback to the turn's prompt (an earlier fallback is how a media-only rules-mode message came to spool the group's rules). Weixin captures `text` and the attachment count BEFORE ingestion, because ingestion rewrites the text with turn-owned temp paths and clears `inbound.attachments`; WhatsApp does the same in `receive` via the `pending_original` side table (keyed like `pending_verdicts`), and its dispatcher declares NO route when the entry is absent rather than falling back to the ingested `inbound.text`. **A route is declared only where `may_send_to` can express revocation for it**: Discord's answers from `_allowed_threads`; WhatsApp's answers from `dm_policy` alone and knows nothing of the group roster, so WhatsApp spools DMs only and a refused group message degrades exactly as before this seam.
 
-**The store.** One JSONL file, `<data_home>/inbound-spool/refused.jsonl`. A COUNT cap (`SPOOL_MAX_ENTRIES`, newest wins) and an AGE horizon (`SPOOL_MAX_AGE_SECS`) in one primitive — nothing else in the tree combined the two; both are applied on write and again on read. Per-entry text cap with visible truncation. Dedupe on the platform `message_id` ONLY: a body digest would collapse two identical messages on a channel with no id, which is data loss (repeating yourself is ordinary), so an identity-less entry is appended, never matched. The refusal write runs off-loop in `asyncio.to_thread` (it takes a file lock and does disk I/O, and a replay worker may hold the lock) and is wrapped in `asyncio.shield`: the handler that reached the refusal is a task `close_all` is about to cancel, and a bare `await` there would be a cancellation point that orphans the write. With the shield the caller is cancelled and the write is not. Shielded writers stay in a process registry counted by the updater census and drained before re-exec. After that drain the updater commits a yield-free restart fence: later refused callbacks write the same bounded record synchronously, so no new asynchronous writer can open between the final snapshot and `exec`. Slack Socket Mode reserves at the envelope boundary before ACK; a paused envelope is left unacknowledged for Slack to retry on the replacement gateway. An executor already shut down (`RuntimeError`) falls back to the same inline write. The whole read-modify-write is serialized by `platform_compat.file_lock` on a dedicated lock file (the spool itself is replaced by rename, so a lock on the old inode would not exclude a writer that opened the new one). **Not for a restricted session**: Slack uses `_is_slack_restricted(session_key)`. Telegram, Discord, and Teams pass a lazy restriction resolver to `admit_inbound_callback`: it runs only after reservation refusal, resolves the channel's full resume decision, and checks the native, resumed, expected, observed, and adopted session keys with the same predicate that gates durable-history writes. The upstream client handler task remains in `_handler_tasks` throughout those routing awaits, so restart cannot overtake the decision. Teams also carries the final answer as `ChannelTurn.inbound_restricted`, covering a shutdown-gate refusal after callback admission succeeded. An incognito or temporary conversation therefore skips both spool sites and persists nothing; the message degrades to the pre-feature loss. A read failure raises `SpoolUnreadable` rather than reading as empty, because every writer rewrites from what it read and the reader unlinks an empty file. Never raises to the caller: a write failure at shutdown degrades to the pre-feature loss; a read failure at boot leaves the file for the next start.
+**The store.** One JSONL file, `<data_home>/inbound-spool/refused.jsonl`. A COUNT cap (`SPOOL_MAX_ENTRIES`, newest wins) and an AGE horizon (`SPOOL_MAX_AGE_SECS`) in one primitive — nothing else in the tree combined the two; both are applied on write and again on read. Per-entry text cap with visible truncation. Dedupe on the platform `message_id` ONLY: a body digest would collapse two identical messages on a channel with no id, which is data loss (repeating yourself is ordinary), so an identity-less entry is appended, never matched. The refusal write runs off-loop in `asyncio.to_thread` (it takes a file lock and does disk I/O, and a replay worker may hold the lock) and is wrapped in `asyncio.shield`: the handler that reached the refusal is a task `close_all` is about to cancel, and a bare `await` there would be a cancellation point that orphans the write. With the shield the caller is cancelled and the write is not. Shielded writers stay in a process registry counted by the updater census and drained before re-exec. After that drain the updater commits a yield-free restart fence: later refused callbacks write the same bounded record synchronously, so no new asynchronous writer can open between the final snapshot and `exec`. Slack Socket Mode reserves at the envelope boundary before ACK; a paused envelope is left unacknowledged for Slack to retry on the replacement gateway. An executor already shut down (`RuntimeError`) falls back to the same inline write. The whole read-modify-write is serialized by `platform_compat.file_lock` on a dedicated lock file (the spool itself is replaced by rename, so a lock on the old inode would not exclude a writer that opened the new one). **Not for a restricted session**: Slack uses `_is_slack_restricted(session_key)`. Telegram, Discord, and Teams pass a lazy restriction resolver to `admit_inbound_callback`: it runs only after reservation refusal, resolves the channel's full resume decision, and checks the native, resumed, expected, observed, and adopted session keys with the same predicate that gates durable-history writes -- plus the `resumed_session_key` a queue replay carries, because a replay runs with commands off, a commands-off turn does not route, and that key is then the only word that its target is restricted. The upstream client handler task remains in `_handler_tasks` throughout those routing awaits, so restart cannot overtake the decision. Teams also carries the final answer as `ChannelTurn.inbound_restricted`, covering a shutdown-gate refusal after callback admission succeeded. An incognito or temporary conversation therefore skips both spool sites and persists nothing; the message degrades to the pre-feature loss. A read failure raises `SpoolUnreadable` rather than reading as empty, because every writer rewrites from what it read and the reader unlinks an empty file. Never raises to the caller: a write failure at shutdown degrades to the pre-feature loss; a read failure at boot leaves the file for the next start.
 
 **The notice pass is AT-LEAST-ONCE, one entry at a time.** `replay_spooled` runs as a detached boot task after the transports are up (`GatewayOrchestrator._replay_spooled_inbound`; `_shutdown` cancels it with a one-second budget). For each entry, oldest first: `peek_next` returns it WITHOUT removing it; the `channels` governance ceiling is asked through `vet_and_audit("channels", channel_type, tool_name="inbound_spool.notice", fail_closed=True)`, the same audited seam every other proactive-send site uses, and a denied channel is HELD (not dropped: the route is not revoked, the channel is governed off, and the horizon bounds it); `may_send_to(conversation_id, thread_id, principal=)` is re-decided (a spooled entry is not a standing grant; a transport with no gate, or one that raises, is read as revoked). **The principal is normally passed for a DM route only.** Slack is the sole sender-owned threaded route: it has no separate thread roster, so its pass-local replay adapter resolves the channel's home workspace, receives the stored owner id, rechecks the current owner roster, and still posts in the original Slack thread. Discord threads and Telegram Topics remain authorized by their thread route alone: Discord's `may_send_to` falls from a thread not in `_allowed_threads` to `principal in _allowed` on the assumption that a thread route names no principal, and a spooled thread entry does name one (the sender), so passing it there would let a still-allowed sender authorize a notice into a thread revoked while the gateway was down; a revoked route is DROPPED and removed with no notice; otherwise `send_message` posts `RESTART_NOTICE` quoting the entry (through `display_safe_for`, so a quoted broadcast mention cannot fire; sized to `capabilities.max_message_chars` with a VISIBLE truncation mark, because the prefix can push a message that fit on the way in over the cap and a transport that slices and still returns an id would otherwise confirm a silently cut notice) and names any dropped attachments; `remove_entry` runs only AFTER the send is confirmed. Confirmation is `messaging.transport.delivery_confirmed` (the shared predicate: a non-empty message id, or any return at all on a transport whose `capabilities.returns_message_id` is `False`, i.e. WeCom and Feishu, which return `""` on success and raise on failure). An UNCONFIRMED send (a raise, an empty id) leaves the entry on disk for the next start and the loop moves on, so one dead route cannot park the queue. **Once per entry per pass**: an entry the pass attempted and left on disk (unconfirmed, or noticed but `remove_entry` returned `False`) is never handed back to that pass, so an unwritable spool costs one notice per entry rather than `SPOOL_MAX_ENTRIES` per entry; an entry that was removed is not remembered, so an identical id-less twin sharing its `trace_id` is still noticed in the same pass. An entry whose channel is not connected THIS run is never touched (a startup blip is not the operator disabling the channel); the age horizon still bounds it. This direction is safe precisely because the only action is a notice: a crash between the send and the removal costs one repeated line, never a repeated side effect, which is the opposite of the tradeoff a re-dispatch would have to make. Removal is by ONE occurrence of the entry's `trace_id` and is always the atomic replace (never a bare unlink, which fails routinely on Windows under an AV handle and would re-notice the entry on every start).
 
@@ -1190,8 +1190,9 @@ opening the dashboard:
 - A message queued while a native Telegram turn is busy keeps native affinity when
   it drains (`interpret_commands=False` skips resume resolution). A `/session` bind
   created after enqueue therefore cannot redirect already-queued text into the
-  selected dashboard conversation. Busy resumed sessions refuse a second message
-  instead of queuing it, so the exception cannot strand resumed work.
+  selected dashboard conversation. A message queued while a RESUMED session is
+  busy records that session on its entry and drains back into it -- see
+  [A busy resumed session](#a-busy-resumed-session); it is never refused.
 - Every `/model` picker records its exact target session and re-resolves the current
   binding on press. `/new`, `/unlink`, an agent switch, or any rebind invalidates the
   old picker before `session/set_model`; only a native picker stores the route-level
@@ -1605,6 +1606,176 @@ The combined turn itself runs outside `ReceiptQueue.lock`, and the drain replays
 `handle_message(..., interpret_commands=False)`. Drained payloads therefore
 bypass both the command intercept and override parsing, so a queued `/new`
 reaches the model as literal text instead of executing on drain.
+
+### A busy resumed session
+
+A conversation bound to a dashboard session through the channel's session-switch
+command (`/session` on Telegram, `!sessions` on Discord, `/sessions` on Teams)
+runs its turns under that `dashboard:` key -- and so do the dashboard's own: the
+composer, a `session_send` from a peer, a cron injection. A message arriving while
+that session is mid-turn is **queued or steered into it, never refused**, and WHO
+holds the turn decides where it waits:
+
+- **This channel holds it** (the user asked here and follows up here, which is the
+  common case): the channel's own machinery applies unchanged -- `_session/steer`
+  into the live provider under the resumed key, or the channel queue with its
+  collapsing receipt. The queue entry additionally records the resumed session it
+  was accepted for (`queue_drain.QUEUED_RESUMED_KEY`, written by
+  `tag_resumed_entry`, read by `entry_resumed_key`), and the drain at the tail of
+  that turn passes it back as `handle_message(..., resumed_session_key=...)`. That
+  parameter exists because a drain replays with commands off, which also skips
+  resume routing (a NATIVE entry must keep native affinity even when a binding
+  appeared after it queued), so without it a replay could only re-derive the native
+  key and would answer a message accepted for the dashboard session in the wrong
+  conversation. The replay confirms, by a read-only `resumed_session` lookup and
+  never a routing decision, that the chat still resumes that key; an entry whose
+  binding was released or moved while it waited (`/unlink`, `/new`, a rebind) is
+  **dropped with a notice** -- answering it into a session the user left, or running
+  it natively in a session that never accepted it, are both worse -- the same shape
+  the dashboard drain gives a queued prompt whose admission lapsed. The lookup runs
+  twice: at admission, and again in the driver's closing gate -- the yield-free step
+  right before the prompt opens (`session_resume.check_replay_binding`, raising
+  `ReplayBindingChanged`; the shared pipeline takes it as
+  `ChannelTurn.binding_still_holds`) -- because every await between the two
+  (callback admission, session acquisition, attachment I/O, the context build) is a
+  window in which an unlink or a rebind can land, and a replay that passed the first
+  lookup would otherwise run and persist in the session the conversation has left.
+  A gate-time mismatch drops the entry with the same notice: nothing runs, nothing
+  is persisted, the lease is released.
+- **The dashboard holds it**: the channel queue is the wrong place to wait, because
+  it is drained only from the tail of a channel-driven turn and the dashboard turn
+  loop knows nothing of it -- an entry left there would run out of order after some
+  later channel turn, or never. So the message is handed to the slot's OWN queue,
+  the one the running turn's teardown already drains
+  (`dashboard/channel_busy.py::hand_to_dashboard_turn` ->
+  `chat_delivery.queue_for_next_turn`), stamped `directive_user_origin` (an
+  allow-listed human typed it into the bound conversation) and
+  `directive_channel_origin` (that conversation is a channel, so a directive derived
+  from it keeps channel authority) with the admission containment recorded --
+  `linked` is already held, so the drain's re-validation drops it only for a
+  constraint that appears afterwards. It runs as the next dashboard turn in arrival
+  order behind whatever the composer queued, and its reply reaches the channel
+  through the session's outbound mirror like every dashboard turn on a linked
+  session. The channel answers with a one-shot receipt rather than the collapsing
+  one, whose flip belongs to the channel's own drain. This is the queue arm ONLY:
+  the dashboard's steer path keeps its requeue provenance in per-message maps that
+  know the composer and a peer but not a channel, so a channel steer the turn never
+  consumed would be requeued as dashboard-authored text and run with the wider
+  authority. A message carrying attachments is refused with a resend prompt in this
+  case rather than queued without its files: a channel attachment is downloaded by
+  the channel turn that runs it, and the dashboard queue has no reader for one.
+  The precedent for the whole arm is Slack's linked-thread intercept
+  (`slack/handler.py`), which hands a linked thread's message to the slot queue
+  through the same producer, with both provenance flags and the thread stamped as
+  the entry's origin the same way -- so the drain contract below covers a Slack
+  thread too.
+
+The discriminator is `slot.running or slot._in_stage_execution` on the live slot
+(`channel_busy.dashboard_turn_in_progress`), the predicate the peer send path
+reads: a channel-driven turn holds the `SessionManager` lease and projects its
+result into the slot afterwards, so for it the slot reads idle. Discord, Telegram
+and Teams -- the channels that resume dashboard sessions -- all take both arms;
+the remaining channels have no resumed sessions, so the question does not arise.
+
+For a resumed session the busy test is that predicate **as well as**
+`sessions.is_busy`, not the lease alone: a dashboard plan releases the lease
+between its stages while the plan is still live, and a message arriving in that
+gap would start a turn beside the plan instead of waiting behind it. Either holder
+saying busy is busy; only the lease decides which arm runs, because a steer needs a
+live provider turn.
+
+Four further properties the arm has to hold, each pinned by a test:
+
+- **The handed-off text is prose on the dashboard.** The entry runs through the
+  dashboard turn loop, which reads a leading `/token` as a command, so a channel
+  message could otherwise run `/workflow`, `/goal` or a harness command on the
+  dashboard owner's authority -- authority that channel never offered its user, and
+  that natively the same text never gets (the channel forwards it to the model as
+  text). `chat_utils.dashboard_command_word` returns `""` for a
+  `directive_channel_origin` turn, so such a turn has no command word at all.
+  Prose is the right reading; silence is not. A leading token the dashboard WOULD
+  have run from its own composer (`chat_utils.suppressed_channel_command`: a
+  member of its command set, any slash under `claude_code`, a quick-prompt macro)
+  is refused with `CHANNEL_COMMAND_UNAVAILABLE` rather than streamed to the model
+  as text -- the person who typed `/compact` into a linked thread would otherwise
+  wait for a compaction that never comes -- and the notice is posted to the
+  conversation that typed it through the same legs a turn's reply takes, through
+  the reply's own fenced publication site (`chat_runner._publish_cross_surface_reply`,
+  the turn runner's one caller of the channel-neutral transport leg), so a steer-audience fence
+  that withholds the reply withholds this notice too. The token
+  is named through the same two redactors the intercept runs on the user's message
+  and cut to `CHANNEL_COMMAND_TOKEN_MAX` (`chat_utils.displayable_channel_command`):
+  under `claude_code` it is the user's own text, and the notice, the audit row and
+  the Slack post must not hand it back around that redaction. A leading
+  token no surface reads as a command stays prose -- and so does a path-shaped one
+  on every provider (`chat_utils._path_shaped`: a second `/` or a `.` past the first
+  character), because `claude_code` forwards ANY leading slash from the composer and
+  would otherwise refuse a channel message that merely opens with
+  `/usr/bin/python3`.
+- **An entry does not outlive its binding.** The binding IS the entry's reply route
+  (a resume is an inbound-capable mirror link), so `channel_busy`'s stamp records
+  the conversation on the entry (`CHANNEL_ORIGIN_META_KEY`) and the drain's
+  re-validation drops the entry when that mirror is gone at delivery
+  (`channel_binding_released`, reported as the `unlinked` constraint). A mirror
+  moved to a different conversation is the existing `mirror_retarget` constraint.
+  Entries without the stamp -- composer text, peer sends, automation -- are
+  unaffected: for them a mirror disappearing costs no reply route. The stamp is
+  not carried across a restart: it names a write target, and the persisted queue
+  line is an editable file, so `sanitize_restored_queue` strips it with the
+  sender stamp. A hand-off that outlives a restart therefore drains as an
+  unstamped entry -- neither released by a lost binding nor reported to the
+  conversation -- rather than sending a notice wherever an edited line points. It
+  still drains as CHANNEL TEXT: the producer persists `chat_delivery.CHANNEL_TEXT_META_KEY`
+  in the entry's `meta`, the one provenance the restore keeps because it can only
+  take authority away, and the drain folds it into `directive_channel_origin`, so a
+  queued `/workflow` from a linked conversation does not regain the composer's
+  command word after a restart.
+- **The drop reaches the person who sent it.** The dashboard's own drop notice lands
+  on the slot transcript, which the channel user is not reading, and its sender
+  notice keys on a sender SLOT, which a channel has none of. So the conversation is
+  told through its own transport (`notify_channel_origin_dropped`, addressed from
+  the entry's stamp because the live link is exactly what may be gone), through the
+  same governed cross-surface ladder every proactive leg walks -- channel-scope
+  governance and the recipient allow-list are re-checked at send time. The ladder is
+  asked with the platform user the dispatcher admitted the message from, which the
+  stamp carries beside the address (`CHANNEL_ORIGIN_PRINCIPAL_KEY`): a `dashboard:`
+  session key names nobody, and a DM is judged against a roster of users, so
+  without it every DM notice would be refused. A Slack
+  thread is the one address that ladder answers `None` for by design (Slack's
+  dedicated client is not a registered transport), so it is posted through that
+  client at the stamped thread instead. Best-effort,
+  like every other drop notice: withholding the message is the authorization
+  decision and never waits on the report, and the notice task is held on the
+  state's background set until it finishes so it cannot be collected mid-send. The
+  receipt therefore promises a wait and a condition, not delivery.
+- **A privacy modifier is never silently swallowed.** Telegram refuses
+  `/temporary <msg>` and `/incognito <msg>` outright while a session is resumed (a
+  dashboard slot owns its `memory_mode`), so only a drained entry can still carry
+  one into the hand-off. It is not applied -- that would announce privacy the
+  persistent slot does not honour -- and the unapplied modifier is named beside the
+  queue receipt.
+
+### Channel commands outrank the busy path
+
+The command intercept runs BEFORE the busy check on every channel, so a command
+typed while the bound session -- native OR resumed, in steer OR queue mode -- is
+mid-turn is executed by the gateway and is never queued or steered into the turn
+as text. The session-switch command is the case that matters most: a user who asked
+`who pinged me on slack today`, sees the agent busy checking, and types
+`/session <other> issue` gets the picker for the query `<other> issue` (the
+command's own grammar) and the conversation moves; nothing lands in the busy turn.
+`/new`, `/stop`, `/unlink`, `/help` and the rest behave the same. `pre_turn.py`
+states the ordering for the channels that route through `resolve_pre_turn`;
+Discord, Telegram and Teams own their ladders and keep the same order. Pinned per
+channel in `test_telegram_sessions.py`, `test_discord.py`, `test_teams_midturn.py`,
+`test_webex_dispatch.py`, `test_wecom_dispatch.py`, `test_weixin_dispatch.py`,
+`test_imessage_dispatch.py`, `test_whatsapp_dispatch.py` and
+`test_feishu_dispatch.py`.
+
+What still decides steer-vs-queue for a channel message is the static
+`messaging.queue_mode` plus the per-message overrides below. The dashboard's
+`message.steer` decision point is not yet wired for channels; what that would take
+is recorded in [decisions](decisions.md#10-mid-turn-handling-messagesteer).
 
 ### Per-message overrides
 
