@@ -15094,7 +15094,16 @@
         "file_delivery_destination_help": "Eso significa que el archivo llega a la carpeta de bandeja de salida de este equipo y aparece en la vista Archivos de tu panel — en ningún lugar donde un tercero pueda verlo. Nunca se envía a Slack ni a un canal de chat.",
         "file_delivery_armed_help": "Un paso más, en esta máquina: ejecuta este comando en una terminal del equipo que ejecuta {{productName}} para terminar de permitir la entrega. Esto confirma que hay una persona en la máquina — una sesión de navegador por sí sola no puede permitirlo.",
         "file_delivery_armed_expires": "Esta solicitud caduca en unos {{duration}}.",
-        "file_delivery_arm_status_failed": "No se pudo comprobar si hay una aprobación en curso."
+        "file_delivery_arm_status_failed": "No se pudo comprobar si hay una aprobación en curso.",
+        "credential_redaction_section": "Ocultación de credenciales",
+        "credential_redaction_title": "Ocultar credenciales en la salida del agente",
+        "credential_redaction_desc": "{{productName}} elimina todo lo que parezca una credencial (claves de acceso, tokens, claves privadas, valores de enlace ?token=) de la salida del agente antes de que la veas. Desactívalo cuando esté ocultando un valor tuyo que necesitas volver a leer: pide al agente que escriba el valor en un archivo y abre ese archivo en la vista Archivos del panel, donde tú, con la sesión del propietario, lo ves tal como se escribió. En el resto de lugares (el chat, Slack y los canales de chat, los archivos que salen del equipo) sigue ocultándose, y los enlaces que parecen sacar datos y todas las reglas de bloqueo de comandos siguen aplicándose en ambos casos.",
+        "credential_redaction_toggle": "Ocultar credenciales",
+        "credential_redaction_toggle_help": "Activado por defecto. Desactivado, los archivos se muestran tal como se escribieron solo en la vista Archivos de tu propio panel; el chat, Slack y los canales de chat siguen ocultos.",
+        "credential_redaction_off_notice": "La ocultación de credenciales está desactivada. Los secretos de los archivos que escriba el agente aparecerán literalmente en la vista Archivos de tu panel.",
+        "credential_redaction_off_since": "Desactivado desde {{time}}.",
+        "credential_redaction_read_failed": "No se pudo leer el ajuste de ocultación. No se muestra nada porque la lectura falló, no porque la ocultación esté desactivada.",
+        "credential_redaction_write_failed": "No se pudo guardar el cambio. El interruptor muestra la posición que sigue en vigor."
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Asignar el cambio de pestaña de chat a Ctrl+dígito en lugar de Option+dígito",

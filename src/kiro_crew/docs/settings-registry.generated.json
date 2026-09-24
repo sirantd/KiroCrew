@@ -1266,6 +1266,13 @@
       "route": "/settings/security/posture?highlight=security.live-security-posture"
     },
     {
+      "id": "security.redact-credentials",
+      "label": "Redact credentials",
+      "tab": "security",
+      "route": "/settings/security?highlight=security.redact-credentials",
+      "description": "On by default. Off shows files as written in your own dashboard Files view only; the chat, Slack and chat channels stay redacted."
+    },
+    {
       "id": "security.trust-every-third-party-app",
       "label": "Trust every third-party app",
       "tab": "security",

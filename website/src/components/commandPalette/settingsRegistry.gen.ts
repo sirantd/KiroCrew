@@ -1895,6 +1895,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Live Security Posture"
   },
   {
+    "id": "security.redact-credentials",
+    "label": "Redact credentials",
+    "labelKey": "pages.settings.securityPanel.credential_redaction_toggle",
+    "description": "On by default. Off shows files as written in your own dashboard Files view only; the chat, Slack and chat channels stay redacted.",
+    "tab": "security",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "security.trust-every-third-party-app",
     "labelKey": "pages.settings.securityPanel.trustedApps.allow_all_label",
     "tab": "security",

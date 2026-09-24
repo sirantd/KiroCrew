@@ -15094,7 +15094,16 @@
         "file_delivery_destination_help": "Significa che il file finisce nella cartella posta in uscita di questo computer e compare nella vista File della tua dashboard — in nessun luogo visibile a terzi. Non viene mai inviato a Slack o a un canale di chat.",
         "file_delivery_armed_help": "Ancora un passaggio, su questa macchina: esegui questo comando in un terminale sul computer che esegue {{productName}} per completare l'autorizzazione alla consegna. Questo conferma che una persona è alla macchina — una sola sessione del browser non può autorizzarla.",
         "file_delivery_armed_expires": "Questa richiesta scade tra circa {{duration}}.",
-        "file_delivery_arm_status_failed": "Impossibile verificare se un'approvazione è in corso."
+        "file_delivery_arm_status_failed": "Impossibile verificare se un'approvazione è in corso.",
+        "credential_redaction_section": "Oscuramento delle credenziali",
+        "credential_redaction_title": "Oscura le credenziali nell'output dell'agente",
+        "credential_redaction_desc": "{{productName}} rimuove tutto ciò che somiglia a una credenziale (chiavi di accesso, token, chiavi private, valori di link ?token=) dall'output dell'agente prima che tu lo veda. Disattivalo quando nasconde un valore tuo che devi rileggere: chiedi all'agente di scrivere il valore in un file e apri quel file nella vista File della dashboard, dove tu, connesso come proprietario, lo vedi com'è stato scritto. Ovunque altrove (la chat, Slack e i canali di chat, i file che lasciano la macchina) l'oscuramento resta attivo, e i link che sembrano portare dati all'esterno e tutte le regole di blocco dei comandi restano applicati in entrambi i casi.",
+        "credential_redaction_toggle": "Oscura le credenziali",
+        "credential_redaction_toggle_help": "Attivo per impostazione predefinita. Disattivato, i file vengono mostrati com'è stati scritti solo nella vista File della tua dashboard; la chat, Slack e i canali di chat restano oscurati.",
+        "credential_redaction_off_notice": "L'oscuramento delle credenziali è disattivato. I segreti nei file scritti dall'agente compariranno testualmente nella vista File della tua dashboard.",
+        "credential_redaction_off_since": "Disattivato dal {{time}}.",
+        "credential_redaction_read_failed": "Impossibile leggere l'impostazione di oscuramento. Qui non viene mostrato nulla perché la lettura è fallita, non perché l'oscuramento sia disattivato.",
+        "credential_redaction_write_failed": "Impossibile salvare la modifica. L'interruttore mostra la posizione ancora in vigore."
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Associa il cambio di scheda chat a Ctrl+cifra invece di Option+cifra",

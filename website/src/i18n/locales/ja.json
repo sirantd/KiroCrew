@@ -14682,7 +14682,16 @@
         "file_delivery_destination_help": "つまりファイルはこのコンピューターの送信ボックスフォルダーに置かれ、ダッシュボードのファイルビューに表示されます。第三者が見られる場所には届きません。Slack やチャットチャンネルに送信されることは決してありません。",
         "file_delivery_armed_help": "このマシンでもう一手順: {{productName}} を実行しているコンピューターのターミナルでこのコマンドを実行して、配信の許可を完了してください。これは人がマシンの前にいることを確認するものです。ブラウザーのセッションだけでは許可できません。",
         "file_delivery_armed_expires": "このリクエストは約 {{duration}} で失効します。",
-        "file_delivery_arm_status_failed": "承認が進行中かどうかを確認できませんでした。"
+        "file_delivery_arm_status_failed": "承認が進行中かどうかを確認できませんでした。",
+        "credential_redaction_section": "認証情報のマスキング",
+        "credential_redaction_title": "エージェント出力内の認証情報をマスクする",
+        "credential_redaction_desc": "{{productName}} は、エージェントの出力があなたに届く前に、認証情報に見えるもの（アクセスキー、トークン、秘密鍵、?token= リンクの値）を取り除きます。読み返す必要がある自分の値が隠されてしまう場合はオフにしてください。エージェントにその値をファイルへ書き出させ、そのファイルをダッシュボードのファイルビューで開くと、オーナーとしてサインインしたあなたには書かれたままの内容が表示されます。それ以外の場所（チャット、Slack やチャットチャンネル、マシンの外へ出るファイル）ではマスクが続き、データを外部に持ち出すように見えるリンクとすべてのコマンドブロックルールは、どちらの設定でも引き続き適用されます。",
+        "credential_redaction_toggle": "認証情報をマスクする",
+        "credential_redaction_toggle_help": "デフォルトはオン。オフにすると、自分のダッシュボードのファイルビューに限り、ファイルが書かれたままの形で表示されます。チャット、Slack、チャットチャンネルはマスクされたままです。",
+        "credential_redaction_off_notice": "認証情報のマスキングはオフです。エージェントが書き出したファイル内のシークレットは、ダッシュボードのファイルビューにそのまま表示されます。",
+        "credential_redaction_off_since": "{{time}} からオフ。",
+        "credential_redaction_read_failed": "マスキング設定を読み取れませんでした。ここに何も表示されていないのは読み取りに失敗したためで、マスキングがオフだからではありません。",
+        "credential_redaction_write_failed": "変更を保存できませんでした。スイッチは現在も有効な状態を示しています。"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "チャットタブの切り替えを Option+digit ではなく Ctrl+digit にバインドします",

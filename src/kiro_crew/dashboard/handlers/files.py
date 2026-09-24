@@ -90,7 +90,7 @@ from kiro_crew.pdf_extract import PdfExtraction, extract_pdf_segments
 from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import wide_content_is_flagged
-from kiro_crew.platform.context import redact_log_via_context
+from kiro_crew.platform.context import redact_log_via_context, redact_owner_view_via_context
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     popen_limited,
@@ -2817,8 +2817,14 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
 
 async def api_file_watch(request: web.Request) -> web.StreamResponse:
     """GET /api/file-watch?path=... — SSE stream of file content changes."""
+    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+        owner_view_for_request,
+    )
 
     raw_path = request.query.get("path", "")
+    # Resolved once, from the request, for the whole stream: the owner's
+    # credential-redaction switch applies to these reads only for the owner.
+    owner_view = owner_view_for_request(request)
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
     except ValidationError:
@@ -2909,7 +2915,14 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
                     break
                 try:
                     content = await asyncio.to_thread(_read_file, current_resolved, read_cap)
-                    content = redact(content)
+                    # Same OWNER-VIEW seam as api_file_read: this is the file
+                    # viewer's live refresh of the same bytes, for the same
+                    # (per-request, owner-verified) requester.
+                    content = (
+                        redact_owner_view_via_context(content)
+                        if owner_view
+                        else redact(content)
+                    )
                 except Exception:
                     logger.warning("file-watch read error for %s", path, exc_info=True)
                     await asyncio.sleep(poll_interval)
@@ -3040,7 +3053,21 @@ async def api_file_read(request: web.Request) -> web.Response:
         content = outcome.content
         truncated = len(content) > read_cap
         content = content[:read_cap]
-        content = redact(content)
+        # OWNER-VIEW seam: when the requester IS the dashboard owner, the owner's
+        # credential-redaction switch applies to this read of their own disk
+        # (``security.redaction_switch``). A non-owner dashboard user (a Slack
+        # allow-listed ``!dashboard`` caller) gets the unconditional pass. Nothing
+        # else in this module opens the scope: the outbox flagged-file check and
+        # the upload gates keep the unconditional ``redact``.
+        from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+            owner_view_for_request,
+        )
+
+        content = (
+            redact_owner_view_via_context(content)
+            if owner_view_for_request(request)
+            else redact(content)
+        )
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_read", outcome="success", resources=path
         )

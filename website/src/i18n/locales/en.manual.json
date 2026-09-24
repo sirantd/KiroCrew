@@ -6530,7 +6530,16 @@
         "file_delivery_never_grantable": "Uploads to Slack or a chat channel can never be allowed here, and are not offered: an allowance can never cover a destination a third party can see.",
         "file_delivery_load_failed": "Could not read which destinations are allowed.",
         "file_delivery_arm_status_failed": "Could not check whether an approval is in progress.",
-        "file_delivery_save_failed": "Could not save that change."
+        "file_delivery_save_failed": "Could not save that change.",
+        "credential_redaction_section": "Credential redaction",
+        "credential_redaction_title": "Redact credentials in agent output",
+        "credential_redaction_desc": "{{productName}} scrubs anything that looks like a credential — access keys, tokens, private keys, ?token= link values — from agent output before you see it. Turn it off when it is hiding a value of your own that you need to read back: ask the agent to write the value to a file, then open that file in the dashboard Files view, where you, signed in as the owner, see it as written. Everywhere else — the chat, Slack and chat channels, files leaving the machine — stays scrubbed, and links that look like they carry data out and every command-blocking rule stay enforced either way.",
+        "credential_redaction_toggle": "Redact credentials",
+        "credential_redaction_toggle_help": "On by default. Off shows files as written in your own dashboard Files view only; the chat, Slack and chat channels stay redacted.",
+        "credential_redaction_off_notice": "Credential redaction is off. Secrets in files the agent writes will appear verbatim in your dashboard Files view.",
+        "credential_redaction_off_since": "Off since {{time}}.",
+        "credential_redaction_read_failed": "Could not read the redaction setting. Nothing is shown here because the read failed, not because redaction is off.",
+        "credential_redaction_write_failed": "Could not save the change. The switch shows the position that is still in force."
       },
       "skillsPanel": {
         "failed_to_save_skills_setting": "Failed to save skills setting",

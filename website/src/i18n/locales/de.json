@@ -14888,7 +14888,16 @@
         "file_delivery_destination_help": "Das bedeutet, die Datei landet im Postausgang-Ordner dieses Rechners und erscheint in der Dateien-Ansicht Ihres Dashboards — nirgends, wo ein Dritter sie sehen kann. Sie wird nie an Slack oder einen Chat-Kanal gesendet.",
         "file_delivery_armed_help": "Noch ein Schritt, auf diesem Rechner: Führen Sie diesen Befehl in einem Terminal auf dem Computer aus, auf dem {{productName}} läuft, um die Zustellung endgültig zu erlauben. Das bestätigt, dass eine Person am Rechner ist — eine Browsersitzung allein kann es nicht erlauben.",
         "file_delivery_armed_expires": "Diese Anfrage läuft in etwa {{duration}} ab.",
-        "file_delivery_arm_status_failed": "Es konnte nicht geprüft werden, ob eine Genehmigung läuft."
+        "file_delivery_arm_status_failed": "Es konnte nicht geprüft werden, ob eine Genehmigung läuft.",
+        "credential_redaction_section": "Schwärzung von Zugangsdaten",
+        "credential_redaction_title": "Zugangsdaten in der Agentenausgabe schwärzen",
+        "credential_redaction_desc": "{{productName}} entfernt alles, was wie Zugangsdaten aussieht – Zugriffsschlüssel, Tokens, private Schlüssel, ?token=-Linkwerte – aus der Agentenausgabe, bevor du sie siehst. Schalte es aus, wenn es einen eigenen Wert verdeckt, den du zurücklesen musst: Lass den Agenten den Wert in eine Datei schreiben und öffne diese Datei in der Dateiansicht des Dashboards, wo du, als Eigentümer angemeldet, sie so siehst, wie sie geschrieben wurde. Überall sonst – im Chat, in Slack und Chat-Kanälen, in Dateien, die den Rechner verlassen – bleibt die Schwärzung aktiv, und Links, die aussehen, als würden sie Daten nach außen tragen, sowie alle Regeln zum Blockieren von Befehlen bleiben in jedem Fall wirksam.",
+        "credential_redaction_toggle": "Zugangsdaten schwärzen",
+        "credential_redaction_toggle_help": "Standardmäßig eingeschaltet. Ausgeschaltet erscheinen Dateien nur in der Dateiansicht deines eigenen Dashboards so, wie sie geschrieben wurden; Chat, Slack und Chat-Kanäle bleiben geschwärzt.",
+        "credential_redaction_off_notice": "Die Schwärzung von Zugangsdaten ist ausgeschaltet. Geheimnisse in Dateien, die der Agent schreibt, erscheinen wörtlich in der Dateiansicht deines Dashboards.",
+        "credential_redaction_off_since": "Aus seit {{time}}.",
+        "credential_redaction_read_failed": "Die Schwärzungseinstellung konnte nicht gelesen werden. Hier wird nichts angezeigt, weil das Lesen fehlgeschlagen ist, nicht weil die Schwärzung aus ist.",
+        "credential_redaction_write_failed": "Die Änderung konnte nicht gespeichert werden. Der Schalter zeigt die weiterhin gültige Stellung."
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Wechsel zwischen Chat-Tabs an Strg+Zahl statt Option+Zahl binden",

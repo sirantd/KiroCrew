@@ -978,6 +978,22 @@ def binary_content_is_flagged(raw: bytes) -> bool:
     return wide_content_is_flagged(raw)
 
 
+def redact_owner_view_via_context(text: str) -> str:
+    """:func:`redact_via_context` for a surface whose audience is the DASHBOARD OWNER.
+
+    Runs the same context-aware redaction -- a loaded companion's exfiltration
+    carve-outs and extra patterns apply -- inside a ``redaction_switch.owner_view``
+    scope, so the CORE credential pass stands down when the owner has switched
+    credential redaction OFF while everything else in the chain is unchanged.
+    Use it at an owner-view seam only (the dashboard file viewer); every other
+    egress keeps :func:`redact_via_context`, which never consults the switch.
+    """
+    from kiro_crew.security.redaction_switch import owner_view
+
+    with owner_view():
+        return redact_via_context(text)
+
+
 #: Substituted for a log line's text when redaction could not be composed. Names
 #: the cause, because on the host where this fires the operator's real problem is
 #: the failed companion composition, not the missing line.

@@ -9,7 +9,7 @@ import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
-import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type ArmedFileDeliveryConsent, type FileDeliveryConsentStatus, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
+import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type ArmedFileDeliveryConsent, type CredentialRedactionState, type FileDeliveryConsentStatus, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
 import { MobileLoginCard } from './MobileLoginCard'
 
@@ -854,6 +854,79 @@ function YoloDurationCard() {
       {save.isError && (
         <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.failed_to_save_yolo_duration')} askAgent />
       )}
+    </SettingsCard>
+  )
+}
+
+/* ── Credential redaction switch ─────────────────────────────────────────────
+ *
+ * A VIEW over the switch the `/api/security/credential-redaction` endpoints own.
+ * ON by default: every output surface runs the credential scrubber over what the
+ * agent produced. The owner turns it OFF when the scrubber is swallowing a value
+ * they legitimately need to read back (a one-time approval link's `?token=`, a
+ * blob they generated on purpose). Exfiltration-URL redaction and every
+ * request-blocking gate stay on regardless; the card says so, because a toggle
+ * labelled "redaction" that silently left half of it on would misdescribe what
+ * the owner just did.
+ *
+ * A FAILED READ renders NO switch. Rendering the default (ON) for a state we
+ * could not read would show a reassuring position that may be wrong, and the
+ * reassuring direction is the dangerous one.
+ */
+function CredentialRedactionCard() {
+  const qc = useQueryClient()
+  const { data, isLoading, isError } = useQuery<CredentialRedactionState>({
+    queryKey: ['credential-redaction'],
+    queryFn: api.credentialRedaction,
+  })
+  const set = useMutation({
+    mutationFn: (enabled: boolean) => api.setCredentialRedaction(enabled),
+    onSuccess: state => qc.setQueryData(['credential-redaction'], state),
+    // Re-read on EVERY settlement, failure included: a PUT whose write landed
+    // but whose response was lost would otherwise leave the card showing the
+    // position from before the click while the switch is already in force.
+    onSettled: () => void qc.invalidateQueries({ queryKey: ['credential-redaction'] }),
+  })
+  // Same rule as the consent card: react-query RETAINS the last good `data`
+  // across a rejected refetch, so `isError` -- not `data === undefined` -- is
+  // the whole test for "unreadable".
+  const view = isError ? undefined : data
+  const busy = isLoading || set.isPending
+
+  return (
+    <SettingsCard>
+      <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.credential_redaction_title')}</div>
+      <div className="text-[12px] text-muted mt-0.5 mb-2 leading-relaxed">{i18nT('pages.settings.securityPanel.credential_redaction_desc')}</div>
+      {view ? (
+        <div data-testid="credential-redaction-row" className="flex flex-col gap-1.5 border border-border rounded-md px-3 py-2">
+          <SettingsToggle
+            label={i18nT('pages.settings.securityPanel.credential_redaction_toggle')}
+            description={i18nT('pages.settings.securityPanel.credential_redaction_toggle_help')}
+            checked={view.enabled}
+            disabled={busy}
+            onChange={enabled => set.mutate(enabled)}
+          />
+          {!view.enabled && (
+            <div data-testid="credential-redaction-off-notice" className="flex items-start gap-2 text-[11px] text-warn leading-relaxed">
+              <AlertTriangle size={13} className="shrink-0 mt-px" />
+              <span>
+                {i18nT('pages.settings.securityPanel.credential_redaction_off_notice')}
+                {view.changed_at && (
+                  <> {i18nT('pages.settings.securityPanel.credential_redaction_off_since', { time: fmtDateTime(view.changed_at) })}</>
+                )}
+              </span>
+            </div>
+          )}
+          {/* A rejected PUT is an error the agent can usually fix (an owner-gate
+              refusal, a keystone write failure), so the hand-off is on; nothing
+              on this card is destroyed by navigating away. */}
+          {set.isError && (
+            <ErrorNotice variant="inline" className="mt-1" message={i18nT('pages.settings.securityPanel.credential_redaction_write_failed')} askAgent testId="credential-redaction-write-failed" />
+          )}
+        </div>
+      ) : isError ? (
+        <ErrorNotice variant="inline" message={i18nT('pages.settings.securityPanel.credential_redaction_read_failed')} askAgent testId="credential-redaction-read-failed" />
+      ) : null}
     </SettingsCard>
   )
 }
@@ -2687,7 +2760,7 @@ function DocsSection() {
  * The rail states which is which before any row is read, and the two large
  * tables (137 rules, ~20 governed scopes) get a pane instead of a fold.
  */
-type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'delivery' | 'layers' | 'governance' | 'docs'
+type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'redaction' | 'delivery' | 'layers' | 'governance' | 'docs'
 type SecuritySectionGroup = 'status' | 'yours' | 'enforced' | 'reference'
 
 interface SecuritySectionDef {
@@ -2713,6 +2786,7 @@ export const SECTION_LABEL_KEY: Record<SecuritySectionKey, string> = {
   rules: 'pages.settings.securityPanel.denied_commands',
   tailnet: 'pages.settings.securityPanel.tailnet_section',
   apps: 'pages.settings.securityPanel.third_party_apps_section',
+  redaction: 'pages.settings.securityPanel.credential_redaction_section',
   delivery: 'pages.settings.securityPanel.file_delivery_section',
   layers: 'pages.settings.securityPanel.defense_in_depth_architecture',
   governance: 'pages.settings.securityPanel.governance_policy',
@@ -2735,6 +2809,7 @@ const SECURITY_SECTIONS: readonly SecuritySectionDef[] = [
   { key: 'rules', icon: <Terminal size={15} />, group: 'yours' },
   { key: 'tailnet', icon: <Network size={15} />, group: 'yours' },
   { key: 'apps', icon: <Boxes size={15} />, group: 'yours' },
+  { key: 'redaction', icon: <EyeOff size={15} />, group: 'yours' },
   { key: 'delivery', icon: <FileWarning size={15} />, group: 'yours' },
   { key: 'layers', icon: <Layers size={15} />, group: 'enforced' },
   { key: 'governance', icon: <Gavel size={15} />, group: 'enforced' },
@@ -2921,6 +2996,11 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
             {key === 'apps' && (
               <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
                 <ThirdPartyAppsCard />
+              </SettingsSection>
+            )}
+            {key === 'redaction' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.credential_redaction_section')}>
+                <CredentialRedactionCard />
               </SettingsSection>
             )}
             {key === 'delivery' && (

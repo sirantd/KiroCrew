@@ -14682,7 +14682,16 @@
         "file_delivery_destination_help": "也就是说，文件会保存到本机发件箱文件夹，并显示在你仪表板的文件视图中——不会到达任何第三方可见的位置。它绝不会发送到 Slack 或聊天频道。",
         "file_delivery_armed_help": "在这台机器上还差一步：在运行 {{productName}} 的计算机的终端中运行此命令，以完成允许投递。这可确认有人在机器旁——仅凭浏览器会话无法允许。",
         "file_delivery_armed_expires": "此请求将在约 {{duration}} 后过期。",
-        "file_delivery_arm_status_failed": "无法确认是否有审批正在进行。"
+        "file_delivery_arm_status_failed": "无法确认是否有审批正在进行。",
+        "credential_redaction_section": "凭据脱敏",
+        "credential_redaction_title": "对智能体输出中的凭据脱敏",
+        "credential_redaction_desc": "{{productName}} 会在你看到智能体输出之前抹去任何形似凭据的内容：访问密钥、令牌、私钥、?token= 链接值。当它遮住了你确实需要读回的自有值时可以关闭：让智能体把该值写入文件，再在仪表板文件视图中打开，以所有者身份登录的你将看到原文。其他位置（聊天、Slack 和聊天频道、离开本机的文件）仍保持脱敏；形似向外传输数据的链接以及所有命令拦截规则也始终生效。",
+        "credential_redaction_toggle": "凭据脱敏",
+        "credential_redaction_toggle_help": "默认开启。关闭后，仅你自己的仪表板文件视图按原样显示文件；聊天、Slack 和聊天频道仍会脱敏。",
+        "credential_redaction_off_notice": "凭据脱敏已关闭。智能体写入文件中的密钥将原样出现在你的仪表板文件视图中。",
+        "credential_redaction_off_since": "自 {{time}} 起关闭。",
+        "credential_redaction_read_failed": "无法读取脱敏设置。此处未显示内容是因为读取失败，而不是脱敏已关闭。",
+        "credential_redaction_write_failed": "无法保存更改。开关显示的是仍在生效的状态。"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "将聊天标签切换绑定到 Ctrl+数字，而不是 Option+数字",

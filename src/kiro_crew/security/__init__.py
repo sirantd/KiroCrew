@@ -425,6 +425,7 @@ from .redaction import (
     redact_local_paths,
     redact_path_segments,
 )
+from .redaction_switch import credential_redaction_enabled, owner_view
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
     _ANSI_C_LITERAL_ESCAPES,
@@ -869,6 +870,20 @@ def redact_with_findings(text: str) -> tuple[str, list[str], list[str]]:
 def redact(text: str) -> str:
     """Apply all redaction passes (exfiltration URLs + credentials)."""
     return redact_with_findings(text)[0]
+
+
+def redact_owner_view(text: str) -> str:
+    """:func:`redact` for a surface whose audience is the DASHBOARD OWNER.
+
+    Same two passes in the same order, inside a ``redaction_switch.owner_view``
+    scope: the exfiltration-URL pass always runs, and the credential pass stands
+    down only when the owner has switched credential redaction OFF. Use it at an
+    owner-view seam ONLY, after the requester has been verified as the owner
+    (today: the dashboard file viewer); the chat, a channel egress, an admission
+    gate or a log keep calling :func:`redact`, which never consults the switch.
+    """
+    with owner_view():
+        return redact(text)
 
 
 # ── Streaming redaction (pentest issue 3) ──

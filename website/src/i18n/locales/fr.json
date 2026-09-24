@@ -15094,7 +15094,16 @@
         "file_delivery_destination_help": "Cela signifie que le fichier arrive dans le dossier boîte d'envoi de cet ordinateur et apparaît dans la vue Fichiers de votre tableau de bord — nulle part où un tiers peut le voir. Il n'est jamais envoyé vers Slack ni un canal de discussion.",
         "file_delivery_armed_help": "Une dernière étape, sur cette machine : exécutez cette commande dans un terminal sur l'ordinateur qui exécute {{productName}} pour terminer l'autorisation de livraison. Cela confirme qu'une personne est à la machine — une session de navigateur seule ne peut pas l'autoriser.",
         "file_delivery_armed_expires": "Cette demande expire dans environ {{duration}}.",
-        "file_delivery_arm_status_failed": "Impossible de vérifier si une approbation est en cours."
+        "file_delivery_arm_status_failed": "Impossible de vérifier si une approbation est en cours.",
+        "credential_redaction_section": "Masquage des identifiants",
+        "credential_redaction_title": "Masquer les identifiants dans la sortie de l'agent",
+        "credential_redaction_desc": "{{productName}} retire tout ce qui ressemble à un identifiant (clés d'accès, jetons, clés privées, valeurs du paramètre token= dans les liens) de la sortie de l'agent avant que tu la voies. Désactive-le lorsqu'il cache une valeur qui t'appartient et que tu dois relire : demande à l'agent d'écrire la valeur dans un fichier, puis ouvre ce fichier dans la vue Fichiers du tableau de bord, où toi, connecté en tant que propriétaire, le vois tel qu'il a été écrit. Partout ailleurs (le chat, Slack et les canaux de discussion, les fichiers qui quittent la machine) le masquage reste actif, et les liens qui semblent exfiltrer des données ainsi que toutes les règles de blocage de commandes restent appliqués dans les deux cas.",
+        "credential_redaction_toggle": "Masquer les identifiants",
+        "credential_redaction_toggle_help": "Activé par défaut. Désactivé, les fichiers s'affichent tels qu'ils ont été écrits uniquement dans la vue Fichiers de ton propre tableau de bord ; le chat, Slack et les canaux de discussion restent masqués.",
+        "credential_redaction_off_notice": "Le masquage des identifiants est désactivé. Les secrets des fichiers écrits par l'agent apparaîtront tels quels dans la vue Fichiers de ton tableau de bord.",
+        "credential_redaction_off_since": "Désactivé depuis {{time}}.",
+        "credential_redaction_read_failed": "Impossible de lire le réglage de masquage. Rien ne s'affiche ici parce que la lecture a échoué, pas parce que le masquage est désactivé.",
+        "credential_redaction_write_failed": "Impossible d'enregistrer la modification. L'interrupteur affiche la position toujours en vigueur."
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Associer le changement d'onglet de chat à Ctrl+chiffre au lieu de Option+chiffre",

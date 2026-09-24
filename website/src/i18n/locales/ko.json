@@ -14682,7 +14682,16 @@
         "file_delivery_destination_help": "즉 파일은 이 컴퓨터의 발신함 폴더에 저장되고 대시보드의 파일 보기에 표시됩니다. 제3자가 볼 수 있는 곳에는 전달되지 않습니다. Slack이나 채팅 채널로는 결코 전송되지 않습니다.",
         "file_delivery_armed_help": "이 컴퓨터에서 한 단계 더: {{productName}}을(를) 실행 중인 컴퓨터의 터미널에서 이 명령을 실행하여 전달 허용을 마치세요. 이는 사람이 컴퓨터 앞에 있음을 확인합니다. 브라우저 세션만으로는 허용할 수 없습니다.",
         "file_delivery_armed_expires": "이 요청은 약 {{duration}} 후에 만료됩니다.",
-        "file_delivery_arm_status_failed": "승인이 진행 중인지 확인할 수 없습니다."
+        "file_delivery_arm_status_failed": "승인이 진행 중인지 확인할 수 없습니다.",
+        "credential_redaction_section": "자격 증명 마스킹",
+        "credential_redaction_title": "에이전트 출력의 자격 증명 마스킹",
+        "credential_redaction_desc": "{{productName}}은(는) 에이전트 출력이 사용자에게 도달하기 전에 자격 증명처럼 보이는 모든 항목(액세스 키, 토큰, 개인 키, ?token= 링크 값)을 제거합니다. 다시 읽어야 하는 본인의 값이 가려질 때 끄세요. 에이전트에게 값을 파일에 쓰게 한 뒤 대시보드 파일 보기에서 그 파일을 열면, 소유자로 로그인한 본인에게는 쓰인 그대로 표시됩니다. 그 외 모든 곳(채팅, Slack과 채팅 채널, 머신 밖으로 나가는 파일)은 계속 마스킹되며, 데이터를 외부로 내보내는 것처럼 보이는 링크와 모든 명령 차단 규칙은 어느 경우에도 계속 적용됩니다.",
+        "credential_redaction_toggle": "자격 증명 마스킹",
+        "credential_redaction_toggle_help": "기본값은 켜짐입니다. 끄면 본인의 대시보드 파일 보기에서만 파일이 쓰인 그대로 표시되며, 채팅, Slack, 채팅 채널은 계속 마스킹됩니다.",
+        "credential_redaction_off_notice": "자격 증명 마스킹이 꺼져 있습니다. 에이전트가 쓴 파일의 비밀 정보가 대시보드 파일 보기에 그대로 나타납니다.",
+        "credential_redaction_off_since": "{{time}}부터 꺼짐.",
+        "credential_redaction_read_failed": "마스킹 설정을 읽을 수 없습니다. 읽기에 실패했기 때문에 여기에 아무것도 표시되지 않는 것이며, 마스킹이 꺼져 있어서가 아닙니다.",
+        "credential_redaction_write_failed": "변경 사항을 저장할 수 없습니다. 스위치는 여전히 적용 중인 상태를 표시합니다."
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "채팅 탭 전환을 Option+숫자 대신 Ctrl+숫자에 할당합니다",
