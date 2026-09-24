@@ -485,12 +485,28 @@ format change to land.
 ### Retention: whole units
 
 A unit's whole crew log is removed by `store.remove_unit(kind, id)`, and that is the ONE spelling of
-deletion in this module: the retention sweep and the two permanent-delete funnels -- a session's and a
-crew member's -- all call it,
+deletion in this module: the retention sweep and the two permanent-delete funnels that call it -- a
+session's, and the dashboard's crew-member route -- all reach the same spelling,
 because two callers deleting one tree two ways is two chances to get the order wrong and the order is
 the entire correctness argument. It is not rotation and not a format change, and NOTHING is written
 to a crew log that is about to go -- no tombstone, no `pruned` entry. A reader holding a citation into
 it already has its answer: `resolve` reports `gone` for a pointer into a unit with no crew log at all.
+
+**A caller whose unit has a companion file OUTSIDE it passes `in_hold`.** Some of a unit's meaning
+lives elsewhere -- a crew member's pre-log activity source is the case -- and a caller that removed
+such a file after `remove_unit` RETURNED would do it in the window between the lease's release and its
+own next line, where another process can create the unit afresh and fold that file back in. Since the
+lease is `sole` and cannot be shared, the caller cannot hold it itself, so the step is handed inward
+instead: it runs once the unit's contents are gone and BEFORE the lease file is unlinked, because while
+that file exists it names the inode whose lock proves ownership. The parameter is optional and the
+sweep and the session funnel pass nothing, so the one spelling of deletion stays one spelling; an
+exception from the action is logged rather than reported as a failed removal, since by then the
+history really is gone. **It runs on the PARTIAL path too, whenever history went.** A removal that
+took the segments and then failed on something else destroyed this unit's history just as a whole one
+would, and nothing revisits a unit afterwards, so returning `failed` without the companion step
+strands that file and re-arms whatever reads it. Gated on history having gone rather than on the
+failure alone: a unit whose contents are still intact keeps its own marker, and taking the companion
+from under it would delete a live reader's input.
 
 **Removal goes through the lease, and the lease it takes is SOLE.** Ownership is what stands between
 a removal and unlinking the segments a live writer is appending to, so the removal claims it
@@ -675,10 +691,25 @@ slug through `member_slug` against the config it captured while the record still
 carrying an explicit `member_id` keys its log by that id, so folding the name after the record is gone
 aims at a different unit), and the `guard` re-reads the roster inside the lease hold: a same-name
 member created in that window derives THIS unit, and its history is what an unguarded removal would
-take. The predicate fails closed -- a config the loader marks degraded answers `claimed`, since a load
+take. That re-read is a snapshot on its own, so the funnel decides while it still holds
+`memory_store_namespace_lock` -- the one seam every allocator of a member id shares, and so the only
+thing that stops another PROCESS committing a same-slug record between the decision and the unlink,
+which nothing rebuilds. The predicate fails closed -- a config the loader marks degraded answers
+`claimed`, since a load
 that could not read the file returns defaults and an emptiness test alone would read that as proof the
 owner is gone -- and it is asked through `eventlog.service`, not from the handler, so the service's
 cached log for that slug is dropped in the same step as the files.
+
+**Exactly one member-delete path reclaims, and the others are named rather than implied.** The
+dashboard delete route is that path. `kirocrew agent delete`, the package-sync prune and the crewmate
+prune migration each remove a member record without collecting its unit, and a unit orphaned before
+this exists has no collector at all -- the first two already hold `memory_store_namespace_lock`, so
+reaching them is a call apiece, while the migration holds no such lock and reads a member's own
+activity to decide what to prune. A sweep that collected ANY unclaimed member unit would cover all of
+them, the crash window and the backlog together, but it would also ask the predicate about the whole
+tree instead of the one slug a delete is deciding, and that bound is what keeps a wrong answer's cost
+to a single already-deleted member. Widening it is a retention decision in its own right, not a
+follow-on to this one.
 
 ## 9. Scope
 

@@ -147,6 +147,127 @@ _singleton: "MemberEventLogService | None" = None
 _singleton_lock = threading.Lock()
 
 
+def _remove_legacy_activity(slug: str) -> None:
+    """Remove *slug*'s pre-log activity files. Never raises.
+
+    The companion to removing a member's unit. These rows are the member's own
+    history from before the log existed, and they sit OUTSIDE the unit while the
+    marker recording that they were folded sits inside it -- so taking the unit
+    alone both leaves the history on disk and re-arms the fold, because the next
+    fresh ``ensure`` finds no marker and reads the source again. Every name the
+    fold reads is covered: the live file, its one rotation, and the retired names
+    the fold renames them to.
+
+    **The directory is PINNED to a descriptor and the leaves are unlinked by
+    BASENAME against it, so there is no window between deciding and deleting.**
+    ``member_dir`` resolves and then only containment-checks the result, so
+    ``members/<slug>`` swapped for a link to a PEER's directory resolves inside the
+    members root, passes that check, and hands back the peer's real directory --
+    where these four names are ordinary files, so a link test on the leaves is false
+    and the unlink destroys a live member's history. For a member whose fold has not
+    run that file is the sole copy. ``members/<slug>`` is deliberately agent-writable,
+    which is what makes the swap reachable rather than hypothetical.
+
+    A test on the name cannot close that, whatever it tests FOR: the test and the
+    unlink are separate syscalls, and whoever can plant the link chooses when to
+    plant it. ``platform_compat.pin_directory`` refuses a link AS IT OPENS -- POSIX
+    through ``O_DIRECTORY | O_NOFOLLOW``, Windows by opening a reparse point as
+    itself -- so the refusal is the open rather than a prediction about it, and it
+    answers for a junction as well as a symlink. Every unlink then names a basename
+    against that descriptor, so it resolves against the directory that was inspected
+    and a later swap of the NAME reaches nothing. Windows has no ``dir_fd``; there
+    the same handle is what closes the window, because a directory held open without
+    ``FILE_SHARE_DELETE`` can be neither renamed nor deleted, nor can any directory
+    above it, so the by-path unlink under that hold cannot be redirected either.
+
+    **``O_NOFOLLOW`` binds the FINAL component only, so the members ROOT is pinned
+    first and the slug is opened relative to it.** ``members_root()`` is an
+    unresolved path under the data home, and nothing seals the ``members`` component
+    itself -- swapped for a link, it redirects an open of ``members/<slug>`` however
+    carefully that leaf is no-followed, and the four unlinks land in a tree outside
+    the member area entirely. Two pins settle it: the root refuses a link as it
+    opens, and the slug is then opened THROUGH that descriptor, so neither name is
+    re-resolved from a string afterwards. On Windows the root's own handle is what
+    holds, since it blocks renaming ``members`` and everything above it.
+
+    The leaf test is kept as well, and it is not a second guess at the directory: it
+    covers a single file swapped for a link inside a directory that is genuinely this
+    member's, where the worst case is removing a link instead of the file it names.
+
+    Best-effort otherwise -- a name that will not go is logged and the rest are
+    still removed, because the member's record is already gone and a cleanup must
+    not turn that into a failed delete.
+    """
+    from kiro_crew import members
+
+    try:
+        members.validate_slug(slug)
+        named_dir = members.members_root() / slug
+    except Exception:
+        logger.debug("legacy activity path unavailable for %r", slug, exc_info=True)
+        return
+    live = members.ACTIVITY_FILE_NAME
+    retired = live + LEGACY_MIGRATED_SUFFIX
+    names = (live, live + ".1", retired, retired + ".1")
+    relative = os.open in os.supports_dir_fd and os.unlink in os.supports_dir_fd
+    try:
+        root = platform_compat.pin_directory(members.members_root())
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.warning(
+            "crew log: the members root is not a real directory; "
+            "refusing to remove what its name reaches for %r",
+            slug,
+        )
+        return
+    try:
+        try:
+            if relative:
+                pinned = os.open(slug, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            else:
+                pinned = platform_compat.pin_directory(named_dir)
+        except FileNotFoundError:
+            return
+        except OSError:
+            logger.warning(
+                "crew log: member directory for %r is not a real directory; "
+                "refusing to remove what its name reaches",
+                slug,
+            )
+            return
+        try:
+            for name in names:
+                try:
+                    if relative:
+                        if stat.S_ISLNK(os.lstat(name, dir_fd=pinned).st_mode):
+                            logger.warning(
+                                "crew log: legacy activity at %s is a link; leaving it in place",
+                                name,
+                            )
+                            continue
+                        os.unlink(name, dir_fd=pinned)
+                    else:
+                        leaf = named_dir / name
+                        if leaf.is_symlink():
+                            logger.warning(
+                                "crew log: legacy activity at %s is a link; leaving it in place",
+                                name,
+                            )
+                            continue
+                        leaf.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logger.warning(
+                        "crew log: could not remove legacy activity %s for %r", name, slug
+                    )
+        finally:
+            os.close(pinned)
+    finally:
+        os.close(root)
+
+
 LEGACY_PROVENANCE_KEY = "legacy_unverified"
 """Marks an activity record imported from the pre-fold legacy file.
 
@@ -1077,12 +1198,55 @@ class MemberEventLogService:
         survives the removal as an answer -- the folded cells for this slug stay
         in the registry, and are unreachable through every read here, each of
         which returns empty once ``_get_log`` finds no file.
+
+        **The legacy activity source goes with the unit, INSIDE the store's own lease
+        hold, and that is what makes the removal mean anything.** Those rows are the
+        member's own pre-log history, they live outside the unit under
+        ``members/<slug>/``, and the marker saying they were already folded lives
+        INSIDE it -- so a removal that took only the unit would leave the history on
+        disk AND leave the next fresh ``ensure`` free to fold it into a new log, in
+        this process or any other writer's. Taking it after the removal RETURNED
+        would leave the same fold reachable in the window between the lease's release
+        and the unlink, so it is handed to ``remove_unit`` as its ``in_hold`` action
+        instead. Kept, those rows are the thing the delete was asked to remove; taken,
+        a later append can recreate at most an empty header, which carries nothing.
+        Best-effort and link-refusing, like every other step of this teardown.
+
+        **A unit the store does not find leaves that source behind too, so the
+        cleanup runs for an absent unit as well, and there it re-asks the roster
+        itself.** A member whose log was never written, or whose fold has not run, has
+        its history ONLY in that source, and skipping it there would leave the delete
+        having removed nothing at all. The store calls the predicate as its guard only
+        when there is a unit to hold, so for an absent one there is no answer to
+        inherit and this asks again; the question raising rather than answering keeps
+        the source, the same direction every other decision here takes. That branch
+        has no unit and so no lease to run inside, which is stated as a residual
+        rather than implied: a concurrent creation of the unit can still fold the
+        source, bounded to one deduped copy of this slug's own pre-log rows.
         """
-        from kiro_crew.crew_log.store import REMOVE_REMOVED, remove_unit
+        from kiro_crew.crew_log.store import REMOVE_ABSENT, REMOVE_REMOVED, remove_unit
 
         with self._slug_lock(slug):
-            status = remove_unit(KIND_MEMBER, slug, guard=lambda _directory: still_unclaimed())
-            if status == REMOVE_REMOVED:
+            status = remove_unit(
+                KIND_MEMBER,
+                slug,
+                guard=lambda _directory: still_unclaimed(),
+                in_hold=lambda: _remove_legacy_activity(slug),
+            )
+            reclaim = False
+            if status == REMOVE_ABSENT:
+                try:
+                    reclaim = bool(still_unclaimed())
+                except Exception:
+                    logger.debug(
+                        "crew log: roster unreadable for %r; keeping legacy activity",
+                        slug,
+                        exc_info=True,
+                    )
+                    reclaim = False
+                if reclaim:
+                    _remove_legacy_activity(slug)
+            if status == REMOVE_REMOVED or reclaim:
                 with self._map_lock:
                     self._logs.pop(slug, None)
                     self._names.pop(slug, None)

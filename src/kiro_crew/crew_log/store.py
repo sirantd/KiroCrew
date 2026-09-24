@@ -362,12 +362,37 @@ REMOVE_ABSENT = "absent"
 REMOVE_FAILED = "failed"
 
 
-def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> str:
+def _run_in_hold(action: "Callable[[], None]", kind: str, unit_id: str) -> None:
+    """Run a caller's companion cleanup, swallowing its failure.
+
+    By the time this runs the unit's history is gone, so an exception here is not a
+    failed removal: reporting one would send a reader looking for a record this pass
+    destroyed. One spelling, because both the whole-removal path and the partial one
+    owe the caller the same step and must not disagree about what a failure means.
+    """
+    try:
+        action()
+    except Exception:
+        logger.warning(
+            "crew log retention: companion cleanup for %s log %r failed",
+            kind,
+            unit_id,
+            exc_info=True,
+        )
+
+
+def remove_unit(
+    kind: str,
+    unit_id: str,
+    *,
+    guard: "Callable[[Path], bool]",
+    in_hold: "Callable[[], None] | None" = None,
+) -> str:
     """Remove one unit's crew log entirely. Returns one of the ``REMOVE_*`` statuses.
 
     The ONE spelling of deletion in this package, called by the retention sweep
-    and by each permanent-delete funnel alike -- a session's and a crew member's
-    -- for the reason the work crew log's
+    and by each permanent-delete funnel that reaches it -- a session's, and the
+    dashboard's crew-member route -- for the reason the work crew log's
     ``purge_matching`` docstring gives: two callers deleting the same tree two
     ways is two chances to get the order wrong, and the order is the whole
     correctness argument.
@@ -393,6 +418,19 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
     than a filter the caller applies first, and why there is no default that
     skips the re-decision. A caller whose precondition is not a property of the
     file passes ``lambda _dir: True`` and says at the call site what does decide.
+
+    **A caller with a companion file OUTSIDE the unit passes ``in_hold``, and it
+    runs while this lease is still held.** Some of a unit's meaning lives outside its
+    directory -- a member's pre-log activity source is the case -- and a caller that
+    removed such a file after this function RETURNED would do it in the window
+    between the release here and its own next line, where another PROCESS can create
+    the unit afresh and fold that source back in. The lease is taken ``sole`` and so
+    cannot be shared, which is why the caller cannot simply hold it itself; a hook
+    inside the hold closes that window without a second spelling of deletion.
+    Optional, so a caller with nothing outside the unit passes nothing and is
+    unaffected. It runs once the unit's contents are gone, and an exception from it is
+    logged rather than reported as a failed removal, because by then the history
+    really is gone.
 
     **Then order, with IDENTITY LAST.** Segments carry the header, so they are the
     history and they go first; the per-append lock file next; then any other
@@ -528,7 +566,21 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
                     kind,
                     unit_id,
                 )
+            if history_gone and in_hold is not None:
+                # A PARTIAL removal still destroyed this unit's history, so the
+                # caller's companion file is as orphaned as it would be after a
+                # whole one -- and nothing revisits this unit, so skipping the step
+                # here strands that file and re-arms whatever reads it. Only when
+                # history went: an intact unit still has its own marker, and taking
+                # the companion from under it would delete a live reader's input.
+                _run_in_hold(in_hold, kind, unit_id)
             return REMOVE_FAILED
+        if in_hold is not None:
+            _run_in_hold(in_hold, kind, unit_id)
+        # Before the identity unlink below, not after: while the lease FILE exists it
+        # names the inode whose lock proves ownership, and once it is gone a second
+        # remover can lock a fresh one -- which would put another process inside the
+        # hold this action was given to be alone in.
         lease_gone = unlink_lock_in_hold(lease_path)
     finally:
         release_lease(lease_key)
