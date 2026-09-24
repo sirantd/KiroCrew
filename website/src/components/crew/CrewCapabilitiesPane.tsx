@@ -81,6 +81,11 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
   const error = query.error || prepare.error || save.error
   const errorKey = error instanceof ApiError && error.status === 409 ? 'crewCapabilities.stale' : error instanceof ApiError && [404, 405, 501].includes(error.status) ? 'crewCapabilities.unsupported' : 'crewCapabilities.failed'
   const enabled = !!view && view.schema_version === 1 && view.template.available && !query.isError && (view.mode === 'inherited' || draft?.enroll === true)
+  // The member's agent file changed outside this page, so new chats refuse to
+  // start. An empty draft rebuilds the file from the saved setup; Review shows
+  // what that changes before anything is written.
+  const drifted = !!view && view.mode === 'inherited' && view.runtime.status === 'failed' && view.runtime.error_code === 'materialization_changed'
+  const request = draft ?? (drifted ? emptyDraft() : null)
   const operations = draft?.operations ?? []
   const invalidTransport = operations.some(op => {
     if (!retentionValid(op)) return true
@@ -148,7 +153,7 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
             {!view.template.available
               ? <ErrorNotice message={t('crewCapabilities.parentMissing')} variant="inline" />
               : view.runtime.status === 'failed'
-                ? <ErrorNotice message={t(view.runtime.error_code ? 'crewCapabilityEditing.sourceFailed' : 'crewCapabilities.runtime_failed')} variant="inline" />
+                ? <ErrorNotice message={t(drifted ? 'crewCapabilities.driftHint' : view.runtime.error_code ? 'crewCapabilityEditing.sourceFailed' : 'crewCapabilities.runtime_failed')} variant="inline" />
                 : <p role="status" className="mt-2">{t(capabilityLabels.runtime[view.runtime.status])}</p>}
             <p className="mt-1 text-muted">{t('crewCapabilities.newRuntime')}</p>
             {view.mode !== 'inherited' && <div className="mt-3">
@@ -257,9 +262,9 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
       <Dialog open={discardOpen} onOpenChange={setDiscardOpen}>
         {view?.schema_version === 1 && <div className="flex shrink-0 flex-wrap justify-end gap-2 border-t border-border bg-card px-5 py-3" data-testid="capability-save-footer">
           <DialogTrigger asChild><Btn disabled={!dirty || busy}>{t('crewCapabilities.discard')}</Btn></DialogTrigger>
-          <SendBtn disabled={!enabled || !draft || busy || invalidTransport || !!connectionName.trim() || !!reference.trim() || draft.revision !== view.revision || (draft.enroll === false && view.mode !== 'inherited')} onClick={() => {
+          <SendBtn disabled={!enabled || !request || busy || invalidTransport || !!connectionName.trim() || !!reference.trim() || request.revision !== view.revision || (request.enroll === false && view.mode !== 'inherited')} onClick={() => {
             if (preview && reviewedRequest) save.mutate({ ...reviewedRequest, preview_token: preview.preview_token })
-            else if (draft) prepare.mutate(draft)
+            else if (request) prepare.mutate(request)
           }}>{busy ? t('crewCapabilities.working') : preview ? t('crewCapabilities.save') : t('crewCapabilities.review')}</SendBtn>
         </div>}
         {/* Keep this Radix layer mounted inside the crew editor's DialogContent:

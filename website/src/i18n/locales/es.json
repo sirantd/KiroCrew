@@ -137,7 +137,8 @@
     "parentChange_changed": "La plantilla principal cambió esto",
     "discardDraftTitle": "¿Descartar el borrador de Capacidades?",
     "discardDraftBody": "Descartar los cambios de capacidades de {{name}} mantiene el editor abierto. Los valores guardados y las credenciales ocultas no cambian. Ningún otro miembro se ve afectado.",
-    "discardDraftConfirm": "Descartar borrador"
+    "discardDraftConfirm": "Descartar borrador",
+    "driftHint": "El archivo de agente cambió fuera de esta página. Revisa el cambio y guárdalo para volver a iniciar chats nuevos."
   },
   "api": {
     "client": {
@@ -10074,7 +10075,9 @@
         "sign_in": "Iniciar sesión en Kiro",
         "sign_in_hint": "Abre Ajustes → Resumen → Inicio de sesión en Kiro, vuelve a iniciar sesión y envía tu mensaje de nuevo.",
         "feature_request_form": "Abrir el formulario de solicitud de función",
-        "feature_request_form_hint": "No hay capacidad de inferencia en este momento — abre el formulario de solicitud de función en su lugar."
+        "feature_request_form_hint": "No hay capacidad de inferencia en este momento — abre el formulario de solicitud de función en su lugar.",
+        "capabilities_changed": "El archivo de agente de este miembro de la crew cambió fuera de la página Capabilities, así que no se pueden iniciar chats nuevos. Abre Capabilities, revisa el cambio y guárdalo; luego inicia un chat nuevo.",
+        "open_capabilities": "Abrir Capabilities"
       },
       "folderPanel": {
         "clear_search": "Borrar búsqueda",

@@ -4130,6 +4130,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const openKiroSignIn = useCallback(() => {
     navigate(KIRO_SIGN_IN_PATH)
   }, [navigate])
+  // A `materialization_changed` row's fix: the member's Capabilities pane in
+  // the crew editor, where the changed agent file is reviewed and saved.
+  const openMemberCapabilities = useCallback((member: string) => {
+    navigate(`/capabilities?tab=crews&crew=${encodeURIComponent(member)}&pane=capabilities`)
+  }, [navigate])
   // The non-inference exit for a feature request the plan could not afford
   // (#13342). Only a slot the header's "Request a Feature" action created gets
   // the form route: the row's `usage_limit` kind says the allowance is spent,
@@ -5784,6 +5789,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       onPickModel: openModelPickerFromError,
       onOpenDefaultModel: embedded || popout ? undefined : openDefaultModelSetting,
       onOpenSignIn: embedded || popout ? undefined : openKiroSignIn,
+      onOpenCapabilities: embedded || popout ? undefined : openMemberCapabilities,
       featureRequestFormUrl,
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
@@ -5822,7 +5828,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       bubble,
     ])
     return { renderers, fallback: bubble }
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, featureRequestFormUrl, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, featureRequestFormUrl, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel])
 
   const renderMessage = useCallback((i: number, m: ChatMessage) => {
     // Key identity rules (clientTs preference + streaming->assistant role

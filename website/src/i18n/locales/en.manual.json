@@ -136,7 +136,8 @@
     "parentChange_changed": "Parent changed this",
     "discardDraftTitle": "Discard the Capabilities draft?",
     "discardDraftBody": "Discarding the capability edits for {{name}} keeps the editor open. Saved values and hidden credentials are unchanged. No other member is affected.",
-    "discardDraftConfirm": "Discard draft"
+    "discardDraftConfirm": "Discard draft",
+    "driftHint": "The agent file changed outside this page. Review the change and save it to start new chats again."
   },
   "api": {
     "client": {
@@ -4273,7 +4274,9 @@
         "feature_request_form": "Open the feature request form",
         "feature_request_form_hint": "No inference capacity right now — open the feature request form instead.",
         "sign_in": "Sign in to Kiro",
-        "sign_in_hint": "Open Settings → Overview → Kiro sign-in and sign in again, then send your message again."
+        "sign_in_hint": "Open Settings → Overview → Kiro sign-in and sign in again, then send your message again.",
+        "capabilities_changed": "This crew member's agent file changed outside the Capabilities page, so new chats cannot start. Open Capabilities, review the change and save it, then start a new chat.",
+        "open_capabilities": "Open Capabilities"
       },
       "crewLog": {
         "section_status": "Status",

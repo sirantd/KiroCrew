@@ -135,7 +135,8 @@
     "parentChange_changed": "親がこれを変更しました",
     "discardDraftTitle": "機能のドラフトを破棄しますか？",
     "discardDraftBody": "{{name}} の機能編集を破棄しても、エディターは開いたままです。保存済みの値と非表示の認証情報は変わりません。他のメンバーには影響しません。",
-    "discardDraftConfirm": "ドラフトを破棄"
+    "discardDraftConfirm": "ドラフトを破棄",
+    "driftHint": "エージェントファイルがこのページの外で変更されました。変更を確認して保存すると、新しいチャットを再び開始できます。"
   },
   "api": {
     "client": {
@@ -9798,7 +9799,9 @@
         "sign_in": "Kiro にサインイン",
         "sign_in_hint": "「設定 → 概要 → Kiro サインイン」を開いて再度サインインし、メッセージをもう一度送信してください。",
         "feature_request_form": "機能リクエストフォームを開く",
-        "feature_request_form_hint": "現在、推論の容量がありません。代わりに機能リクエストフォームから送信できます。"
+        "feature_request_form_hint": "現在、推論の容量がありません。代わりに機能リクエストフォームから送信できます。",
+        "capabilities_changed": "このクルーメンバーのエージェントファイルが Capabilities ページの外で変更されたため、新しいチャットを開始できません。Capabilities を開き、変更を確認して保存してから、新しいチャットを開始してください。",
+        "open_capabilities": "Capabilities を開く"
       },
       "folderPanel": {
         "clear_search": "検索をクリア",

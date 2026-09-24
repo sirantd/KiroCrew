@@ -136,7 +136,8 @@
     "parentChange_changed": "Die Vorlage hat dies geändert",
     "discardDraftTitle": "Entwurf der Fähigkeiten verwerfen?",
     "discardDraftBody": "Das Verwerfen der Fähigkeiten-Änderungen für {{name}} lässt den Editor offen. Gespeicherte Werte und verborgene Zugangsdaten bleiben unverändert. Kein anderes Mitglied ist betroffen.",
-    "discardDraftConfirm": "Entwurf verwerfen"
+    "discardDraftConfirm": "Entwurf verwerfen",
+    "driftHint": "Die Agent-Datei wurde außerhalb dieser Seite geändert. Prüfe die Änderung und speichere sie, damit neue Chats wieder starten."
   },
   "api": {
     "client": {
@@ -9936,7 +9937,9 @@
         "sign_in": "Bei Kiro anmelden",
         "sign_in_hint": "Öffne Einstellungen → Übersicht → Kiro-Anmeldung, melde dich erneut an und sende deine Nachricht noch einmal.",
         "feature_request_form": "Formular für Funktionsvorschläge öffnen",
-        "feature_request_form_hint": "Gerade keine Inferenz-Kapazität — öffne stattdessen das Formular für Funktionsvorschläge."
+        "feature_request_form_hint": "Gerade keine Inferenz-Kapazität — öffne stattdessen das Formular für Funktionsvorschläge.",
+        "capabilities_changed": "Die Agent-Datei dieses Crew-Mitglieds wurde außerhalb der Capabilities-Seite geändert, daher können keine neuen Chats starten. Öffne Capabilities, prüfe die Änderung und speichere sie, dann starte einen neuen Chat.",
+        "open_capabilities": "Capabilities öffnen"
       },
       "folderPanel": {
         "clear_search": "Suche löschen",

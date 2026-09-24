@@ -37,7 +37,7 @@ import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
-import { ErrorCard, isAuthRequired, isModelUnentitled, isUsageLimit } from './ErrorCard'
+import { ErrorCard, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isUsageLimit } from './ErrorCard'
 import NoticeCard from './NoticeCard'
 import { resolveTransientNotice } from './transientNotice'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
@@ -143,6 +143,9 @@ export interface TranscriptRendererOptions {
   /** Fix affordance for an `auth_required` row: deep-link to the Kiro sign-in
    *  card in Settings. Omitted on a surface with no settings route. */
   onOpenSignIn?: () => void
+  /** Fix affordance for a `materialization_changed` row: open the named crew
+   *  member's Capabilities pane. Omitted on a surface with no crew editor. */
+  onOpenCapabilities?: (member: string) => void
   /** The non-inference exit for a `usage_limit` row: the repo's feature-request
    *  form (#13342). The host passes it ONLY when the slot on screen is one the
    *  header's "Request a Feature" action created -- that flow is an agent turn
@@ -421,6 +424,10 @@ export function createTranscriptRenderers(
         }
         const unentitled = isModelUnentitled(m)
         const authRequired = isAuthRequired(m)
+        const capabilitiesMember = isCapabilitiesChanged(m) ? String((m.meta as { member?: unknown } | undefined)?.member ?? '') : ''
+        const openCapabilities = isCapabilitiesChanged(m) && o.onOpenCapabilities
+          ? () => o.onOpenCapabilities!(capabilitiesMember)
+          : undefined
         // The form is offered on the plan's own refusal and nowhere else: a
         // #4198 refused-send row in the same slot carries no kind (the send
         // never went out, so a retry CAN help), and a usage limit in a slot the
@@ -435,7 +442,7 @@ export function createTranscriptRenderers(
             // resuming would replay the identical rejection (or the same
             // signed-out wall, or the same spent allowance).
             onContinue={
-              !unentitled && !authRequired && !featureRequestFormUrl && o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
+              !unentitled && !authRequired && !featureRequestFormUrl && !isCapabilitiesChanged(m) && o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
                 ? o.onContinue
                 : undefined
             }
@@ -445,6 +452,7 @@ export function createTranscriptRenderers(
             onOpenSignIn={authRequired ? o.onOpenSignIn : undefined}
             unentitledElsewhere={unentitled}
             featureRequestFormUrl={featureRequestFormUrl}
+            onOpenCapabilities={openCapabilities}
           />,
         )
       },

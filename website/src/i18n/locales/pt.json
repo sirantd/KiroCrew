@@ -137,7 +137,8 @@
     "parentChange_changed": "O modelo principal alterou isto",
     "discardDraftTitle": "Descartar o rascunho de Capacidades?",
     "discardDraftBody": "Descartar as edições de capacidades de {{name}} mantém o editor aberto. Os valores salvos e as credenciais ocultas não mudam. Nenhum outro membro é afetado.",
-    "discardDraftConfirm": "Descartar rascunho"
+    "discardDraftConfirm": "Descartar rascunho",
+    "driftHint": "O arquivo de agente foi alterado fora desta página. Revise a alteração e salve-a para voltar a iniciar novos chats."
   },
   "api": {
     "client": {
@@ -10074,7 +10075,9 @@
         "sign_in": "Entrar no Kiro",
         "sign_in_hint": "Abra Configurações → Visão geral → Login do Kiro, entre novamente e reenvie sua mensagem.",
         "feature_request_form": "Abrir o formulário de sugestão de recurso",
-        "feature_request_form_hint": "Sem capacidade de inferência no momento — abra o formulário de sugestão de recurso em vez disso."
+        "feature_request_form_hint": "Sem capacidade de inferência no momento — abra o formulário de sugestão de recurso em vez disso.",
+        "capabilities_changed": "O arquivo de agente deste membro da crew foi alterado fora da página Capabilities, então novos chats não podem começar. Abra Capabilities, revise a alteração e salve-a; depois inicie um novo chat.",
+        "open_capabilities": "Abrir Capabilities"
       },
       "folderPanel": {
         "clear_search": "Limpar pesquisa",

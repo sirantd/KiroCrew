@@ -48,6 +48,8 @@ class CapabilityError(ValueError):
         super().__init__(code)
         self.code = code
         self.status = status
+        #: Crew member whose spec failed, set by the session start seam.
+        self.member = ""
 
 
 def _digest(value: Any) -> str:
@@ -1393,8 +1395,14 @@ class CapabilityService:
                 changed_binding = False
                 for snap, spec, intent, _ in plans:
                     if snap["intent"] and spec == snap["spec"] and intent == snap["intent"]:
-                        intent.setdefault("revision", secrets.token_hex(16))
+                        _align_permissions(snap["spec"], copy.deepcopy(spec))
+                        materialized = _digest(spec)
+                        if intent.get("materialized") != materialized:
+                            intent["revision"] = secrets.token_hex(16)
+                        else:
+                            intent.setdefault("revision", secrets.token_hex(16))
                         intent["status"] = "saved"
+                        intent["materialized"] = materialized
                         intent["governance_generation"] = snap["generation"]
                         unchanged[snap["target"]] = intent
                         continue

@@ -137,7 +137,8 @@
     "parentChange_changed": "Le parent a modifié ceci",
     "discardDraftTitle": "Abandonner le brouillon des Capacités ?",
     "discardDraftBody": "Abandonner les modifications de capacités de {{name}} laisse l’éditeur ouvert. Les valeurs enregistrées et les identifiants masqués ne changent pas. Aucun autre membre n’est concerné.",
-    "discardDraftConfirm": "Abandonner le brouillon"
+    "discardDraftConfirm": "Abandonner le brouillon",
+    "driftHint": "Le fichier d'agent a été modifié en dehors de cette page. Vérifie la modification et enregistre-la pour pouvoir redémarrer de nouvelles discussions."
   },
   "api": {
     "client": {
@@ -10074,7 +10075,9 @@
         "sign_in": "Se connecter à Kiro",
         "sign_in_hint": "Ouvrez Paramètres → Aperçu → Connexion Kiro, reconnectez-vous, puis renvoyez votre message.",
         "feature_request_form": "Ouvrir le formulaire de demande de fonctionnalité",
-        "feature_request_form_hint": "Aucune capacité d’inférence pour le moment — ouvre plutôt le formulaire de demande de fonctionnalité."
+        "feature_request_form_hint": "Aucune capacité d’inférence pour le moment — ouvre plutôt le formulaire de demande de fonctionnalité.",
+        "capabilities_changed": "Le fichier d'agent de ce membre de la crew a été modifié en dehors de la page Capabilities, donc les nouvelles discussions ne peuvent pas démarrer. Ouvre Capabilities, vérifie la modification et enregistre-la, puis démarre une nouvelle discussion.",
+        "open_capabilities": "Ouvrir Capabilities"
       },
       "folderPanel": {
         "clear_search": "Effacer la recherche",
