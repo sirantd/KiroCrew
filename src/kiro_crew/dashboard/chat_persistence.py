@@ -38,10 +38,12 @@ from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
     _redact_meta_for_role,
     _sync_dashboard_slots,
+    drop_records_without_placeholders,
     effective_session_key,
     session_key_for,
     slot_history_key,
     slot_transcript_key,
+    with_bounded_redaction_records,
 )
 from kiro_crew.dashboard.slot_buffers import (
     committed_filtered_note_ids,
@@ -78,7 +80,12 @@ from kiro_crew.history import (
 )
 from kiro_crew.memory_stores import UnknownMemoryStore, named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact_credentials,
+    redact_exfiltration_urls,
+)
+from kiro_crew.security.exfil import current_scoped_exempt_hosts, scoped_exempt_hosts
+from kiro_crew.security.redaction_allow import allowed_hosts_for
 from kiro_crew.sel import sel
 from kiro_crew.session_agent_selection import session_agent_selection_name
 from kiro_crew.validation import ARTIFACT_SLUG_RE
@@ -1014,10 +1021,14 @@ def _attach_variants(slot: _ChatSlot, m: dict) -> None:
     """Copy variant history from a persisted message onto the slot's last message, with redaction."""
     if m.get("variants"):
         slot.messages[-1]["variants"] = [  # type: ignore[assignment]
-            {
-                **v,
-                "content": redact_credentials(redact_exfiltration_urls(v.get("content", ""))[0])[0],
-            }
+            with_bounded_redaction_records(
+                {
+                    **v,
+                    "content": redact_credentials(
+                        redact_exfiltration_urls(v.get("content", ""))[0]
+                    )[0],
+                }
+            )
             for v in m["variants"]
             if isinstance(v, dict)
         ]
@@ -1326,6 +1337,20 @@ def _is_app_owned_channel_row(meta: dict, history_key: str) -> bool:
         )
         return True
     return False
+
+
+def _redact_loaded_content(slot: _ChatSlot, content: str) -> str:
+    """Redact a restored non-user row's content under the slot's allowed hosts.
+
+    The write and display passes honour the hosts a reader allowed for this
+    workspace, so the load pass does too: otherwise an allowed link stored as
+    written would come back from disk as a blocked-link placeholder with no
+    record behind it.
+    """
+    with scoped_exempt_hosts(allowed_hosts_for(getattr(slot, "workspace", None))):
+        content, _ = redact_exfiltration_urls(content)
+    content, _ = redact_credentials(content)
+    return content
 
 
 def _rehydrate_slot_from_history(
@@ -1762,8 +1787,7 @@ def _rehydrate_slot_from_history(
             # stays raw because its author is its only reader, but `system` MUST be
             # redacted — the write path excludes it, so system bytes reach disk raw.
             if role != "user":
-                content, _ = redact_exfiltration_urls(content)
-                content, _ = redact_credentials(content)
+                content = _redact_loaded_content(slot, content)
             slot.append(
                 role,
                 content,
@@ -1782,8 +1806,14 @@ def _rehydrate_slot_from_history(
                 # the large payloads, so meta redaction was ~5.5s of a ~7s restore
                 # while content redaction was only ~0.4s. Redacted at emit instead
                 # (chat_utils._prepare_messages), which is the only path that returns
-                # meta to a client.
-                meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+                # meta to a client. Blocked-link records are the exception: they are
+                # BOUNDED here because this is where the slot retains them, and the
+                # bound is a no-op for a row that carries none.
+                meta=(
+                    with_bounded_redaction_records(m["meta"])
+                    if isinstance(m.get("meta"), dict)
+                    else None
+                ),
                 mint_mid=False,
             )
             # Provenance is not a slot.append() argument, so carry it onto the
@@ -2302,15 +2332,20 @@ def _apply_recent_session(
         # measured rationale (content ~0.4s / ~204 readers, meta ~5.5s /
         # 31 readers that touch only control fields outside the emit sites).
         if role != "user":
-            content, _ = redact_exfiltration_urls(content)
-            content, _ = redact_credentials(content)
+            content = _redact_loaded_content(slot, content)
         slot.append(
             role,
             content,
             cls,
             ts=m.get("ts", ""),
             broadcast=False,
-            meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+            # Blocked-link records bounded where the slot retains them; see the
+            # equivalent append in _rehydrate_slot_from_history.
+            meta=(
+                with_bounded_redaction_records(m["meta"])
+                if isinstance(m.get("meta"), dict)
+                else None
+            ),
             mint_mid=False,
         )
         # See the equivalent call in _rehydrate_slot_from_history.
@@ -2776,6 +2811,11 @@ def _build_message_entry(m: dict, *, attachments: tuple[Path, str] | None = None
     # a file its own delete will never reclaim. Folded in AFTER the digest rather
     # than into its input, so the message payload keeps exactly one hashing site.
     key = f"{attachments}\x00{key}"
+    # The scoped allowed hosts change what redaction keeps, so an entry built
+    # under one workspace's set is never served under another's.
+    scoped = current_scoped_exempt_hosts()
+    if scoped:
+        key = f"{key}\x00{','.join(sorted(scoped))}"
     size = len(payload)
     with _entry_cache_lock:
         if key in _entry_cache:
@@ -2910,14 +2950,30 @@ def _build_message_entry_uncached(
                     vc = rewritten
             vc, _ = redact_exfiltration_urls(vc)
             vc, _ = redact_credentials(vc)
-            redacted_variants.append({**v, "content": vc})
+            v_entry = {**v, "content": vc}
+            # A variant's records are ITS OWN, under the same rule the row obeys:
+            # they describe this variant's text, so they ride with it, they go
+            # through their bounded constructors, and they are dropped when that
+            # text holds no placeholder to explain.
+            drop_records_without_placeholders(v_entry, vc)
+            v_entry = with_bounded_redaction_records(v_entry)
+            redacted_variants.append(v_entry)
         entry["variants"] = redacted_variants
         entry["variant_idx"] = m.get("variant_idx", 0)
     cls_val = m.get("cls", "")
     if role == "system" and cls_val:
         entry["cls"] = cls_val
-    if isinstance(m.get("meta"), dict):
-        entry["meta"] = _redact_meta_for_role(role, m["meta"])
+    meta_src = m.get("meta") if isinstance(m.get("meta"), dict) else None
+    if meta_src is not None:
+        meta_in = dict(meta_src)
+        # Records are CARRIED, never re-derived here. They are born at the one
+        # moment the URL exists -- the redaction that produces this row's text --
+        # so by the time this function sees the content it holds the placeholder
+        # and a scan of it would describe nothing. The records still have to
+        # DESCRIBE this text, so a row whose content shows no placeholder does not
+        # keep them; `_redact_meta_for_role` re-validates whatever survives.
+        drop_records_without_placeholders(meta_in, content)
+        entry["meta"] = _redact_meta_for_role(role, meta_in)
     return entry
 
 
@@ -4396,9 +4452,13 @@ def _save_slot_to_history(
             # ``path`` is this session's transcript, so its directory and stem are
             # what pairs an attachment with the session that will delete it.
             attachments = (path.parent, path.stem)
-            window_entries = [
-                e for m in window if (e := build_entry(m, attachments=attachments)) is not None
-            ]
+            # The slot's allowed hosts scope the write, so a link the reader
+            # allowed is stored as the flush left it rather than turned into a
+            # blocked-link placeholder that has no record to open it by.
+            with scoped_exempt_hosts(allowed_hosts_for(getattr(slot, "workspace", None))):
+                window_entries = [
+                    e for m in window if (e := build_entry(m, attachments=attachments)) is not None
+                ]
             window_lines = [json.dumps(e) + "\n" for e in window_entries]
             frozen_prefix, foreign_lines, dedup_dropped = _frozen_prefix_and_foreign_appends(
                 slot, path, disk_older, window_entries, collect_foreign=not rewrite

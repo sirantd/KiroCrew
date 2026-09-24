@@ -1529,6 +1529,10 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
 # catches an omission.
 NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
     {
+        # The redaction cards' owner-only route (allowed hosts). It applies no
+        # redactor; the call-site scan matches its
+        # handler names (`api_redaction_allow_host`, ...).
+        "dashboard/handlers/redaction.py",
         # Drives the backup redaction pass and reports what it did, but applies no
         # redactor itself: the outbound bytes are rewritten in `snapshot_redact.py`,
         # which is the registered sink. What matches the call-site scan here are the
