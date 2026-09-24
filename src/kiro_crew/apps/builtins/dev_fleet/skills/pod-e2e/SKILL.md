@@ -355,13 +355,11 @@ Then return a QA VERDICT, not a raw dump:
      (b) a flaky/timing issue, or (c) an environment problem (missing venv,
      missing dist, port clash)? Cite the log line or screenshot that proves it.
   4. The ARTIFACT_DIR path so the dev can open screenshots/video.
-""", solo_reason="bulk_data")
+""")
 ```
 
-`solo_reason` is required: this is ONE sub-agent for one task, and `spawn_run`
-refuses that unless told why. The e2e run is a legitimate `bulk_data` case --
-Playwright output, videos and pod logs would flood your context, and only the
-verdict is needed back.
+One sub-agent is right here: Playwright output, videos and pod logs would
+flood your context, and only the verdict is needed back.
 
 ### When to delegate vs run inline
 - **Delegate to a QA agent** when the suite is long (Playwright + video) and
