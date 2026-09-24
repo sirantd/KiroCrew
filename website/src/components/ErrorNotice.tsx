@@ -76,6 +76,7 @@ export default function ErrorNotice({
   variant = 'block',
   askAgent = false,
   askAgentLabel,
+  actionPlacement = 'beside',
   footer,
   onHandoff,
   className = '',
@@ -123,6 +124,18 @@ export default function ErrorNotice({
    * `askAgent` is off.
    */
   askAgentLabel?: string
+  /**
+   * Where the hand-off sits in the block variant. `beside` (default) puts it in
+   * the banner's right-hand column, which is right for a banner that spans a
+   * page. `below` stacks it under the text, inside the text column: in a
+   * NARROW host — the chat sidebar is ~300px — a sibling column takes a third
+   * of the width and the title and message wrap one or two words per line. Not
+   * a container query: jsdom cannot evaluate one, so the pin would be
+   * untestable, and `container-type` on the shared root would collapse a
+   * notice laid out in a shrink-to-fit context. Ignored by the inline variant
+   * and when `askAgent` is off.
+   */
+  actionPlacement?: 'beside' | 'below'
   /**
    * Rendered INSIDE the banner, under the message (block variant only) — for
    * a follow-on line that answers the message above it (a resolved outcome, a
@@ -216,8 +229,18 @@ export default function ErrorNotice({
           ? <span className={messageClassName} title={messageTooltip}>{message}</span>
           : message}
         {footer && <div className="mt-1 font-normal">{footer}</div>}
+        {askAgent && actionPlacement === 'below' && (
+          <div className="mt-1.5">
+            <AskAgentButton
+              report={report}
+              message={message}
+              onHandoff={onHandoff}
+              label={askAgentLabel}
+            />
+          </div>
+        )}
       </div>
-      {askAgent && (
+      {askAgent && actionPlacement === 'beside' && (
         <AskAgentButton
           report={report}
           message={message}
