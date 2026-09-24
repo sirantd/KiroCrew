@@ -77,7 +77,7 @@ from kiro_crew.discord.transport_dispatch import (
 )
 from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
-from kiro_crew.messaging.display_safety import joins_to_a_credential
+from kiro_crew.messaging.display_safety import CREDENTIAL_SEAM_TAG, joins_to_a_credential
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -1225,6 +1225,478 @@ class TestARewrittenHeadIsRegradedAgainstTheSealedFrame:
         assert not joins_to_a_credential(
             screen[-2], screen[-1], _default_redactor
         ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_seal_is_what_the_next_message_is_graded_against(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed upload's markup re-post IS the message the reader sees.
+
+        The multipart seal breaks out before it can record anything, so the text
+        that actually reached the channel is the recovery's. Grading the next
+        message against what the seal MEANT to send, or against nothing, blesses a
+        boundary the reader never had.
+        """
+        r, cli = self._renderer(monkeypatch, 200)
+        cli.fail_uploads = True
+        monkeypatch.setattr(r, "_uploads_enabled", lambda: True)
+
+        async def _extract(source: str) -> tuple[str, list[Any]]:
+            # One attachment, so the seal takes the multipart path and its failure
+            # reaches the markup recovery, which re-posts the SOURCE markup.
+            return "extraction stripped the markup", [object()]
+
+        monkeypatch.setattr(r, "_extract_uploads", _extract)
+        r._buf = [f"recovered {self._HEAD_HALF}"]
+        await r._seal_current()
+
+        assert [t for t, _ in cli.sent] == [f"recovered {self._HEAD_HALF}"]
+        # The recovery promotes each chunk it lands, so the frozen text is already
+        # the recovered message -- the caller does not have to open a new one for
+        # the next send to be graded against what the reader received.
+        assert r._frozen_above == f"recovered {self._HEAD_HALF}", r._frozen_above
+        assert r._landed_text == "", r._landed_text
+
+        # The next message is graded against the recovered text, so a head opening
+        # with the key's other half cannot complete it on screen.
+        cli.fail_uploads = False
+        monkeypatch.setattr(r, "_uploads_enabled", lambda: False)
+        r._buf = []
+        r._delivery_text = f"{self._TAIL_HALF} and the rest"
+        await r._seal_current()
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        assert not joins_to_a_credential(screen[-2], screen[-1], _default_redactor), screen
+
+    @pytest.mark.asyncio
+    async def test_a_message_that_landed_nothing_does_not_erase_the_one_above_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A send that never arrived puts no text on screen, so the message a reader
+        # sees above the next one is still the last one that did land. Zeroing the
+        # frozen text on a failure would grade the next send against nothing, which
+        # `break_credential_seam` passes unconditionally.
+        r, cli = self._renderer(monkeypatch, 200)
+        r._buf = [f"landed {self._HEAD_HALF}"]
+        await r._seal_current()
+        r._open_new_message()
+        assert r._frozen_above == f"landed {self._HEAD_HALF}"
+
+        cli.fail_sends = True
+        r._buf = ["this one never arrives"]
+        await r._seal_current()
+        r._open_new_message()
+
+        assert r._frozen_above == f"landed {self._HEAD_HALF}", r._frozen_above
+
+
+class TestAnUnconfirmedLiveFrameIsNotTakenForVisibleText:
+    """The frozen text has to be text a reader received, not text we attempted.
+
+    A live frame records what it rendered, and ``_open_new_message`` promotes that
+    record to the text the next message is graded beside. A send that returned no
+    id, and an edit the API refused, both put nothing on screen: what a reader
+    still has is the last frame that did land. Recording the attempt replaces the
+    real visible tail with one nobody saw, and the danger runs in the direction
+    that matters -- a key whose first half ends the REAL tail is then completed by
+    the next message, because the text the seam was checked against does not end
+    that way.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    def _renderer(self, monkeypatch: pytest.MonkeyPatch) -> tuple[DiscordRenderer, FakeClient]:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+        return r, cli
+
+    @pytest.mark.asyncio
+    async def test_a_refused_live_edit_does_not_replace_the_visible_tail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r, cli = self._renderer(monkeypatch)
+        # Frame one lands, and its tail is the key's first half.
+        r._buf = [f"first frame {self._HEAD_HALF}"]
+        await r._stream_live(force=True)
+        assert [t for t, _ in cli.sent] == [f"first frame {self._HEAD_HALF}"]
+        assert r._landed_text == f"first frame {self._HEAD_HALF}"
+
+        # Frame two is refused, so the bubble on screen still holds frame one.
+        cli.edit_ok = False
+        r._buf = ["a later frame the API refused"]
+        await r._stream_live(force=True)
+        assert len(cli.edits) == 1, cli.edits
+        assert [t for t, _ in cli.sent] == [f"first frame {self._HEAD_HALF}"]
+        assert r._landed_text == f"first frame {self._HEAD_HALF}", r._landed_text
+
+        # So the next message is graded against what the reader can actually read.
+        r._open_new_message()
+        assert r._frozen_above == f"first frame {self._HEAD_HALF}", r._frozen_above
+        cli.edit_ok = True
+        r._buf = [f"{self._TAIL_HALF} and the rest"]
+        await r._stream_live(force=True)
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        for message in screen:
+            assert _default_redactor(message) == message, f"redacted alone: {message}"
+        assert not joins_to_a_credential(
+            screen[-2], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_live_send_that_returned_no_id_records_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [f"landed {self._HEAD_HALF}"]
+        await r._seal_current()
+        r._open_new_message()
+        assert r._frozen_above == f"landed {self._HEAD_HALF}"
+
+        # No id back means no message exists, so this frame is on no screen.
+        cli.fail_sends = True
+        r._buf = ["a live frame that never arrived"]
+        await r._stream_live(force=True)
+        assert r._stream_mid is None, r._stream_mid
+        assert r._landed_text == "", r._landed_text
+
+        r._open_new_message()
+        assert r._frozen_above == f"landed {self._HEAD_HALF}", r._frozen_above
+
+
+class TestWhicheverChunkLandsFirstIsTheOneThatIsGraded:
+    """A seal splits into chunks, and each send can fail on its own.
+
+    Grading once before the split only fixes the head of the WHOLE text, which is
+    the head of the first chunk. When that chunk fails to land, the next one is the
+    first thing a reader sees under the frozen message, and its head was never the
+    head that was checked. So the grade belongs immediately before each chunk's own
+    send, against whatever is frozen above it at that moment.
+    """
+
+    _HEAD_HALF = "AKIAIOSF"
+    _TAIL_HALF = "ODNN7EXAMPLE"
+
+    @pytest.mark.asyncio
+    async def test_a_later_chunk_that_lands_first_is_graded_against_the_frozen_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+
+        # A frozen message whose tail is the key's first half.
+        r._buf = [f"first message {self._HEAD_HALF}"]
+        await r._seal_current()
+        r._open_new_message()
+        assert r._frozen_above == f"first message {self._HEAD_HALF}", r._frozen_above
+        landed_before = len(cli.sent)
+
+        # Two chunks, and the SECOND one opens with the key's other half. Grading
+        # the whole text once would leave this chunk untouched, because it is
+        # interior text at that point.
+        monkeypatch.setattr(
+            "kiro_crew.discord.renderer.split_markdown_safe",
+            lambda text, limit: ["chunk one is harmless", f"{self._TAIL_HALF} and the rest"],
+        )
+        monkeypatch.setattr("kiro_crew.discord.renderer.DISCORD_MAX_TEXT", 8)
+        # Pass the stubbed chunks through untouched: the real cap chopper would
+        # re-slice them at 8 characters and destroy the heads under test.
+        monkeypatch.setattr("kiro_crew.discord.renderer._fit_platform_cap", lambda t, cap=None: [t])
+
+        # Chunk one fails, so chunk two is what lands under the frozen message.
+        original_send = cli.send_message
+        calls = {"n": 0}
+
+        async def _fail_first(channel_id: str, text: str, **kw: Any) -> str | None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return await original_send(channel_id, text, **kw)
+
+        cli.send_message = _fail_first  # type: ignore[method-assign]
+        try:
+            r._buf = []
+            r._delivery_text = "unused, the split is stubbed"
+            await r._seal_current()
+        finally:
+            cli.send_message = original_send  # type: ignore[method-assign]
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) > landed_before, "precondition: a later chunk landed"
+        assert not joins_to_a_credential(
+            f"first message {self._HEAD_HALF}", screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across the frozen message and {screen[-1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_later_recovery_chunk_that_lands_first_is_graded_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The markup recovery after a failed upload splits and sends per chunk too.
+
+        Its chunks are separate messages with separate failures, so the same rule
+        applies: whichever one lands first under the frozen message is the one whose
+        head has to be safe beside it.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+
+        r._buf = [f"first message {self._HEAD_HALF}"]
+        await r._seal_current()
+        r._open_new_message()
+        frozen = f"first message {self._HEAD_HALF}"
+        assert r._frozen_above == frozen, r._frozen_above
+        landed_before = len(cli.sent)
+
+        # Force the recovery: one attachment, and the multipart upload fails.
+        cli.fail_uploads = True
+        monkeypatch.setattr(r, "_uploads_enabled", lambda: True)
+
+        async def _extract(source: str) -> tuple[str, list[Any]]:
+            return "extraction stripped the markup", [object()]
+
+        monkeypatch.setattr(r, "_extract_uploads", _extract)
+        # Two recovery chunks, the second opening with the key's other half.
+        monkeypatch.setattr(
+            "kiro_crew.discord.renderer.split_markdown_safe",
+            lambda text, limit: ["recovery chunk one", f"{self._TAIL_HALF} and the rest"],
+        )
+        monkeypatch.setattr("kiro_crew.discord.renderer.DISCORD_MAX_TEXT", 8)
+        # Pass the stubbed chunks through untouched: the real cap chopper would
+        # re-slice them at 8 characters and destroy the heads under test.
+        monkeypatch.setattr("kiro_crew.discord.renderer._fit_platform_cap", lambda t, cap=None: [t])
+
+        # The first recovery chunk fails, so the second is what lands under the
+        # frozen message.
+        original_send = cli.send_message
+        calls = {"n": 0}
+
+        async def _fail_first(channel_id: str, text: str, **kw: Any) -> str | None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return await original_send(channel_id, text, **kw)
+
+        cli.send_message = _fail_first  # type: ignore[method-assign]
+        try:
+            r._buf = ["a segment whose upload fails"]
+            await r._seal_current()
+        finally:
+            cli.send_message = original_send  # type: ignore[method-assign]
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) > landed_before, "precondition: a recovery chunk landed"
+        assert not joins_to_a_credential(
+            frozen, screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across the frozen message and {screen[-1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_cap_length_segment_with_an_open_seam_stays_under_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reserve has to survive the whole pipeline, not just exist.
+
+        Asserting the budget's arithmetic proves nothing: the split only consulted it
+        when the text was already over the platform cap, and the cap fitter then
+        re-bounded every chunk to the full cap and handed the reserve back. A
+        cap-length segment with an open seam then reached the client at cap plus the
+        tag, and the client silently sliced the tail off -- including a synthetic
+        fence closer.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: DISCORD_MAX_TEXT)
+
+        # A frozen message whose tail is the key's first half.
+        r._buf = [f"first message {self._HEAD_HALF}"]
+        await r._seal_current()
+        r._open_new_message()
+
+        # Lengths spanning the band the traced path named -- just under the seam
+        # budget, inside 1979-2000 which a cap-based split threshold does not reach, at
+        # the cap, and past it -- each OPENING the seam so the grade fires and
+        # prepends its tag. The property under test is the outcome: nothing the
+        # client receives may exceed the cap, because it slices the excess off
+        # silently and the dropped tail can be a synthetic fence closer.
+        for length in (1900, 1979, 1990, DISCORD_MAX_TEXT, DISCORD_MAX_TEXT + 500):
+            cli.sent.clear()
+            r._landed_text = ""
+            r._frozen_above = f"first message {self._HEAD_HALF}"
+            r._buf = []
+            r._delivery_text = self._TAIL_HALF + ("x" * (length - len(self._TAIL_HALF)))
+            await r._seal_current()
+
+            payloads = [t for t, _ in cli.sent]
+            assert payloads, f"len={length}: nothing was sent"
+            assert any(
+                CREDENTIAL_SEAM_TAG in t for t in payloads
+            ), f"len={length}: precondition, the seam did not open"
+            for payload in payloads:
+                assert len(payload) <= DISCORD_MAX_TEXT, (length, len(payload))
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_send_after_a_failed_edit_is_graded_against_the_live_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed edit does not remove the bubble, so the send lands UNDER it.
+
+        The client reports any API failure falsily -- a chat out of edit budget, not
+        only a message that is really gone -- so the live frame is still on screen
+        and it, not the message above it, is what the fresh send has to be safe
+        beside.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+
+        # A live frame ending with the key's first half, confirmed on screen.
+        r._buf = [f"live frame {self._HEAD_HALF}"]
+        await r._stream_live(force=True)
+        assert r._landed_text == f"live frame {self._HEAD_HALF}", r._landed_text
+        assert r._stream_mid is not None, "precondition: a bubble streamed"
+        # Nothing is frozen above it, so grading against the frozen text alone would
+        # withhold nothing at all.
+        assert r._frozen_above == "", r._frozen_above
+
+        # The seal's edit is refused, so it falls through to a fresh send that lands
+        # under the frame above.
+        cli.edit_ok = False
+        r._buf = []
+        r._delivery_text = f"{self._TAIL_HALF} and the rest"
+        await r._seal_current()
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        assert not joins_to_a_credential(
+            screen[0], screen[1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[0]!r} and {screen[1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_recovery_chunk_is_graded_against_the_live_frame_it_lands_under(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The recovery's sends land under whatever the failed seal left on screen.
+
+        When a live frame landed and the seal's upload then failed, the frame is
+        still the bottom message, so it -- not the message above it -- is what each
+        recovery chunk has to be safe beside.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+
+        # A live frame ending with the key's first half, confirmed on screen, with
+        # nothing frozen above it -- so grading against the frozen text alone would
+        # withhold nothing.
+        r._buf = [f"live frame {self._HEAD_HALF}"]
+        await r._stream_live(force=True)
+        assert r._landed_text == f"live frame {self._HEAD_HALF}", r._landed_text
+        assert r._frozen_above == "", r._frozen_above
+
+        # The seal's multipart upload fails, so the recovery re-posts the markup.
+        cli.fail_uploads = True
+        monkeypatch.setattr(r, "_uploads_enabled", lambda: True)
+
+        async def _extract(source: str) -> tuple[str, list[Any]]:
+            return "extraction stripped the markup", [object()]
+
+        monkeypatch.setattr(r, "_extract_uploads", _extract)
+        r._buf = []
+        r._delivery_text = f"{self._TAIL_HALF} and the rest"
+        await r._seal_current()
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert not joins_to_a_credential(
+            screen[0], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[0]!r} and {screen[-1]!r}"
+        # And the recovery counts what it withheld, so the turn's notice reports it.
+        assert CREDENTIAL_SEAM_TAG in screen[-1], "precondition: the seam opened"
+        assert r._redacted_creds > 0, r._redacted_creds
+
+    @pytest.mark.asyncio
+    async def test_a_chunk_after_a_wholly_failed_one_is_graded_against_the_live_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Chunk 0 failing BOTH its edit and its send is the case a loop grade misses.
+
+        After chunk 0 there is no live message left to edit, so chunk 1 is a fresh
+        send -- and because chunk 0 landed nothing, the frame still on screen is the
+        live frame, not the message above it. A grade made in the chunk loop cannot
+        see that: it runs before either attempt and has only one prior to offer.
+        """
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+
+        # A live frame ending mid-key, confirmed on screen, with nothing frozen
+        # above it -- so grading against the frozen text alone withholds nothing.
+        r._buf = [f"live frame {self._HEAD_HALF}"]
+        await r._stream_live(force=True)
+        assert r._landed_text == f"live frame {self._HEAD_HALF}", r._landed_text
+        assert r._stream_mid is not None, "precondition: a bubble streamed"
+        assert r._frozen_above == "", r._frozen_above
+
+        # Two chunks; the second opens with the key's other half.
+        monkeypatch.setattr(
+            "kiro_crew.discord.renderer.split_markdown_safe",
+            lambda text, limit: ["chunk one is harmless", f"{self._TAIL_HALF} and the rest"],
+        )
+        monkeypatch.setattr("kiro_crew.discord.renderer.DISCORD_MAX_TEXT", 8)
+        monkeypatch.setattr("kiro_crew.discord.renderer._fit_platform_cap", lambda t, cap=None: [t])
+
+        # Chunk 0 fails its edit AND its send, so nothing it carried is on screen and
+        # `_landed_text` never advances past the live frame.
+        cli.edit_ok = False
+        original_send = cli.send_message_with_files
+        calls = {"n": 0}
+
+        async def _fail_first(channel_id: str, text: str, files: Any, **kw: Any) -> str | None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return await original_send(channel_id, text, files, **kw)
+
+        cli.send_message_with_files = _fail_first  # type: ignore[method-assign]
+        try:
+            r._buf = []
+            r._delivery_text = "unused, the split is stubbed"
+            await r._seal_current()
+        finally:
+            cli.send_message_with_files = original_send  # type: ignore[method-assign]
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert not joins_to_a_credential(
+            f"live frame {self._HEAD_HALF}", screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across the live frame and {screen[-1]!r}"
+
+    @pytest.mark.asyncio
+    async def test_a_graded_chunk_is_counted_as_a_redaction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The spec this change adds says the withheld run is counted like any other
+        # redaction, so the turn's notice tells the user something was held back. A
+        # sink that withholds without counting is a silent gap.
+        cli = FakeClient()
+        r = DiscordRenderer(cli, "chan1", DISCORD_CAPABILITIES, session_key="sk")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: 200)
+        r._buf = [f"first message {self._HEAD_HALF}"]
+        await r._seal_current()
+        r._open_new_message()
+        before = r._redacted_creds
+
+        r._buf = []
+        r._delivery_text = f"{self._TAIL_HALF} and the rest"
+        await r._seal_current()
+
+        assert CREDENTIAL_SEAM_TAG in [t for t, _ in cli.sent][-1], "precondition: seam opened"
+        assert r._redacted_creds > before, (before, r._redacted_creds)
 
 
 class TestOptionComponents:

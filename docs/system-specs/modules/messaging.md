@@ -2208,7 +2208,29 @@ answer is not permission: a raised evaluation and a `Decision` without
   readable on screen while each message alone scrubs clean. So Discord and Telegram
   remember what the current message carries, promote it when a fresh one opens, and
   re-ask `joins_to_a_credential` at each SINK — the seal and the live frame — rather
-  than trusting a grade made upstream. The failure direction is to WITHHOLD:
+  than trusting a grade made upstream. The grade sits immediately before each
+  individual SEND, not once before a split: a seal splits into chunks that each fail
+  on their own, so whichever chunk lands first under the frozen message is the one
+  whose head has to be safe beside it, and that is not always the first chunk
+  produced. Each chunk that lands becomes the frozen text for the next, and the
+  split reserves `CREDENTIAL_SEAM_TAG`'s room so a graded chunk still fits the
+  platform cap. WHICH text it is graded against depends on what the sink is about to
+  do: an in-place edit REPLACES the current message, so the text above it is the
+  message above this one, while a fresh send ADDS a message below the current one —
+  which is still on screen whenever it landed anything, because a client reports any
+  API failure falsily (a chat out of edit budget included), not only a message that
+  is really gone, and Telegram's rich replacement is sent BEFORE the bubble it
+  supersedes is deleted. So an edit grades against the frozen text and a fresh send
+  grades against this message's own landed text, falling back to the frozen text only
+  when it landed nothing. What each sink remembers is what DELIVERY
+  CONFIRMED, never what it attempted: an id-less send created no message and a
+  refused edit left the previous frame standing, so recording the attempt would
+  grade the next message beside a frame nobody received while the frame they do
+  have ends mid-key. A message that landed nothing therefore leaves the frozen text
+  alone rather than zeroing it. Every sink that withholds also TALLIES, including the
+  per-chunk sender of an overflowing degraded segment, because the turn's notice is
+  gated on that count and a sink that withholds silently is a gap. The failure
+  direction is to WITHHOLD:
   `break_credential_seam` replaces leading characters of the text below with the
   redactor's own tag until the pair shows nothing, so the channel's existing
   per-message tally counts it and the turn's notice tells the user something was held

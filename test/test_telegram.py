@@ -25,7 +25,7 @@ from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
-from kiro_crew.messaging.display_safety import joins_to_a_credential
+from kiro_crew.messaging.display_safety import CREDENTIAL_SEAM_TAG, joins_to_a_credential
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -1912,6 +1912,339 @@ class TestRenderer:
         assert not joins_to_a_credential(
             screen[-2], screen[-1], _default_redactor
         ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
+
+    def test_a_failed_finalization_leaves_the_visible_tail_as_the_frozen_text(self) -> None:
+        """A seal that never landed puts nothing on screen.
+
+        The streamed bubble keeps showing its last live frame, so THAT is what a
+        reader has above the next message. Recording the seal's own text before the
+        send would promote a phantom, and the phantom is not a superset of the
+        visible tail -- grading the next message against it is not the careful
+        direction.
+        """
+        head_half = "AKIAIOSF"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = [f"live frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._stream_mid is not None, "precondition: a bubble streamed"
+            assert r._landed_text == f"live frame {head_half}", r._landed_text
+
+            # Every edit and both sends fail, so the seal lands nothing and the
+            # bubble above still shows the live frame.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            async def _no_send(*a: Any, **kw: Any) -> None:
+                return None
+
+            r._buf = ["a finalization that never arrives"]
+            original_edit, original_send = cli.edit_message, cli.send_message
+            cli.edit_message, cli.send_message = _no_edit, _no_send  # type: ignore[method-assign]
+            try:
+                await r._seal_current()
+            finally:
+                cli.edit_message, cli.send_message = (  # type: ignore[method-assign]
+                    original_edit,
+                    original_send,
+                )
+
+        asyncio.run(_go())
+
+        assert r._landed_text == f"live frame {head_half}", r._landed_text
+        r._open_new_message()
+        assert r._frozen_above == f"live frame {head_half}", r._frozen_above
+
+    def test_a_refused_live_edit_does_not_replace_the_visible_tail(self) -> None:
+        """A live frame the API refused is on no screen.
+
+        The bubble keeps showing the last frame that DID land, so that is the text
+        the next message's seam has to be graded against. Recording the refused
+        attempt swaps the real visible tail for one nobody saw, and when the real
+        tail ends mid-key the next message completes it unchallenged.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            # Frame one lands, and its tail is the key's first half.
+            r._buf = [f"first frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._stream_mid is not None, "precondition: a bubble streamed"
+            assert r._landed_text == f"first frame {head_half}", r._landed_text
+
+            # Frame two is refused, so the bubble still holds frame one.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            original_edit = cli.edit_message
+            cli.edit_message = _no_edit  # type: ignore[method-assign]
+            try:
+                r._buf = ["a later frame the API refused"]
+                await r._stream_live(force=True)
+            finally:
+                cli.edit_message = original_edit  # type: ignore[method-assign]
+
+            assert r._landed_text == f"first frame {head_half}", r._landed_text
+
+            # So the next message is graded against what the reader can read.
+            r._open_new_message()
+            assert r._frozen_above == f"first frame {head_half}", r._frozen_above
+            r._buf = [f"{tail_half} and the rest"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) == 2, screen
+        for message in screen:
+            assert _default_redactor(message) == message, f"redacted alone: {message}"
+        assert not joins_to_a_credential(
+            screen[-2], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[-2]!r} and {screen[-1]!r}"
+
+    def test_a_live_send_that_returned_no_id_records_nothing(self) -> None:
+        head_half = "AKIAIOSF"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = [f"landed {head_half}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above == f"landed {head_half}", r._frozen_above
+
+            # No id back means no message exists, so this frame is on no screen.
+            async def _no_send(*a: Any, **kw: Any) -> None:
+                return None
+
+            original_send = cli.send_message
+            cli.send_message = _no_send  # type: ignore[method-assign]
+            try:
+                r._buf = ["a live frame that never arrived"]
+                await r._stream_live(force=True)
+            finally:
+                cli.send_message = original_send  # type: ignore[method-assign]
+
+            assert r._stream_mid is None, r._stream_mid
+            assert r._landed_text == "", r._landed_text
+
+        asyncio.run(_go())
+
+        r._open_new_message()
+        assert r._frozen_above == f"landed {head_half}", r._frozen_above
+
+    def test_each_shipped_chunk_is_graded_against_what_is_frozen_above_it(self) -> None:
+        """An overflowing degraded segment ships leading chunks itself.
+
+        The caller grades the whole segment once, which only fixes the head of the
+        first chunk. Every chunk it ships is its own message, so each one has to be
+        graded immediately before its own send.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            # A frozen message whose tail is the key's first half.
+            r._buf = [f"first message {head_half}"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above == f"first message {head_half}", r._frozen_above
+
+            # The SHIPPED chunk opens with the key's other half, so it is the one
+            # that has to be withheld against the frozen message.
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"{tail_half} opens the shipped chunk",
+                "the tail chunk is harmless prose",
+            ]
+            # Force the degraded path: both rendered forms must exceed the limit.
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+            r._buf = ["anything, the chunking is stubbed"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        for above, below in zip(screen, screen[1:]):
+            assert not joins_to_a_credential(
+                above, below, _default_redactor
+            ), f"the reader can rejoin a key across {above!r} and {below!r}"
+        # And a seam withheld on a shipped chunk is counted, so the turn's notice
+        # reports it rather than leaving a silent gap.
+        assert any(CREDENTIAL_SEAM_TAG in t for t in screen), "precondition: the seam opened"
+        assert r._redacted_creds > 0, r._redacted_creds
+
+    def test_a_fallback_send_after_a_failed_edit_is_graded_against_the_bubble(self) -> None:
+        """A refused edit does not remove the bubble, so the send lands UNDER it.
+
+        ``edit_message`` reports any API failure falsily -- a chat out of edit budget
+        included -- not only a bubble that is really gone, so the streamed frame is
+        plausibly still the bottom message and it is what the fallback send has to be
+        safe beside.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            # A live frame ending with the key's first half, confirmed on screen,
+            # with nothing frozen above it -- so grading against the frozen text
+            # alone would withhold nothing at all.
+            r._buf = [f"live frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._landed_text == f"live frame {head_half}", r._landed_text
+            assert r._frozen_above == "", r._frozen_above
+
+            # Every edit is refused, so the seal falls through to a fresh send that
+            # lands under the frame above.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            original_edit = cli.edit_message
+            cli.edit_message = _no_edit  # type: ignore[method-assign]
+            try:
+                r._buf = [f"{tail_half} and the rest"]
+                await r._seal_current()
+            finally:
+                cli.edit_message = original_edit  # type: ignore[method-assign]
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert not joins_to_a_credential(
+            screen[0], screen[-1], _default_redactor
+        ), f"the reader can rejoin a key across {screen[0]!r} and {screen[-1]!r}"
+
+    def test_a_shipped_chunk_under_a_live_frame_is_graded_against_that_frame(self) -> None:
+        """A shipped chunk placed below a surviving live frame is graded against it.
+
+        With a bubble already on screen the first shipped chunk tries an EDIT, and a
+        refused edit leaves that bubble standing -- so the send that follows lands
+        below the live frame, not below the message above it. Nothing is frozen above
+        here, so grading against the frozen text alone withholds nothing.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = [f"live frame {head_half}"]
+            await r._stream_live(force=True)
+            assert r._landed_text == f"live frame {head_half}", r._landed_text
+            assert r._stream_mid is not None, "precondition: a bubble streamed"
+            assert r._frozen_above == "", r._frozen_above
+
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"{tail_half} opens the shipped chunk",
+                "the tail chunk is harmless prose",
+            ]
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+
+            # Every edit is refused, so the bubble survives and the shipped chunk
+            # becomes a fresh send placed under it.
+            async def _no_edit(*a: Any, **kw: Any) -> bool:
+                return False
+
+            original_edit = cli.edit_message
+            cli.edit_message = _no_edit  # type: ignore[method-assign]
+            try:
+                r._buf = ["anything, the chunking is stubbed"]
+                await r._seal_current()
+            finally:
+                cli.edit_message = original_edit  # type: ignore[method-assign]
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        assert not joins_to_a_credential(
+            f"live frame {head_half}", screen[1], _default_redactor
+        ), f"the reader can rejoin a key across the live frame and {screen[1]!r}"
+
+    def test_a_middle_shipped_chunk_counts_its_own_withheld_seam(self) -> None:
+        """Only the shipped chunk is withheld here, so only its own tally can count.
+
+        The tail chunk is sealed by the caller, which tallies on its own delivery
+        branches -- so a case where the tail is withheld proves nothing about the
+        shipped ones. With three chunks and the danger between the first and the
+        second, the withholding happens on a chunk the caller never sees.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = ["first message, entirely harmless"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._redacted_creds == 0, r._redacted_creds
+
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"shipped chunk one ends {head_half}",
+                f"{tail_half} opens shipped chunk two",
+                "the tail chunk is harmless prose",
+            ]
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+            r._buf = ["anything, the chunking is stubbed"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 3, screen
+        assert any(
+            CREDENTIAL_SEAM_TAG in t for t in screen
+        ), "precondition: the seam opened on a shipped chunk"
+        assert r._redacted_creds > 0, r._redacted_creds
+        for above, below in zip(screen, screen[1:]):
+            assert not joins_to_a_credential(
+                above, below, _default_redactor
+            ), f"the reader can rejoin a key across {above!r} and {below!r}"
+
+    def test_a_shipped_chunk_becomes_the_text_the_next_one_is_graded_against(self) -> None:
+        """A chunk that landed IS what the reader has above the next one.
+
+        The frozen text here is harmless, so nothing is withheld against it. The
+        danger is entirely between the shipped chunk and the tail that follows it,
+        which is only visible if the shipped chunk became the frozen text.
+        """
+        head_half, tail_half = "AKIAIOSF", "ODNN7EXAMPLE"
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            r._buf = ["first message, entirely harmless"]
+            await r._seal_current()
+            r._open_new_message()
+            assert r._frozen_above == "first message, entirely harmless", r._frozen_above
+
+            # The shipped chunk ENDS mid-key and the tail opens with the other half.
+            r._degraded_table_chunks = lambda text: [  # type: ignore[method-assign]
+                f"the shipped chunk ends {head_half}",
+                f"{tail_half} opens the tail chunk",
+            ]
+            r._rendered_limit = lambda: 1  # type: ignore[method-assign]
+            r._buf = ["anything, the chunking is stubbed"]
+            await r._seal_current()
+
+        asyncio.run(_go())
+
+        screen = [t for t, _ in cli.sent]
+        assert len(screen) >= 2, screen
+        for above, below in zip(screen, screen[1:]):
+            assert not joins_to_a_credential(
+                above, below, _default_redactor
+            ), f"the reader can rejoin a key across {above!r} and {below!r}"
+        # And a seam withheld on a shipped chunk is counted, so the turn's notice
+        # reports it rather than leaving a silent gap.
+        assert any(CREDENTIAL_SEAM_TAG in t for t in screen), "precondition: the seam opened"
+        assert r._redacted_creds > 0, r._redacted_creds
 
     def test_streaming_strips_options_and_renders_keyboard(self) -> None:
         cli = self._drive(

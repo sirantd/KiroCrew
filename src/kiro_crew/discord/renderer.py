@@ -68,7 +68,11 @@ from kiro_crew.discord.client import (
     DISCORD_MAX_TOTAL_UPLOAD_BYTES,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import break_credential_seam, redact_for_display
+from kiro_crew.messaging.display_safety import (
+    CREDENTIAL_SEAM_TAG,
+    break_credential_seam,
+    redact_for_display,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -130,6 +134,19 @@ def _redact_transformed(text: str) -> str:
 def _break_seam(prior: str, text: str) -> tuple[str, bool]:
     """Withhold what a reader could rejoin with the message above *text*."""
     return break_credential_seam(prior, text, _redact_all)
+
+
+def _seam_split_budget() -> int:
+    """Chunk budget that still fits the platform cap after a seam is broken.
+
+    ``break_credential_seam`` prepends :data:`CREDENTIAL_SEAM_TAG` and drops
+    leading characters, so the piece it returns is at most the tag longer than the
+    piece it was given. The seam is graded per chunk, AFTER the split, because the
+    chunk that lands first under the frozen message is not always the first chunk
+    produced -- so the split has to leave the tag's room or a graded chunk could
+    cross the cap and be truncated by the client.
+    """
+    return DISCORD_MAX_TEXT - len(CREDENTIAL_SEAM_TAG)
 
 
 # Discord's typing indicator lasts ~10s per trigger; refresh just under that
@@ -364,7 +381,7 @@ def build_model_components(choices: Sequence[tuple[str, str]], current: str) -> 
     return rows
 
 
-def _fit_platform_cap(text: str) -> list[str]:
+def _fit_platform_cap(text: str, cap: int = DISCORD_MAX_TEXT) -> list[str]:
     """Slice *text* into payloads Discord's message API will accept whole.
 
     ``split_markdown_safe`` budgets every chunk against :meth:`_limit`, with one
@@ -384,7 +401,7 @@ def _fit_platform_cap(text: str) -> list[str]:
     render badly, where truncation keeps neither. Nothing here re-derives fence
     grammar — the splitter owns that, and this only bounds what reaches the API.
     """
-    return chunk_text(text, DISCORD_MAX_TEXT) or [text]
+    return chunk_text(text, cap) or [text]
 
 
 class DiscordApprovalDecider:
@@ -857,11 +874,29 @@ class DiscordRenderer(Renderer):
 
     def _open_new_message(self) -> None:
         """Next render creates a fresh message instead of editing the old one."""
-        # Whatever this message last carried is now frozen above the next one, so
-        # it becomes the text the next send has to be safe beside.
-        self._frozen_above, self._landed_text = self._landed_text, ""
+        # Whatever this message landed is now frozen above the next one, so it
+        # becomes the text the next send has to be safe beside. A message that
+        # landed NOTHING leaves the frozen text alone: the message a reader sees
+        # above the next one is then the last one that did land, and zeroing it
+        # here would grade the next send against nothing at all.
+        if self._landed_text:
+            self._frozen_above = self._landed_text
+        self._landed_text = ""
         self._stream_mid = None
         self._shown = ""
+
+    def _prior_above_a_fresh_send(self) -> str:
+        """What sits immediately above a message this renderer is about to SEND.
+
+        An in-place edit REPLACES the current message, so the text above it is the
+        message above this one. A fresh send ADDS a message below the current one,
+        and that one is still on screen whenever it landed anything: an edit that
+        failed did not remove it, because the client reports ANY API failure as a
+        falsy result -- a rate-limited chat included -- not only a message that is
+        really gone. So the text directly above a fresh send is this message's own
+        landed text, and the frozen text only when this message landed nothing.
+        """
+        return self._landed_text or self._frozen_above
 
     def _segment_text(self) -> str:
         """Current outbound text, with protocol removed only from canonical source.
@@ -925,13 +960,19 @@ class DiscordRenderer(Renderer):
             return
         self._last_edit = now
         self._shown = text
-        self._landed_text = text
+        # Recorded only where delivery is confirmed. ``_open_new_message`` promotes
+        # this to the text the next message's seam is graded against, so it has to
+        # be text a reader received: an id-less send created no message, and a
+        # refused edit left the previous frame on screen. Recording the attempt
+        # would grade the next send beside a frame nobody has, and the frame they
+        # DO have could end mid-credential.
         if self._stream_mid is None:
             mid = await self._client.send_message(self._channel_id, text)
             if mid is not None:
                 self._stream_mid = mid
-        else:
-            await self._client.edit_message(self._channel_id, self._stream_mid, text)
+                self._landed_text = text
+        elif await self._client.edit_message(self._channel_id, self._stream_mid, text):
+            self._landed_text = text
 
     def authorize_upload_root(self, root: str) -> None:
         """Authorize the provider's resolved cwd; invalid roots disable uploads."""
@@ -1023,19 +1064,33 @@ class DiscordRenderer(Renderer):
         files: list[OutboundFile],
         components: list[dict] | None,
     ) -> bool:
-        """Edit first, then send; fail softly so recovery can restore markup."""
+        """Edit first, then send; fail softly so recovery can restore markup.
+
+        This is the ONE place a sealed payload's seam is graded, because it is the
+        only place that knows which operation is about to happen. An edit REPLACES
+        this message, so the text above it is the message above this one. A send
+        ADDS a message below whatever is visible, which is this message's own
+        landed text when it landed anything. Grading in the caller's chunk loop
+        cannot tell the two apart: after the first chunk there is no live message
+        left to edit, so every later chunk is a send placed under the frame the
+        failed one left standing.
+        """
         self._seals_attempted += 1
         try:
             if self._stream_mid is not None:
+                edited, _ = _break_seam(self._frozen_above, text)
                 if await self._client.edit_message_with_files(
-                    self._channel_id, self._stream_mid, text, files, components=components
+                    self._channel_id, self._stream_mid, edited, files, components=components
                 ):
                     self._seals_landed += 1
-                    self._landed_text = text
-                    self._tally_redactions(text)
+                    self._landed_text = edited
+                    self._tally_redactions(edited)
                     return True
-                # A missing live message falls through to a fresh send.
+                # A missing live message falls through to a fresh send. But "the
+                # edit failed" is not "the message is gone": the client reports any
+                # API failure falsily, so the frame is plausibly still on screen.
                 self._stream_mid = None
+            text, _ = _break_seam(self._prior_above_a_fresh_send(), text)
             landed = (
                 await self._client.send_message_with_files(
                     self._channel_id, text, files, components=components
@@ -1099,19 +1154,23 @@ class DiscordRenderer(Renderer):
             if components is None:
                 return
             text = "…"
-        # The message above is frozen and this text may have been rewritten since
-        # any cut was graded (a presentation snapshot, an options expansion, a
-        # footer), so the pair is re-asked here rather than trusted. Ahead of the
-        # cap split below, which then sizes what actually goes out. The withheld
-        # run is replaced by the redactor's own tag, so `_tally_redactions` counts
-        # it on landing and the turn's notice reports it like any other redaction.
-        text, _ = _break_seam(self._frozen_above, text)
-
+        # Sized against the SEAM budget, not the platform cap, and unconditionally:
+        # the grade below prepends a tag, so a segment that is merely close to the
+        # cap has to reserve its room too. `_fit_platform_cap` is bounded by the
+        # same budget, or it would re-cap each chunk to the full 2000 and hand the
+        # reserve straight back.
         chunks = [text]
-        if len(text) > DISCORD_MAX_TEXT:
-            chunks = await asyncio.to_thread(split_markdown_safe, text, DISCORD_MAX_TEXT)
-        chunks = [part for chunk in chunks for part in _fit_platform_cap(chunk)]
+        if len(text) > _seam_split_budget():
+            chunks = await asyncio.to_thread(split_markdown_safe, text, _seam_split_budget())
+        chunks = [
+            part for chunk in chunks for part in _fit_platform_cap(chunk, _seam_split_budget())
+        ]
         for index, chunk in enumerate(chunks):
+            # The seam is graded inside `_land_sealed`, which is the only place
+            # that knows whether this chunk is about to REPLACE the live message or
+            # be placed below it -- and after the first chunk it is always the
+            # latter. The split above reserves the tag's room so the grade cannot
+            # push a chunk past the platform cap.
             part_files = files if index == 0 else []
             final = index == len(chunks) - 1
             if not await self._land_sealed(chunk, part_files, components if final else None):
@@ -1132,24 +1191,43 @@ class DiscordRenderer(Renderer):
         )
         try:
             source = _redact_transformed(source)
-            # This recovery restores the markup the extraction cut, so it is a
-            # THIRD form of the same segment and the message above it has not
-            # moved -- re-asked here as well, or the sink's guarantee holds only
-            # for the payload that failed to upload.
-            source, _ = _break_seam(self._frozen_above, source)
             recovery = [source]
-            if len(source) > DISCORD_MAX_TEXT:
-                recovery = await asyncio.to_thread(split_markdown_safe, source, DISCORD_MAX_TEXT)
-            recovery = [part for chunk in recovery for part in _fit_platform_cap(chunk)]
+            if len(source) > _seam_split_budget():
+                recovery = await asyncio.to_thread(
+                    split_markdown_safe, source, _seam_split_budget()
+                )
+            recovery = [
+                part
+                for chunk in recovery
+                for part in _fit_platform_cap(chunk, _seam_split_budget())
+            ]
             landed_any = False
             for index, chunk in enumerate(recovery):
+                # This recovery restores the markup the extraction cut, so it is a
+                # THIRD form of the same segment and the message above it has not
+                # moved. Re-asked per chunk and immediately before that chunk's own
+                # send, for the same reason as the seal loop: the chunk that lands
+                # first under the frozen message is the one whose head has to be
+                # safe beside it, and a failed earlier chunk changes which one that
+                # is.
+                # Every recovery chunk is a FRESH send, and the seal that failed may
+                # have left the live frame on screen, so the text directly above
+                # this chunk is that frame rather than the message above it.
+                chunk, _ = _break_seam(self._prior_above_a_fresh_send(), chunk)
                 if await self._client.send_message(
                     self._channel_id,
                     chunk,
                     components=components if index == len(recovery) - 1 else None,
                 ):
                     landed_any = True
+                    # This chunk IS on screen, so it is what the next message has
+                    # to be safe beside. The failed seal above took the break
+                    # before `_land_sealed` could record anything, so without this
+                    # the next send is graded against a message the reader never
+                    # got -- or, right after a rotation, against nothing.
+                    self._landed_text = chunk
                     self._tally_redactions(chunk)
+                    self._open_new_message()
             if landed_any:
                 # This recovery IS a delivery, so it has to answer to
                 # `delivery_failed`. Only the LANDED count moves: the seal that
