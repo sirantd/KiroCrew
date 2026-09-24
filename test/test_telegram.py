@@ -27,7 +27,11 @@ from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
-from kiro_crew.messaging.display_safety import canonicalize_display
+from kiro_crew.messaging.display_safety import (
+    canonicalize_display,
+    joins_to_a_credential,
+    safe_split_offset,
+)
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -70,6 +74,7 @@ from kiro_crew.telegram.commands import (
 from kiro_crew.telegram.renderer import (
     TelegramApprovalDecider,
     TelegramRenderer,
+    _delivered_form,
     _extract_options,
     _has_table,
     _may_exceed_rendered,
@@ -5919,6 +5924,81 @@ class TestRotationSeamCredentialSafety:
         asyncio.run(r._rotate_on_length())
         assert cli.sent, "an innocent body was withheld"
 
+    def test_a_live_frame_is_graded_against_the_message_above_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Streaming frames are on screen too, for the whole turn.
+
+        Every throttled frame is sent or edited live under a message that is already
+        closed. A frame grows at its end, so the growth can complete a key whose head
+        sits at the end of that closed message, while the frame on its own reads clean
+        the entire time.
+        """
+        r, cli = self._renderer(monkeypatch)
+        r._delivered_closed = "the note above ends AKIAIOSF"
+        r._buf = ["ODNN7EXAMPLE and the answer goes on"]
+
+        asyncio.run(r._stream_live_locked(force=True))
+
+        assert cli.sent, "fixture did not put a frame on screen"
+        self._assert_no_key_on_screen([r._delivered_closed, *[t for t, _kb in cli.sent]])
+
+    def test_a_delivered_rich_message_becomes_the_predecessor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A table-bearing segment is on screen like any other, so it must be recorded.
+
+        The rich path is the ordinary case for a reply containing a table. Leaving it
+        unrecorded means the NEXT segment is graded against the message before the
+        table -- text that sits further up the screen, not beside it -- so a key
+        straddling the real boundary is never seen.
+        """
+        r, cli = self._renderer(monkeypatch)
+        text = "| col |\n| --- |\n| val |\n\nthe tail ends AKIAIOSF"
+
+        asyncio.run(r._seal_text(text, None))
+
+        assert cli.rich_sent, "fixture did not take the rich path"
+        assert r._last_landed, "a delivered rich message left no predecessor"
+        r._open_new_message()
+        assert r._delivered_closed == r._last_landed
+
+    def test_a_degraded_chunk_becomes_the_predecessor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An over-cap segment ships as several messages; each one is on screen.
+
+        ``_seal_chunk_html`` delivers every chunk but the last, and the caller seals
+        the tail. Recording nothing here leaves the tail graded against the message
+        before the whole segment rather than against the chunk actually above it.
+        """
+        r, _cli = self._renderer(monkeypatch)
+        chunk = "a chunk whose tail ends AKIAIOSF"
+
+        asyncio.run(r._seal_chunk_html(chunk))
+
+        assert r._last_landed == chunk, "a delivered chunk left no predecessor"
+        assert r._delivered_closed == chunk, "the chunk is beyond editing the moment it lands"
+
+    def test_a_reasoning_post_is_graded_and_becomes_the_predecessor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reasoning preview is a message, so both directions apply to it.
+
+        It is graded against whatever is already closed above it, and once it lands the
+        next segment is graded against it rather than against the message further up.
+        """
+        r, cli = self._renderer(monkeypatch)
+        r._delivered_closed = "the note above ends AKIAIOSF"
+        r._thinking = ["ODNN7EXAMPLE is the reasoning tail"]
+
+        asyncio.run(r._post_thinking())
+
+        assert cli.sent, "fixture did not post a reasoning message"
+        self._assert_no_key_on_screen([r._delivered_closed, *[t for t, _kb in cli.sent]])
+        assert r._last_landed, "a delivered reasoning post left no predecessor"
+        assert r._delivered_closed == r._last_landed
+
     def test_no_safe_offset_withholds_the_text_instead_of_sending_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -5987,6 +6067,41 @@ class TestRotationSeamCredentialSafety:
         frames = [text for text, _kb in cli.sent]
         assert len(frames) >= 2, f"fixture did not rotate into separate bubbles: {len(frames)}"
         self._assert_no_key_on_screen(frames)
+
+    def test_the_fallback_offset_is_one_the_caller_can_take(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The search must grade the DELIVERED form, or the segment deadlocks.
+
+        Graded raw, the budget offset looks safe here -- a newline and an indent sit
+        between the halves and no credential pattern tolerates whitespace -- so the
+        exponential back-off never runs and the first sample is returned. A caller
+        that then re-graded in delivered form would reject it, and because the search
+        is deterministic it would get the same answer on every later rotation: the
+        segment would never go out at all.
+        """
+        raw = "a" * (self._CAP - 8) + "AKIAIOSF" + "\n    ODNN7EXAMPLE" + " tail" * 40
+        raw_offset = safe_split_offset(raw, self._CAP, _default_redactor)
+        assert not joins_to_a_credential(
+            raw[:raw_offset], raw[raw_offset:], _default_redactor
+        ), "fixture no longer exercises the raw-vs-delivered gap"
+        assert joins_to_a_credential(
+            _delivered_form(raw[:raw_offset]),
+            _delivered_form(raw[raw_offset:]),
+            _default_redactor,
+        ), "fixture no longer exercises the raw-vs-delivered gap"
+
+        shown = safe_split_offset(raw, self._CAP, _default_redactor, _delivered_form)
+        assert shown, "the delivered-form search withheld instead of stepping back"
+        assert shown != raw_offset, "the delivered-form search returned the raw answer"
+        assert not joins_to_a_credential(
+            _delivered_form(raw[:shown]), _delivered_form(raw[shown:]), _default_redactor
+        ), "the offset the search returned still severs a key once delivered"
+
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [raw]
+        asyncio.run(r._rotate_on_length())
+        assert cli.sent, "the rotation withheld on an offset it could have taken"
 
     def test_a_markup_span_covering_a_whole_piece_is_caught(
         self, monkeypatch: pytest.MonkeyPatch

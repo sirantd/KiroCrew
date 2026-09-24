@@ -1323,26 +1323,31 @@ class TelegramRenderer(Renderer):
             # inflation actually observed and look again, which is the same loop the
             # splitter itself runs -- a safe cut that fits is worth more than giving
             # up on the rotation, since a deferral holds the whole buffer.
-            budget, head = limit, ""
+            # The search grades the DELIVERED form of both sides, so the offset it
+            # returns is one this caller can take. Grading raw here and re-checking
+            # afterwards would deadlock the segment: the search is deterministic, so a
+            # rejected answer is the same answer every rotation and nothing ever goes
+            # out. Off the loop for the cost reason the redaction above carries -- each
+            # sampled offset is two full-buffer redaction passes.
+            budget, head, offset = limit, "", 0
             while True:
-                offset = safe_split_offset(raw, budget, _default_redactor)
+                offset = await asyncio.to_thread(
+                    safe_split_offset, raw, budget, _default_redactor, _delivered_form
+                )
                 head = raw[:offset]
-                worst = _rendered_len(head)
+                worst = await asyncio.to_thread(_rendered_len, head)
                 if not offset or worst <= rendered_cap:
                     break
                 if budget <= _MIN_SPLIT_LIMIT:
                     offset = 0
                     break
                 budget = _shrunk_limit(budget, rendered_cap, worst)
-            slices = [head, raw[offset:]]
-            if not offset or await asyncio.to_thread(
-                severs_a_credential, [_delivered_form(p) for p in slices], _default_redactor
-            ):
+            if not offset:
                 # Deliver NOTHING: the withheld text rides the next rotation, and the
                 # final seal re-splits and seals an over-cap segment chunk by chunk.
                 self._buf = [raw + protocol_suffix]
                 return
-            chunks = slices
+            chunks = [head, raw[offset:]]
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
@@ -1436,6 +1441,15 @@ class TelegramRenderer(Renderer):
         # A control-tag line still arriving is held off the frame the same way.
         seg = strip_control_comments(seg, hide_partial=True)
         body = await self._safe_body(seg)
+        # Graded against the message above, which is beyond editing, and not only on
+        # its own: a frame carries the live tail, and a tail is what grows into a key
+        # whose head sits at the end of the closed message. Each frame reads clean by
+        # itself while the screen shows one intact credential across the two. The
+        # frame is the side still in hand. Outside the cache above, because the answer
+        # depends on the predecessor rather than on this segment alone.
+        body = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, body, _default_redactor
+        )
         stall = self._stall_mark()
         # The tool footer wins: it names what is happening, which is strictly
         # more informative than "nothing has happened".
@@ -1737,7 +1751,6 @@ class TelegramRenderer(Renderer):
         text = await asyncio.to_thread(
             redact_across_delivery, self._delivered_closed, text, _default_redactor
         )
-        self._last_landed = text
         if footer:
             # A quoted line under the answer rather than a separate message: the
             # footer is metadata about the turn, and a second bubble for it would
@@ -1772,6 +1785,9 @@ class TelegramRenderer(Renderer):
                     )
                     if mid is not None:
                         self._tally_redactions(text)
+                        # A rich bubble is on screen exactly like an HTML one, so it
+                        # becomes the predecessor the next segment is graded against.
+                        self._last_landed = text
                         if self._stream_mid is not None:
                             # The rich message now carries this segment; drop the
                             # superseded plaintext bubble so the user sees one message.
@@ -1811,6 +1827,10 @@ class TelegramRenderer(Renderer):
                         )
                     if ok:
                         self._tally_redactions(text)
+                        # Recorded only where delivery is CONFIRMED: this text becomes
+                        # the predecessor the next segment is graded against, and a
+                        # send that failed is not on anyone's screen.
+                        self._last_landed = text
                         return
                     # Both edits failed — the live message is gone (e.g. the user
                     # deleted it mid-turn). Fall through and SEND the final content so
@@ -1834,6 +1854,7 @@ class TelegramRenderer(Renderer):
                     )
                 if mid is not None:
                     self._tally_redactions(text)
+                    self._last_landed = text
 
             finally:
                 # Retire the live message: this segment is final, so nothing
@@ -1925,8 +1946,22 @@ class TelegramRenderer(Renderer):
         # One message. Reasoning is unbounded and is not the answer, so a
         # tag-safe truncation beats a burst of continuation bubbles.
         inner = html.escape(safe)[: self._thinking_budget()]
+        # A reasoning post is a message on screen like any other, so it is graded
+        # against the message above it and, once it lands, becomes the message the
+        # next segment is graded against. Graded on the DELIVERED form and after the
+        # budget cut, because that is the text the reader ends up with and its tail is
+        # what the answer joins onto.
+        shown = html.unescape(inner)
+        graded = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, shown, _default_redactor
+        )
+        if graded != shown:
+            inner = html.escape(graded)[: self._thinking_budget()]
+            shown = html.unescape(inner)
+        if not shown:
+            return
         try:
-            await self._client.send_message(
+            mid = await self._client.send_message(
                 self._chat_id,
                 f"<blockquote expandable>💭 {inner}</blockquote>",
                 parse_mode="HTML",
@@ -1935,6 +1970,9 @@ class TelegramRenderer(Renderer):
                 disable_notification=True,
             )
             self._tally_redactions(inner)
+            if mid is not None:
+                self._last_landed = shown
+                self._delivered_closed = shown
         except Exception:
             logger.debug("Telegram: thinking post failed", exc_info=True)
 
@@ -2184,31 +2222,46 @@ class TelegramRenderer(Renderer):
         so it must carry the earliest content or the reply reads out of order);
         later chunks are fresh sends. Mirrors the tail seal's degradation
         ladder: HTML edit -> plaintext edit, or HTML send -> plaintext send.
+
+        Each chunk lands as its own message, so it is graded against the one above it
+        and, once delivered, becomes the message the next chunk and the tail seal are
+        graded against. A chunk sealed here can never be edited again -- the live id is
+        released and every later chunk is a fresh send -- so it is beyond editing the
+        moment it lands.
         """
+        chunk = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, chunk, _default_redactor
+        )
         html_text = _seal_table_fallback(chunk)
         if len(html_text) > self._rendered_limit():
             html_text = _md_to_telegram_html(chunk)
+        landed = False
         if self._stream_mid is not None:
             mid = self._stream_mid
             self._stream_mid = None
-            ok = await self._client.edit_message(
-                self._chat_id, mid, html_text, parse_mode="HTML", retry_plain=False
+            landed = bool(
+                await self._client.edit_message(
+                    self._chat_id, mid, html_text, parse_mode="HTML", retry_plain=False
+                )
             )
-            if ok:
-                return
-            if await self._client.edit_message(self._chat_id, mid, _strip_md(chunk)):
-                return
-        mid2 = await self._client.send_message(
-            self._chat_id,
-            html_text,
-            parse_mode="HTML",
-            retry_plain=False,
-            message_thread_id=self._thread_id,
-        )
-        if mid2 is None:
-            await self._client.send_message(
-                self._chat_id, _strip_md(chunk), message_thread_id=self._thread_id
+            if not landed:  # malformed HTML -> clean plaintext, never raw tags
+                landed = bool(await self._client.edit_message(self._chat_id, mid, _strip_md(chunk)))
+        if not landed:
+            mid2 = await self._client.send_message(
+                self._chat_id,
+                html_text,
+                parse_mode="HTML",
+                retry_plain=False,
+                message_thread_id=self._thread_id,
             )
+            if mid2 is None:
+                mid2 = await self._client.send_message(
+                    self._chat_id, _strip_md(chunk), message_thread_id=self._thread_id
+                )
+            landed = mid2 is not None
+        if landed:
+            self._last_landed = chunk
+            self._delivered_closed = chunk
 
     def _chip_for_seal(self, i: int) -> str | None:
         """The steer chip (a "> quote" blockquote of the USER's own words) that

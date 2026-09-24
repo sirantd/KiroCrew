@@ -818,13 +818,12 @@ class DiscordRenderer(Renderer):
             # A presentation snapshot is delivered verbatim, so the chunks ARE what
             # the reader gets.
             if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor):
-                offset = safe_split_offset(candidate, limit, _default_redactor)
-                slices = [candidate[:offset], candidate[offset:]]
-                if not offset or await asyncio.to_thread(
-                    severs_a_credential, slices, _default_redactor
-                ):
+                offset = await asyncio.to_thread(
+                    safe_split_offset, candidate, limit, _default_redactor
+                )
+                if not offset:
                     return
-                chunks = slices
+                chunks = [candidate[:offset], candidate[offset:]]
             for chunk in chunks[:-1]:
                 self._buf = []
                 self._delivery_text = chunk
@@ -870,20 +869,21 @@ class DiscordRenderer(Renderer):
             # The head and the retained remainder are SOURCE slices: splitter output
             # does not concatenate back to its input (a chunk is rstripped, a fence
             # is closed and reopened), so rejoining chunks would hand the user text
-            # the model never wrote.
-            offset = safe_split_offset(split_source, limit, _default_redactor)
-            head = split_source[:offset]
-            rest = split_source[offset:] + raw[len(split_source) :]
-            regraded = [_strip_steering(head), _strip_steering(rest)]
-            if not offset or await asyncio.to_thread(
-                severs_a_credential, regraded, _default_redactor
-            ):
+            # the model never wrote. The search grades the DELIVERED form, so its
+            # answer is one this caller can take -- grading raw and re-checking after
+            # would deadlock the segment, since a deterministic search returns the
+            # same rejected answer every rotation.
+            offset = await asyncio.to_thread(
+                safe_split_offset, split_source, limit, _default_redactor, _strip_steering
+            )
+            if not offset:
                 # Deliver NOTHING: withheld text rides the next rotation, and the
                 # final seal redacts the whole segment as one string.
                 self._buf = [raw + protocol_suffix]
                 self._delivery_text = None
                 return
-            sealed, tail = [head], rest
+            sealed = [split_source[:offset]]
+            tail = split_source[offset:] + raw[len(split_source) :]
         for ch in sealed:
             self._buf = [ch]
             self._delivery_text = None
@@ -951,6 +951,16 @@ class DiscordRenderer(Renderer):
         # ``TurnDriver`` applies — and the display pass exists precisely for the
         # credential that is invisible until Discord renders the markdown away.
         body = _redact_transformed(body)
+        # The message ABOVE this frame is beyond editing, so the frame is graded
+        # against it as well as on its own. A frame carries the live tail, and a tail
+        # is what grows into a key whose head sits at the end of the closed message:
+        # each frame alone reads clean while the reader sees one intact credential
+        # down the screen for the whole streaming window. The frame is the side still
+        # in hand, so it is the side that gives characters up. Off the loop for the
+        # same reason as the redaction above.
+        body = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, body, _default_redactor
+        )
         footer = f"-# 🔧 {self._tool}…" if self._tool else ""
         if footer:
             room = self._limit() - len(footer) - 2
@@ -1173,6 +1183,13 @@ class DiscordRenderer(Renderer):
             recovery = [part for chunk in recovery for part in _fit_platform_cap(chunk)]
             landed_any = False
             for index, chunk in enumerate(recovery):
+                # A recovery send IS a delivery, so it is graded against the message
+                # above it and becomes the predecessor for the next one, exactly as
+                # `_land_sealed` does. Skipping it here would leave an on-screen
+                # message that no later seam is ever graded against.
+                chunk = await asyncio.to_thread(
+                    redact_across_delivery, self._delivered_closed, chunk, _default_redactor
+                )
                 if await self._client.send_message(
                     self._channel_id,
                     chunk,
@@ -1180,6 +1197,8 @@ class DiscordRenderer(Renderer):
                 ):
                     landed_any = True
                     self._tally_redactions(chunk)
+                    self._last_landed = chunk
+                    self._delivered_closed = chunk
             if landed_any:
                 # This recovery IS a delivery, so it has to answer to
                 # `delivery_failed`. Only the LANDED count moves: the seal that
@@ -1223,9 +1242,25 @@ class DiscordRenderer(Renderer):
         body = _redact_transformed(reasoning)
         if len(body) > _THINKING_PREVIEW_CHARS:
             body = body[:_THINKING_PREVIEW_CHARS].rstrip() + "…"
+        # A reasoning post is a message on screen like any other, so it is graded
+        # against the message above it and, once it lands, becomes the message the
+        # answer below is graded against. It lands on the FIRST chunk, so the answer's
+        # opening message sits flush under it with no scaffold between them.
+        #
+        # Graded AFTER the preview cut, because the cut decides the tail the answer
+        # joins onto, and with the decoration read as absent: a marker that separates
+        # the two on screen can only make the grade fire less often.
+        body = await asyncio.to_thread(
+            redact_across_delivery, self._delivered_closed, body, _default_redactor
+        )
+        if not body:
+            return
         try:
-            await self._client.send_message(self._channel_id, _as_subtext(f"💭 {body}"))
+            mid = await self._client.send_message(self._channel_id, _as_subtext(f"💭 {body}"))
             self._tally_redactions(body)
+            if mid is not None:
+                self._last_landed = body
+                self._delivered_closed = body
         except Exception:
             logger.debug("discord: thinking note send failed", exc_info=True)
 

@@ -55,6 +55,12 @@ _EMPHASIS_RUN = re.compile(r"(?:[*_~`]|\|\|)+")
 _MD_LINK = re.compile(r"\[([^\[\]\n]*)\]\(([^()\n]*)\)")
 _SLACK_LINK = re.compile(r"<([^<>|\n]*)\|([^<>\n]*)>")
 
+#: One run of whitespace -- the granularity at which a credential completion is cut
+#: off the front of a pending message. A credential never straddles a space, so a
+#: whole word is the smallest unit that removes a completion OUTRIGHT rather than
+#: trimming it until a pattern stops matching and leaving the rest readable.
+_WORD_BREAK = re.compile(r"\s+")
+
 
 def strip_ansi(text: str) -> str:
     """Remove SGR colour escapes.
@@ -169,39 +175,55 @@ def joins_to_a_credential(head: str, tail: str, redactor: Callable[[str], str]) 
     return any(redactor(reading) != reading for reading in readings)
 
 
-def safe_split_offset(text: str, limit: int, redactor: Callable[[str], str]) -> int:
+def safe_split_offset(
+    text: str,
+    limit: int,
+    redactor: Callable[[str], str],
+    present: Callable[[str], str] | None = None,
+) -> int:
     """The largest SAMPLED offset at or below *limit* that severs no credential.
 
-    Not the largest safe offset: the candidates are sampled, so a safe offset
-    between two samples is passed over. Those characters are not lost, only
-    deferred to the next delivery.
+    *present* maps a side to the form the platform will actually DELIVER, and both
+    sides go through it before grading. It has to be the caller's own, because a
+    renderer that strips steering markers, horizontal rules or surrounding whitespace
+    on the way out delivers something shorter than the raw slice: grading the raw
+    slice then accepts an offset whose delivered halves sit flush together. Worse than
+    accepting it once -- the search is deterministic, so a caller that re-grades the
+    answer in delivered form and rejects it gets the SAME answer every time and the
+    segment never goes out at all. Default is identity, for a caller that delivers
+    its text verbatim.
 
-    Used by a renderer whose message cap forces *text* into two deliveries: cut
-    here and :func:`joins_to_a_credential` is false, so the reader cannot rejoin a
-    key across the boundary.
+    Not the largest safe offset: the candidates are sampled, so a safe offset between
+    two samples is passed over. Those characters are not lost, only deferred to the
+    next delivery.
+
+    Used by a renderer whose message cap forces *text* into two deliveries: cut here
+    and :func:`joins_to_a_credential` is false of the delivered halves, so the reader
+    cannot rejoin a key across the boundary.
 
     Candidates step back EXPONENTIALLY (``limit``, then 1, 2, 4, 8 ... characters
-    before it), for a cost bound: the nearest safe boundary is not needed, only a
-    safe one, and stepping past it merely defers a few more characters to the next
+    before it), for a cost bound: the nearest safe boundary is not needed, only a safe
+    one, and stepping past it merely defers a few more characters to the next
     delivery. A linear walk would be O(*limit*) redaction passes over
     attacker-influenced text on every frame; this is O(log *limit*), and the common
-    case -- prose, where any cut is safe -- costs one pass, or none at all when
-    *text* already fits.
+    case -- prose, where any cut is safe -- costs one pass, or none at all when *text*
+    already fits.
 
-    ``0`` means every SAMPLED candidate was unsafe -- one matched region covers all
-    of them. A safe offset between two samples may still exist; the search does not
-    look for it, because the answer it needs is only "is there a safe cut I can take
-    now". Callers treat ``0`` as "deliver nothing yet", which is always available to
-    them: text withheld now is text the next delivery carries.
+    ``0`` means every SAMPLED candidate was unsafe -- one matched region covers all of
+    them. A safe offset between two samples may still exist; the search does not look
+    for it, because the answer it needs is only "is there a safe cut I can take now".
+    Callers treat ``0`` as "deliver nothing yet", which is always available to them:
+    text withheld now is text the next delivery carries.
     """
     if limit <= 0:
         return 0
     if limit >= len(text):
         # Nothing is severed, so there is no boundary to check.
         return len(text)
+    shown = present or (lambda piece: piece)
     offset, step = limit, 0
     while offset > 0:
-        if not joins_to_a_credential(text[:offset], text[offset:], redactor):
+        if not joins_to_a_credential(shown(text[:offset]), shown(text[offset:]), redactor):
             return offset
         step = 1 if step == 0 else step * 2
         offset = limit - step
@@ -273,22 +295,48 @@ def redact_across_delivery(delivered: str, pending: str, redactor: Callable[[str
 
     So the boundary is graded again at every delivery, against the message already
     on screen. When the join reveals a key, the remedy has to act on the PENDING
-    side, because that is the only side still in hand. The join is redacted as one
-    string and everything past the surviving prefix of *delivered* is what goes out:
-    the placeholder lands where the match began, so the half already shown is left
-    stranded on its own, which is not a credential.
+    side, because that is the only side still in hand.
 
-    Withholding is NOT an alternative here. The text must be delivered eventually,
+    Everything this returns is built from *pending* ALONE, and that is the whole
+    design rather than a detail. Redacting the JOIN and slicing the result at the
+    point where it stops matching *delivered* cannot work: the redaction of a join
+    may emit its canonical form, which differs from *delivered* from the first piece
+    of markup onward -- before the match, not at it -- so the slice falls at a
+    representation boundary and carries a re-rendered copy of prose the reader can
+    already see. Duplicated prose and a truncated placeholder are the two shapes
+    that produces.
+
+    Withholding is NOT an alternative either. The text must be delivered eventually,
     and a later seal redacts only its own segment -- it cannot see the half that is
     already gone -- so deferring would ship the completion untouched.
+
+    So *pending* is redacted on its own terms first. When that is still not enough,
+    the key's completion is what sits at the front of it, and leading WORDS are
+    dropped until the predicate agrees.
+
+    Words, not characters, and that is the point. A character-at-a-time cut stops at
+    the first length the pattern fails to match, which for a twenty-character key
+    means nineteen of its characters stay on screen -- safe by the regex and plainly
+    readable by a human. A credential does not straddle a space, so the completion
+    lies inside the first word; removing whole words removes it outright. The empty
+    string is always safe -- *delivered* alone is already a fixed point -- so the walk
+    terminates.
+
+    The predicate throughout is the one that fired, :func:`severs_a_credential`, and
+    that matters: :func:`redact_for_display` scans a strictly SMALLER set of readings
+    -- it has no per-piece canonical reading -- so its rewrite alone can leave a
+    match that only the wider reading sees, and a cut inside a link's target is
+    exactly such a match.
     """
     if not delivered or not severs_a_credential([delivered, pending], redactor):
         return pending
-    joined = redact_for_display(delivered + pending, redactor)[0]
-    keep, bound = 0, min(len(joined), len(delivered))
-    while keep < bound and joined[keep] == delivered[keep]:
-        keep += 1
-    return joined[keep:]
+    candidate = redact_for_display(pending, redactor)[0]
+    while candidate and severs_a_credential([delivered, candidate], redactor):
+        head = candidate.lstrip()
+        gap = len(candidate) - len(head)
+        cut = _WORD_BREAK.search(candidate, gap + 1)
+        candidate = candidate[cut.end() :] if cut else ""
+    return candidate
 
 
 def redact_for_display(text: str, redactor: Callable[[str], str]) -> tuple[str, bool]:
