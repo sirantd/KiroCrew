@@ -736,7 +736,7 @@ PR's evidence is then the same evidence you used to verify.
 Evidence is **uploaded as a GitHub attachment, never committed** — no path in the
 repository is a place for review media (why: `references/rationale.md`).
 
-- **Capture into a local scratch dir** — `$KIROCREW_SCRATCH/evidence/`, or the gitignored `temp-screenshots/<feature>/` the capture scripts already write to. Neither reaches the commit.
+- **Capture into a local scratch dir** — `$KIROCREW_SCRATCH/<your-slug>/evidence/` under the subdirectory your session names for itself, or the gitignored `temp-screenshots/<feature>/` the capture scripts already write to. Neither reaches the commit.
 - **Write ordinary local paths in the body file**, relative to the directory you run `gh` from: `![Settings page, empty state](./evidence/after.png)`. A video MUST stand alone in its own paragraph — `![](./evidence/demo.mp4)` with a blank line above and below — to render as an inline player; inside a sentence it renders as a link.
 - **Pass the same files to `gh`, one `--attach` per file** (gh >= 2.99 — check `gh --version` and upgrade first when it is older, e.g. `brew upgrade gh`):
 

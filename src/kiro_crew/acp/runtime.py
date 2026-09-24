@@ -5274,6 +5274,7 @@ class AcpRuntime:
         budget: float,
         payload_snapshot: Any,
         wire_registered: bool,
+        skip_projection_refresh: bool = False,
     ) -> None:
         """Send ``session/set_mode`` for *mode_agent* inside the derived-spec bracket.
 
@@ -5328,7 +5329,10 @@ class AcpRuntime:
                 await self.terminate_session(session_id)
                 raise AcpRuntimeError(str(exc)) from exc
         try:
-            if getattr(self, "_native_skill_projection", None) is not None:
+            if (
+                not skip_projection_refresh
+                and getattr(self, "_native_skill_projection", None) is not None
+            ):
                 from kiro_crew.acp.skill_projection import prepare_native_skill_projection
 
                 # Keep the transport mode selected at spawn for this process.
@@ -5899,6 +5903,7 @@ class AcpRuntime:
         memory_mode: str = "persistent",
         on_gate_acquired: Callable[[float], None] | None = None,
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None" = None,
+        skip_projection_refresh: bool = False,
     ) -> AcpSessionHandle:
         """Create a new ACP session on this runtime. Returns a session handle.
 
@@ -6177,6 +6182,7 @@ class AcpRuntime:
                 payload_snapshot=payload_snapshot,
                 late_adopter=late_adopter,
                 memory_mode=memory_mode,
+                skip_projection_refresh=skip_projection_refresh,
             )
             if collector is None:
                 permit.release()
@@ -6206,6 +6212,7 @@ class AcpRuntime:
             session_work_dir=session_work_dir,
             projected_sources=projected_sources,
             payload_snapshot=payload_snapshot,
+            skip_projection_refresh=skip_projection_refresh,
         )
 
     def _collect_late_start(
@@ -6228,6 +6235,7 @@ class AcpRuntime:
         payload_snapshot: Any,
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None",
         memory_mode: str = "persistent",
+        skip_projection_refresh: bool = False,
     ) -> StartCollector | None:
         """Hand a timed-out ``session/new`` to a :class:`StartCollector`.
 
@@ -6309,6 +6317,7 @@ class AcpRuntime:
                     session_work_dir=session_work_dir,
                     projected_sources=projected_sources,
                     payload_snapshot=payload_snapshot,
+                    skip_projection_refresh=skip_projection_refresh,
                 )
                 # A declining (or raising) adopter answers False and the
                 # collector performs the one teardown.
@@ -6403,6 +6412,7 @@ class AcpRuntime:
         projected_sources: dict[str, str],
         payload_snapshot: Any,
         memory_mode: str = "persistent",
+        skip_projection_refresh: bool = False,
     ) -> AcpSessionHandle:
         """Everything after a successful ``session/new``: queue, handle, mode, drain.
 
@@ -6531,6 +6541,7 @@ class AcpRuntime:
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
+                skip_projection_refresh=skip_projection_refresh,
             )
             handle.active_agent = mode_agent
             # Whether set_mode actually SWITCHED modes: the servers that
