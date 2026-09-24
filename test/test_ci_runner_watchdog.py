@@ -4433,3 +4433,46 @@ def test_an_unanswerable_supersession_lookup_leaves_the_hold_standing() -> None:
     api = FakeApi({}, {})
     with _mock.patch.object(wd, "is_newest_for_branch", explode):
         assert not wd.supersession_clears_hold(api, _policy(), verdict, lambda _l: None)
+
+
+# ── the fleet hold is never released off somebody's own re-run ──────────────
+
+
+def _orphan_at_attempt(attempt: int) -> Any:
+    return wd.RunVerdict(
+        run_id=1,
+        run_attempt=attempt,
+        head_branch="main",
+        head_repo=REPO,
+        event="push",
+        status="in_progress",
+        url="https://example.invalid/runs/1",
+        age=timedelta(minutes=60),
+        verdict=wd.ORPHANED,
+        workflow="ci.yml",
+    )
+
+
+def test_a_rerun_attempt_is_never_released_by_supersession() -> None:
+    """A later attempt may BE the operator response this script's logs ask for.
+
+    Releasing it ends in silent loss rather than a re-run: the heal path cancels it,
+    `_rerun` declines a superseded run, and `superseded-before-cancel` is not a failed
+    outcome, so the tick reports green; `classify_cancelled_run` then classifies the
+    cancelled run out of `CANCELLED_ORPHAN`, so the recovery pass does not restore it
+    either. Holding it costs a stuck concurrency group somebody can see; releasing it
+    costs a person's work with nothing left to show they did it.
+    """
+    api = FakeApi({}, {}, newest_by_branch={"main": 2})
+    lines: list[str] = []
+    assert not wd.supersession_clears_hold(api, _policy(), _orphan_at_attempt(2), lines.append)
+    said = " ".join(lines)
+    assert "this is attempt 2" in said
+    assert "discard their work" in said
+
+
+def test_attempt_one_is_still_released_by_supersession() -> None:
+    """Positive control: the 6-hour block this escape exists for was a stuck
+    attempt-1 run, so narrowing must not take the escape away from it."""
+    api = FakeApi({"in_progress": [_run(1)]}, {1: [_job(11)]}, newest_by_branch={"main": 2})
+    assert wd.supersession_clears_hold(api, _policy(), _orphan_at_attempt(1), lambda _l: None)

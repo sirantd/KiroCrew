@@ -1462,9 +1462,29 @@ def supersession_clears_hold(
     that test is belt-and-braces rather than the fork boundary itself.
 
     A lookup that cannot answer leaves the hold standing: cancelling needs
-    supersession ESTABLISHED, never assumed from a failed read.
+    supersession ESTABLISHED, never assumed from a failed read. So does an attempt
+    past the first: only attempt 1 is certainly nobody's own re-run.
     """
     if verdict.event != "push" or verdict.head_repo.lower() != policy.repo.lower():
+        return False
+    if verdict.run_attempt != 1:
+        # Attempt 1 is the only attempt nobody has re-run, so it is the only one
+        # whose hold this may release. A later attempt may BE somebody's `gh run
+        # rerun` of the stuck run -- the operator response this script's own logs
+        # ask for -- and releasing it ends in silent loss, not a re-run: the heal
+        # path cancels it, `_rerun` declines a superseded run, and the resulting
+        # `superseded-before-cancel` is not a failed outcome, so the tick reports
+        # green. The recovery pass will not restore it either, because
+        # `classify_cancelled_run` classifies a superseded cancelled run out of
+        # `CANCELLED_ORPHAN`. Only a hand `gh run rerun` brings it back.
+        # The trade is deliberate: holding such a run costs a stuck concurrency
+        # group, which the next push or a human can see and act on; releasing it
+        # costs a person's work with nothing left to show they did it.
+        log(
+            f"{_label(verdict)}: the fleet hold stands even though a newer push supersedes it, "
+            f"because this is attempt {verdict.run_attempt} and a re-run attempt may be "
+            f"somebody's own; releasing it could discard their work irrecoverably"
+        )
         return False
     try:
         if is_newest_for_branch(api, policy.repo, verdict):

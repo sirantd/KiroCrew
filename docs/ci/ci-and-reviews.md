@@ -1036,7 +1036,13 @@ Details worth knowing:
     for the run to report `completed`, then `gh run rerun <run-id>`
     (`gh run rerun <run-id> --failed` keeps the successful jobs but carries the
     stale-label caveat). `workflow_dispatch` with `dry_run: true` (the default
-    for a manual dispatch) detects and reports without acting.
+    for a manual dispatch) detects and reports without acting. **A hand re-run is
+    safe from the watchdog**: once a run is past attempt 1 the fleet hold is never
+    released off it, because a later attempt may be the very `gh run rerun` above
+    and cancelling it would be a silent loss — the heal path declines to re-run a
+    superseded run, `superseded-before-cancel` is not a failed outcome, and the
+    recovery pass classifies a superseded cancelled run out. A stuck concurrency
+    group is the cheaper failure: the next push or a human can see it.
   - **Trust model.** A self-hosted runner exposes its host identity to the job it
     runs; that is inherent, not something this PR adds. What bounds it: only runs
     triggered by accounts that can push here reach the runner (forks never do);
