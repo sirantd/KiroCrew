@@ -74,7 +74,7 @@ else:
 
 # Floor on how many tests the suite must yield, checked only under _REQUIRED_ENV.
 #
-# Read off a real collection (327 items). The margin is 2, not a comfortable ten per
+# Read off a real collection (376 items). The margin is 2, not a comfortable ten per
 # cent, and the tightness IS the feature: the smallest module here contributes 3
 # tests, so a floor of 325 is tripped by losing even the smallest one, which a looser
 # floor would wave through. The per-module check below catches a module that stops
@@ -86,7 +86,7 @@ else:
 # When the suite grows, raise it. It may be LOWERED only alongside a deliberate
 # deletion of tests, in the same commit, and never to make a red lane green: a floor
 # edited down to meet the measurement measures nothing.
-_MIN_COLLECTED = 325
+_MIN_COLLECTED = 445
 
 # Not collected on a non-POSIX host. This suite's SUBJECT is the source of a Linux
 # container image, built by the deploy driver and run on Fargate -- not part of the
