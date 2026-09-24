@@ -248,6 +248,7 @@ import {
   subscribeChatHandoff,
 } from '../utils/errorReport'
 import WelcomeView from '../components/WelcomeView'
+import { MemoryModeChip, type MemoryMode } from '../components/MemoryModeChip'
 import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
@@ -1060,6 +1061,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // `title` is optional because several sites already own a whole-sentence
   // message ("Fork failed: …") that must stay intact for the error-journal match.
   const [actionError, setActionError] = useState<{ title?: string; message: string; preserveOnSwitch?: boolean } | null>(null)
+  const [memoryModeError, setMemoryModeError] = useState<string | null>(null)
   const showActionError = useCallback((message: string, title?: string) => {
     // Same failure re-reported (an effect re-run, a retry that fails the same
     // way) keeps the stored object, so React bails out instead of re-rendering.
@@ -6526,6 +6528,58 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     </button>
   )
 
+  const switchMemoryMode = async (newMode: MemoryMode) => {
+    if (!activeSlot) return
+    // Create-first-then-delete: deleting the active slot first
+    // would make deleteSlot jump focus to a sibling. Creating
+    // first keeps the new slot active, so the delete skips the
+    // sibling navigation. Carry agent/project/folder/color so
+    // the recreated slot keeps its identity and placement.
+    const sourceKey = activeSlot
+    const sourceDraft = inputRef.current
+    const sourceFiles = pendingFilesRef.current.slice()
+    const sourcePastes = pasteBlocksRef.current.map(block => ({ ...block }))
+    const sourceSessions = pendingSessionsRef.current.map(session => ({ ...session }))
+    const old = currentSlot
+    const opts = {
+      agent: old?.agent || defaultAgent || undefined,
+      model: old?.model || undefined,
+      mode,
+      memory_mode: newMode,
+      folder_id: old?.folder_id ?? null,
+      color_index: old?.color_index ?? null,
+      color_hex: old?.color_hex ?? null,
+      project: old?.project ?? null,
+      instanceId: old?.instance_id || undefined,
+    }
+    try {
+      const replacement = await dispatch(createSlot({ ...opts, activate: false })).unwrap()
+      if (activeSlotRef.current !== sourceKey || composerSlotRef.current !== sourceKey) {
+        try { await dispatch(deleteSlot(replacement.key)).unwrap() } catch { /* abandoned replacement cleanup is best-effort */ }
+        return
+      }
+      setDraft(drafts.current, replacement.key, sourceDraft)
+      setFileDraft(fileDrafts.current, replacement.key, sourceFiles)
+      setPasteDraft(pasteDrafts.current, replacement.key, sourcePastes)
+      setSessionRefDraft(sessionRefDrafts.current, replacement.key, sourceSessions)
+      setDraft(drafts.current, sourceKey, '')
+      setFileDraft(fileDrafts.current, sourceKey, [])
+      setPasteDraft(pasteDrafts.current, sourceKey, [])
+      setSessionRefDraft(sessionRefDrafts.current, sourceKey, [])
+      composerSlotRef.current = replacement.key
+      prevSlot.current = replacement.key
+      flushDrafts()
+      await dispatch(switchSlot({ key: replacement.key, keepTargetOnMissing: true })).unwrap()
+      setMemoryModeError(null)
+    } catch (error) {
+      setMemoryModeError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
+      return
+    }
+    try { await dispatch(deleteSlot(sourceKey)).unwrap() } catch { /* new slot already active */ }
+  }
+  // The non-orchestrator welcome screen puts its memory chip directly above the composer.
+  const showComposerMemoryChip = isWelcomeState && (currentSlot?.mode || mode) !== 'orchestrator'
+
   return (
     <RowDisclosureProvider resetKey={activeSlot}>
     <TagPopoverProvider>
@@ -6746,6 +6800,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           askAgent
           className="mx-4 mt-2 mb-0 animate-rise"
           testId="sid-error"
+        />
+        <ErrorNotice
+          message={memoryModeError}
+          onDismiss={() => setMemoryModeError(null)}
+          askAgent
+          className="mx-4 mt-2 mb-0 animate-rise"
+          testId="memory-mode-error"
         />
         <ErrorNotice
           title={actionError?.title}
@@ -7097,28 +7158,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   mode={currentSlot?.mode || mode}
                   setInput={setInput}
                   memoryMode={currentSlot?.memory_mode ?? 'persistent'}
-                  onSwitchMode={async (newMode) => {
-                    if (!activeSlot) return
-                    // Create-first-then-delete: deleting the active slot first
-                    // would make deleteSlot jump focus to a sibling. Creating
-                    // first keeps the new slot active, so the delete skips the
-                    // sibling navigation. Carry agent/project/folder/color so
-                    // the recreated slot keeps its identity and placement.
-                    const old = currentSlot
-                    const opts = {
-                      agent: old?.agent || defaultAgent || undefined,
-                      model: old?.model || undefined,
-                      mode,
-                      memory_mode: newMode,
-                      folder_id: old?.folder_id ?? null,
-                      color_index: old?.color_index ?? null,
-                      color_hex: old?.color_hex ?? null,
-                      project: old?.project ?? null,
-                      instanceId: old?.instance_id || undefined,
-                    }
-                    try { await dispatch(createSlot(opts)).unwrap() } catch { return }
-                    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch { /* new slot already active */ }
-                  }}
+                  onSwitchMode={switchMemoryMode}
                 />
               </motion.div>
             ) : (
@@ -7532,6 +7572,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     onStartInWorktree={followupStartInWorktree}
                     onSkip={(index) => dispatch(dismissFollowupItem({ slot: activeSlot, index, ts: pendingFollowup.ts }))}
                   />
+                </div>
+              )}
+              {showComposerMemoryChip && (
+                // Opaque page-colored backdrop: at phone widths the welcome cards
+                // scroll underneath this row, and a see-through row made a tap near
+                // the chip ambiguous between the chip and the card behind it.
+                <div className="relative z-10 flex justify-center px-4 pt-2 pb-2 bg-bg" data-testid="composer-memory-chip">
+                  <MemoryModeChip memoryMode={currentSlot?.memory_mode ?? 'persistent'} onSwitchMode={switchMemoryMode} />
                 </div>
               )}
               <Composer
