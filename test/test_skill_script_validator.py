@@ -583,3 +583,76 @@ def test_ordinary_dunder_dict_access_still_passes():
     ):
         ok, findings = validate_skill_script("run.py", src)
         assert ok is True, (src, findings)
+
+
+def test_rejects_a_banned_attribute_read_through_a_match_pattern():
+    """``case C(system=f)`` reads the attribute with getattr at run time."""
+    for src in (
+        "import os\nmatch os:\n    case object(system=f):\n        f('id')\n",
+        "match f:\n    case object(__globals__=g):\n        pass\n",
+        "import os\nmatch os:\n    case object(__dict__=d):\n        pass\n",
+        "match __builtins__:\n    case object(eval=e):\n        e('1')\n",
+        "match __builtins__:\n    case object(getattr=g):\n        pass\n",
+    ):
+        ok, findings = validate_skill_script("run.py", src)
+        assert ok is False, src
+        assert any("match pattern" in f for f in findings), (src, findings)
+
+
+def test_rejects_a_positional_match_pattern_that_reads_a_banned_attribute():
+    """``case C(f)`` reads ``C.__match_args__[0]`` with getattr at run time."""
+    src = (
+        "import os\n"
+        "class M(type):\n"
+        "    def __instancecheck__(cls, x):\n"
+        "        return True\n"
+        "class C(metaclass=M):\n"
+        "    __match_args__ = ('system',)\n"
+        "match os:\n"
+        "    case C(f):\n"
+        "        print(f)\n"
+    )
+    ok, findings = validate_skill_script("run.py", src)
+    assert ok is False, findings
+    assert any("positional match pattern: C(...)" in f for f in findings), findings
+
+
+def test_rejects_a_positional_match_pattern_on_a_plain_user_class():
+    src = "class C:\n    __match_args__ = ('system',)\n\ndef f(p):\n    match p:\n        case C(f):\n            return f\n"
+    ok, findings = validate_skill_script("run.py", src)
+    assert ok is False, findings
+    assert any("positional match pattern: C(...)" in f for f in findings), findings
+
+
+def test_rejects_a_positional_match_pattern_on_a_builtin_name():
+    """A builtin name can be rebound at run time, so ``case int(f)`` fails closed."""
+    meta = (
+        "import os\n"
+        "class M(type):\n"
+        "    def __instancecheck__(cls, x):\n"
+        "        return True\n"
+    )
+    cls_c = "class C(metaclass=M):\n    __match_args__ = ('system',)\n"
+    use = "match os:\n    case int(f):\n        print(f)\n"
+    for src in (
+        meta + cls_c + "int = C\n" + use,
+        meta + "class int(metaclass=M):\n    __match_args__ = ('system',)\n" + use,
+        meta + cls_c + "globals()['int'] = C\n" + use,
+        meta + cls_c + "__builtins__.int = C\n" + use,
+        "def f(p):\n    match p:\n        case int(x):\n            return x\n",
+    ):
+        ok, findings = validate_skill_script("run.py", src)
+        assert ok is False, src
+        assert any("positional match pattern: int(...)" in f for f in findings), (src, findings)
+
+
+def test_sequence_match_pattern_still_passes():
+    src = "def f(p):\n    match p:\n        case [a, b]:\n            return a + b\n"
+    ok, findings = validate_skill_script("run.py", src)
+    assert ok is True, findings
+
+
+def test_benign_match_pattern_still_passes():
+    src = "def f(p):\n    match p:\n        case complex(real=r, imag=i):\n            return r + i\n"
+    ok, findings = validate_skill_script("run.py", src)
+    assert ok is True, findings

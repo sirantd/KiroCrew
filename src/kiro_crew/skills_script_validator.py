@@ -247,6 +247,32 @@ def _ast_findings(content: str) -> List[str]:
         ):
             findings.append(f"dangerous builtin rebound: {node.id}")
 
+    # ``case C(system=f)`` makes CPython run ``getattr(subject, "system")``, but
+    # the name is a plain str in ``MatchClass.kwd_attrs``, so none of the
+    # Attribute checks below see it. The subject is not resolvable here, so fail
+    # closed on the attribute name alone, as the ``.run()`` call check does.
+    _match_denied = (
+        _BANNED_ATTR_CALLS
+        | _BANNED_CALL_NAMES
+        | _NAMESPACE_LOOKUP_NAMES
+        | _NAMESPACE_ATTRS
+        | _DESCRIPTOR_METHODS
+        | {"__globals__"}
+    )
+    # ``case C(f)`` binds ``f`` from ``C.__match_args__`` (or the subject
+    # itself for a self-matching builtin), read at run time. Neither the class
+    # nor a builtin name can be trusted statically: a script can rebind either
+    # through ``globals()``, ``setattr`` or ``__builtins__``. So every positional
+    # class pattern fails closed; keyword patterns stay allowed under the
+    # ``kwd_attrs`` check in the same loop.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.MatchClass):
+            for attr in node.kwd_attrs:
+                if attr in _match_denied:
+                    findings.append(f"attribute read in a match pattern: {attr}=")
+            if node.patterns:
+                findings.append(f"positional match pattern: {ast.unparse(node.cls)}(...)")
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             fn = node.func
