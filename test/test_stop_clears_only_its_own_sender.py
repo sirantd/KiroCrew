@@ -241,9 +241,13 @@ class _Surface:
     message rather than fail loudly.
     """
 
-    def __init__(self, label: str = "fake", msg_id: Any = 7) -> None:
+    def __init__(self, label: str = "fake", msg_id: Any = 7, *, edit_refuses: bool = False) -> None:
         self.label = label
         self._msg_id = msg_id
+        #: Report the refusal a rate-limited chat or a spent per-message edit cap
+        #: really answers. A refused finalizing edit is what leaves an entry TERMINAL,
+        #: still owing its record, which is the state the cross-chat tests need.
+        self.edit_refuses = edit_refuses
         self.sent: list[str] = []
         self.edits: list[tuple[Any, str]] = []
 
@@ -251,8 +255,9 @@ class _Surface:
         self.sent.append(body)
         return self._msg_id
 
-    async def edit_receipt(self, msg_id: Any, body: str) -> None:
+    async def edit_receipt(self, msg_id: Any, body: str) -> bool | None:
         self.edits.append((msg_id, body))
+        return False if self.edit_refuses else None
 
 
 async def _bubble(
@@ -304,25 +309,37 @@ class TestAPartialStopWritesToNobodysSurface:
         bobs_chat, alices_chat = asyncio.run(go())
         assert alices_chat.sent == [], "the second sender grows the burst, never a bubble"
 
-    def test_the_grow_edit_goes_through_the_growing_senders_own_surface(self) -> None:
-        """A second sender's line is appended through the surface that sender holds.
+    def test_a_second_senders_grow_writes_through_nobodys_surface(self) -> None:
+        """A second sender's line is recorded, and no bubble is edited at all.
 
-        Which conversation a shared bubble's id addresses is the receipt registry's own
-        question, not this one. What this pins is that the append must NOT go through the
-        OPENER's surface, which would write this sender's text into the opener's chat.
+        Neither address is correct. Through the OPENER's surface the edit would put this
+        sender's text into the opener's chat, which this case has always refused. Through
+        this sender's own it would target a ``msg_id`` minted in the opener's chat, and
+        per-chat ids being small and dense, that number names an unrelated bot message
+        here -- so the whole line list would overwrite it, permanently.
+
+        Writing nothing costs only a bubble that does not yet show this line, because a
+        grow owes no record: the message is still queued, and the next same-principal
+        grow or the end-of-turn flip renders the whole list. Which conversation a shared
+        bubble belongs to stays the receipt registry's own question, not this one's.
         """
 
-        async def go() -> tuple[_Surface, _Surface]:
+        async def go() -> tuple[ReceiptQueue, _Surface, _Surface]:
             queue = ReceiptQueue()
             bobs_chat, alices_chat = _Surface("bob"), _Surface("alice")
             async with queue.lock:
                 await queue.create_or_grow_locked("s", bobs_chat, "bob asked", BOB)
                 await queue.create_or_grow_locked("s", alices_chat, "alice asked", ALICE)
-            return bobs_chat, alices_chat
+            return queue, bobs_chat, alices_chat
 
-        bobs_chat, alices_chat = asyncio.run(go())
+        queue, bobs_chat, alices_chat = asyncio.run(go())
         assert bobs_chat.edits == [], "the opener's chat never receives another's text"
-        assert alices_chat.edits == [(7, receipt_text(["bob asked", "alice asked"]))]
+        assert alices_chat.edits == [], "and the second sender's chat is not rewritten"
+        assert alices_chat.sent == [], "a second sender grows the burst, never a bubble"
+        assert queue._receipts["s"].texts == [
+            "bob asked",
+            "alice asked",
+        ], "the line is still RECORDED, so the next render shows the whole list"
 
 
 class TestWhatTheBubbleSaysAfterAPartialStop:
@@ -607,3 +624,199 @@ class TestEveryStopHandlerNamesItsCaller:
     def test_the_handler_never_clears_the_whole_queue(self, channel: str, name: str) -> None:
         source = _handler_source(channel, name)
         assert "clear_queue(session_key)" not in source
+
+
+class TestAnOwedRecordOnlyAddressesTheBubbleItBelongsTo:
+    """A retained terminal entry is written through the surface it was OPENED on.
+
+    A refused finalizing edit leaves the entry terminal, still owing its record, and
+    the next transition retries it. That retry is the one write in the subsystem whose
+    address does NOT come from the message in hand: the surface a transition is handed
+    is built from the ARRIVING message, so under this file's unified key it belongs to
+    whoever spoke last, while ``msg_id`` addresses a message in the opener's chat only
+    and the owed body quotes the opener's own text. Both halves of that are pinned
+    here, because reading the caller's surface instead sends one person's text into
+    another's conversation and there is no later transition to correct it.
+
+    Two conversations deliberately hand out the SAME ``msg_id``: per-chat ids are small
+    and dense, so a mis-addressed edit overwrites an unrelated message rather than
+    failing loudly.
+    """
+
+    def test_a_second_senders_message_writes_the_owed_record_into_the_openers_chat(
+        self,
+    ) -> None:
+        async def go() -> tuple[ReceiptQueue, _Surface, _Surface]:
+            queue = ReceiptQueue()
+            alices_chat = _Surface("alice", edit_refuses=True)
+            bobs_chat = _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", alices_chat, "alice asked", ALICE)
+                # Alice's drain flips; the edit is refused, so the entry is terminal.
+                await queue.flip_answering_locked("s", alices_chat, ["alice asked"])
+                alices_chat.edit_refuses = False
+                # Bob's mid-turn message, arriving with BOB's own surface.
+                await queue.create_or_grow_locked("s", bobs_chat, "bob asked", BOB)
+            return queue, alices_chat, bobs_chat
+
+        queue, alices_chat, bobs_chat = asyncio.run(go())
+        owed = receipt_text(["alice asked"], answering=True)
+        assert alices_chat.edits[-1] == (7, owed), "the record lands in the opener's chat"
+        assert bobs_chat.edits == [], "and never through the arriving sender's surface"
+        assert bobs_chat.sent == [receipt_text(["bob asked"])], "Bob gets a fresh bubble"
+        assert not queue.has_receipt("s") or queue._receipts["s"].opened_on is bobs_chat
+
+    def test_a_second_senders_stop_does_not_post_the_openers_text_into_their_chat(
+        self,
+    ) -> None:
+        """The fallback POST is the disclosing half: it carries the body, not just an id."""
+
+        async def go() -> tuple[_Surface, _Surface]:
+            queue = ReceiptQueue()
+            # Alice's chat keeps refusing edits, so the owed record must be POSTED.
+            alices_chat = _Surface("alice", edit_refuses=True)
+            bobs_chat = _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", alices_chat, "alice secret", ALICE)
+                await queue.flip_answering_locked("s", alices_chat, ["alice secret"])
+                await queue.finish_cancelled_locked("s", bobs_chat, BOB)
+            return alices_chat, bobs_chat
+
+        alices_chat, bobs_chat = asyncio.run(go())
+        owed = receipt_text(["alice secret"], answering=True)
+        assert owed in alices_chat.sent, "the record is posted into the bubble's own chat"
+        assert bobs_chat.sent == [], "Bob's chat receives no post at all"
+        assert bobs_chat.edits == [], "and no edit either"
+        assert not any(
+            "Cancelled" in body for body in alices_chat.sent
+        ), "what is written is the record that was OWED, not one Bob's stop computed"
+
+    def test_a_drain_arriving_on_another_chat_retries_the_record_on_the_openers(
+        self,
+    ) -> None:
+        async def go() -> tuple[_Surface, _Surface]:
+            queue = ReceiptQueue()
+            alices_chat = _Surface("alice", edit_refuses=True)
+            bobs_chat = _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", alices_chat, "alice asked", ALICE)
+                await queue.flip_answering_locked("s", alices_chat, ["alice asked"])
+                alices_chat.edit_refuses = False
+                # A later drain answering BOB, so built with Bob's chat.
+                await queue.flip_answering_locked("s", bobs_chat, ["bob asked"])
+            return alices_chat, bobs_chat
+
+        alices_chat, bobs_chat = asyncio.run(go())
+        assert alices_chat.edits[-1] == (7, receipt_text(["alice asked"], answering=True))
+        assert bobs_chat.edits == [] and bobs_chat.sent == []
+
+    def test_the_fallback_post_uses_the_bubbles_own_send_address(self) -> None:
+        """One principal, two addresses: the forum Topic case.
+
+        A flip and a ``/stop`` build their surface with no thread, because both only
+        ever EDIT and an edit addresses a message rather than a thread. The fallback
+        POST does not, so taking the caller's surface would put the record in the
+        parent chat -- the one place a served send never lands -- for a bubble that
+        lives in a Topic.
+        """
+
+        async def go() -> tuple[_Surface, _Surface]:
+            queue = ReceiptQueue()
+            topic = _Surface("topic", edit_refuses=True)
+            parent_chat = _Surface("parent-chat")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", topic, "asked in the topic", ALICE)
+                await queue.flip_answering_locked("s", topic, ["asked in the topic"])
+                # Same person, but the surface the /stop handler built has no thread.
+                await queue.finish_cancelled_locked("s", parent_chat, ALICE)
+            return topic, parent_chat
+
+        topic, parent_chat = asyncio.run(go())
+        owed = receipt_text(["asked in the topic"], answering=True)
+        assert owed in topic.sent, "the record is posted into the Topic the bubble is in"
+        assert parent_chat.sent == [], "never into the parent chat"
+        assert parent_chat.edits == []
+
+    def test_an_entry_with_no_bound_address_is_not_written_through_a_callers(self) -> None:
+        """No address is not the same as any address, so nothing is written."""
+
+        async def go() -> tuple[ReceiptQueue, _Surface]:
+            queue = ReceiptQueue()
+            receipt = QueueReceipt(
+                msg_id=7,
+                opened_by=ALICE,
+                lines=[ReceiptLine(owner=ALICE, text="alice asked")],
+            )
+            receipt.final_body = receipt_text(["alice asked"], answering=True)
+            queue._receipts["s"] = receipt
+            bobs_chat = _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", bobs_chat, "bob asked", BOB)
+            return queue, bobs_chat
+
+        queue, bobs_chat = asyncio.run(go())
+        assert bobs_chat.edits == [] and bobs_chat.sent == []
+        assert queue._receipts["s"].owes_record, "the record stays owed rather than misfiled"
+
+    def test_a_later_senders_grow_does_not_rebind_the_bubbles_address(self) -> None:
+        """The address is the OPENER's for the entry's whole life.
+
+        Rebinding it on a grow would hand the next owed record the newest speaker's
+        chat, which is the same disclosure by a slower route.
+        """
+
+        async def go() -> tuple[ReceiptQueue, _Surface, _Surface]:
+            queue = ReceiptQueue()
+            alices_chat, bobs_chat = _Surface("alice"), _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", alices_chat, "alice asked", ALICE)
+                await queue.create_or_grow_locked("s", bobs_chat, "bob asked", BOB)
+            return queue, alices_chat, bobs_chat
+
+        queue, alices_chat, _bobs_chat = asyncio.run(go())
+        receipt = queue._receipts["s"]
+        assert receipt.opened_on is alices_chat
+        assert receipt.opened_by == ALICE
+
+    def test_a_whole_session_cancel_finalizes_through_the_bubbles_own_surface(self) -> None:
+        """A clear that names no principal cannot assume its caller is the opener.
+
+        A caller meaning "the queue was all of it" passes no owner, so under a shared key
+        it can arrive from someone who did not open the bubble. Unlike a grow this record
+        is TERMINAL: those messages have left the queue, nothing will revisit the bubble,
+        and one left reading queued for cleared messages is wrong for good. So it IS
+        written -- to the bubble's own chat.
+        """
+
+        async def go() -> tuple[_Surface, _Surface]:
+            queue = ReceiptQueue()
+            alices_chat, bobs_chat = _Surface("alice"), _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", alices_chat, "alice asked", ALICE)
+                await queue.create_or_grow_locked("s", bobs_chat, "bob asked", BOB)
+                # No owner: the whole-session clear, as a /stop handler that names
+                # nobody calls it, arriving on Bob's surface.
+                await queue.finish_cancelled_locked("s", bobs_chat)
+            return alices_chat, bobs_chat
+
+        alices_chat, bobs_chat = asyncio.run(go())
+        cancelled = receipt_text(["alice asked", "bob asked"], cancelled=True)
+        assert alices_chat.edits[-1] == (7, cancelled), "finalized on the bubble's own id"
+        assert bobs_chat.edits == [], "never on the arriving caller's unrelated message"
+
+    def test_a_whole_session_cancel_that_is_refused_keeps_the_record_owed(self) -> None:
+        """The terminal half still holds when the bubble's own chat refuses the edit."""
+
+        async def go() -> tuple[ReceiptQueue, _Surface, _Surface]:
+            queue = ReceiptQueue()
+            alices_chat = _Surface("alice", edit_refuses=True)
+            bobs_chat = _Surface("bob")
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", alices_chat, "alice asked", ALICE)
+                await queue.finish_cancelled_locked("s", bobs_chat)
+            return queue, alices_chat, bobs_chat
+
+        queue, alices_chat, bobs_chat = asyncio.run(go())
+        assert queue._receipts["s"].owes_record, "a refused terminal edit stays owed"
+        assert alices_chat.edits[-1][0] == 7
+        assert bobs_chat.edits == [] and bobs_chat.sent == []

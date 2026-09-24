@@ -1887,8 +1887,8 @@ class TelegramDispatcher:
             async def send_receipt(self, body: str) -> Any | None:
                 return await reply(chat_id, body, thread=thread)
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(chat_id, msg_id, body)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(chat_id, msg_id, body)
 
         return _Surface()
 

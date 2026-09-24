@@ -1240,8 +1240,8 @@ class WebexDispatcher:
                     room_id, webex_display_safe(body), parent_id=parent_id
                 )
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(str(msg_id), room_id, webex_display_safe(body))
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(str(msg_id), room_id, webex_display_safe(body))
 
         return _Surface()
 

@@ -952,8 +952,8 @@ class TeamsDispatcher:
                     logger.debug("Teams: queue receipt send failed", exc_info=True)
                     return None
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.update_message(conversation_id, str(msg_id), body, service_url)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.update_message(conversation_id, str(msg_id), body, service_url)
 
         return _Surface()
 

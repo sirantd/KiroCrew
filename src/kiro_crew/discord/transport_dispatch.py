@@ -1546,8 +1546,8 @@ class DiscordDispatcher:
             async def send_receipt(self, body: str) -> Any | None:
                 return await client.send_message(channel_id, body)
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(channel_id, msg_id, body)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(channel_id, msg_id, body)
 
         return _Surface()
 

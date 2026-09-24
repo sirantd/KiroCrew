@@ -23,20 +23,38 @@ class _Surface:
 
     label = "fake"
 
-    def __init__(self, *, send_id: Any = 7, edit_raises: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        send_id: Any = 7,
+        edit_raises: bool = False,
+        edit_refuses: bool = False,
+        edit_answers_none: bool = False,
+        send_fails_after: int | None = None,
+    ) -> None:
         self._send_id = send_id
         self.edit_raises = edit_raises
+        #: Report the refusal a rate-limited chat or a spent edit cap really answers.
+        self.edit_refuses = edit_refuses
+        #: Answer None: silence, which is not a reported failure.
+        self.edit_answers_none = edit_answers_none
+        self._send_fails_after = send_fails_after
         self.sent: list[str] = []
         self.edits: list[tuple[Any, str]] = []
 
     async def send_receipt(self, body: str) -> Any | None:
         self.sent.append(body)
+        if self._send_fails_after is not None and len(self.sent) > self._send_fails_after:
+            return None
         return self._send_id
 
-    async def edit_receipt(self, msg_id: Any, body: str) -> None:
+    async def edit_receipt(self, msg_id: Any, body: str) -> bool | None:
         self.edits.append((msg_id, body))
         if self.edit_raises:
             raise RuntimeError("edit failed mid-flush")
+        if self.edit_answers_none:
+            return None
+        return not self.edit_refuses
 
 
 class TestReceiptText:
@@ -128,6 +146,173 @@ class TestLifecycle:
 
         asyncio.run(go())
         assert not q.has_receipt("s")
+
+
+class TestATransitionIsPublishedOnlyWhenItLands:
+    """A refused edit is an ordinary answer, not an exception, and not a success."""
+
+    def test_a_refused_flip_keeps_the_bubbles_only_handle(self) -> None:
+        q, s = ReceiptQueue(), _Surface(send_id=42, edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+
+        asyncio.run(go())
+        # Dropped here, nothing would ever revisit the bubble: it reads "Queued" for good.
+        assert q._receipts["s"].owes_record
+        assert q._receipts["s"].final_body == receipt_text(["a"], answering=True)
+        # Not LIVE though -- it cannot be grown.
+        assert not q.has_receipt("s")
+
+    def test_a_refused_grow_leaves_no_record_owed(self) -> None:
+        """That message is still QUEUED, which is what the bubble's ledger says."""
+        q, s = ReceiptQueue(), _Surface(edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.create_or_grow_locked("s", s, "b")
+
+        asyncio.run(go())
+        assert q.has_receipt("s"), "nothing has left the queue, so the bubble is still live"
+        assert q._receipts["s"].texts == ["a", "b"]
+
+    def test_silence_is_not_a_reported_failure(self) -> None:
+        """A surface answering None has not reported one; reading it as failure would
+        keep every receipt in the registry for good."""
+        q, s = ReceiptQueue(), _Surface(edit_answers_none=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+
+        asyncio.run(go())
+        assert "s" not in q._receipts
+
+    def test_a_raise_and_a_refusal_are_the_same_answer(self) -> None:
+        q, s = ReceiptQueue(), _Surface(edit_raises=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+
+        asyncio.run(go())
+        assert q._receipts["s"].owes_record
+
+    def test_a_refused_cancel_keeps_the_handle_too(self) -> None:
+        q, s = ReceiptQueue(), _Surface(edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.finish_cancelled_locked("s", s)
+
+        asyncio.run(go())
+        assert q._receipts["s"].final_body == receipt_text(["a"], cancelled=True)
+
+
+class TestAnOwedRecordIsTheOneThatWasOwed:
+    """The record travels with the entry, so a retry writes what actually happened."""
+
+    def test_the_next_message_writes_the_owed_record_before_opening_a_bubble(self) -> None:
+        q = ReceiptQueue()
+        s = _Surface(send_id=42, edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])  # refused, now terminal
+                s.edit_refuses = False
+                await q.create_or_grow_locked("s", s, "b")
+
+        asyncio.run(go())
+        owed = receipt_text(["a"], answering=True)
+        assert s.edits[-1] == (42, owed), "the retry writes the record the flip owed"
+        assert len(s.sent) == 2, "and then a FRESH bubble, not a grow of the answered one"
+        assert s.sent[-1] == receipt_text(["b"])
+
+    def test_a_terminal_entry_is_never_grown(self) -> None:
+        """Growing it would put already-answered text back under "Queued"."""
+        q, s = ReceiptQueue(), _Surface(edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+                s.edit_refuses = False
+                await q.create_or_grow_locked("s", s, "b")
+
+        asyncio.run(go())
+        assert all("a" not in body for body in s.sent[1:]), "answered text must not return"
+
+    def test_the_key_is_kept_until_the_record_is_on_the_bubble(self) -> None:
+        q = ReceiptQueue()
+        # The edit stays refused AND the record cannot be posted either.
+        s = _Surface(send_id=42, edit_refuses=True, send_fails_after=1)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+                await q.create_or_grow_locked("s", s, "b")
+
+        asyncio.run(go())
+        assert q._receipts["s"].owes_record, "the record is still owed, so the key is held"
+        assert q._receipts["s"].final_body == receipt_text(["a"], answering=True)
+
+    def test_a_bubble_that_refuses_edits_gets_the_record_posted(self) -> None:
+        """Past Webex's per-message edit cap no edit of that id ever lands, so retrying
+        alone would owe the record for the life of the process."""
+        q = ReceiptQueue()
+        s = _Surface(send_id=42, edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+                await q.create_or_grow_locked("s", s, "b")
+
+        asyncio.run(go())
+        owed = receipt_text(["a"], answering=True)
+        assert owed in s.sent, "the record is POSTED when the bubble will not take it"
+        assert "s" in q._receipts and not q._receipts["s"].owes_record
+
+    def test_a_stop_does_not_recompute_a_record_another_transition_owes(self) -> None:
+        """Writing "Cancelled" over an owed "Now answering" says the opposite of what
+        happened, permanently."""
+        q = ReceiptQueue()
+        s = _Surface(send_id=42, edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])  # owes "Now answering"
+                s.edit_refuses = False
+                await q.finish_cancelled_locked("s", s)
+
+        asyncio.run(go())
+        assert s.edits[-1][1] == receipt_text(["a"], answering=True)
+        assert "Cancelled" not in s.edits[-1][1]
+        assert "s" not in q._receipts
+
+    def test_a_second_flip_retries_the_owed_record_rather_than_its_own(self) -> None:
+        q = ReceiptQueue()
+        s = _Surface(send_id=42, edit_refuses=True)
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.flip_answering_locked("s", s, ["a"])
+                s.edit_refuses = False
+                await q.flip_answering_locked("s", s, ["zzz"])
+
+        asyncio.run(go())
+        assert s.edits[-1][1] == receipt_text(["a"], answering=True)
+        assert "zzz" not in s.edits[-1][1]
 
 
 class TestLockIsCallerHeld:
