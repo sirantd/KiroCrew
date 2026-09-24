@@ -474,6 +474,30 @@ class TestFlushFileChanges:
         assert "stopped" in last["content"].lower()
         assert last["meta"]["file_changes"][0]["path"] == str(f)
 
+    def test_every_coroutine_caller_drains_the_flush_worker(self):
+        """`_flush_file_changes` MUTATES slot state -- the assistant message's meta,
+        `_dirty` and `_file_changes` -- so a coroutine must not hand it to a plain
+        `asyncio.to_thread`. A cancellation at that await returns control while the
+        worker is still writing, and `_run_chat`'s exit path then starts a SECOND
+        flush on the same slot with the first in flight; two concurrent writers are
+        how the metadata goes missing or lands on the wrong message.
+        `drained_to_thread` keeps the await alive until the worker finishes, so
+        control only ever returns with no write outstanding.
+
+        Pinned on the source because the defect is which helper the call site names,
+        and a behavioural test would have to cancel a real turn mid-snapshot to see
+        it."""
+        import re
+        from pathlib import Path as _Path
+
+        from kiro_crew.dashboard import chat_runner as runner_mod
+
+        source = _Path(runner_mod.__file__).read_text(encoding="utf-8")
+        calls = re.findall(r"await (\w+)\(_flush_file_changes, slot\)", source)
+        assert calls, "no awaited _flush_file_changes call site found"
+        assert set(calls) == {"drained_to_thread"}, calls
+        assert "asyncio.to_thread(_flush_file_changes" not in source
+
 
 # ── Regression tests: real event ordering & content-block paths ────────────
 

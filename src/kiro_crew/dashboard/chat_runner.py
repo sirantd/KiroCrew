@@ -16460,8 +16460,20 @@ async def _run_chat(
                 turn_boundary=_turn_msg_boundary,
                 model=_turn_model,
             )
-            # Attach accumulated file changes to last assistant message before persist
-            _flush_file_changes(slot)
+            # Attach accumulated file changes to last assistant message before
+            # persist. Off the loop: each changed path is read through
+            # `_safe_read_snapshot`, whose validation opens every component of
+            # the path on Windows, so a slow or mapped drive would stall the
+            # loop for the whole turn's file set. Through `drained_to_thread`
+            # rather than a plain `to_thread` because the worker MUTATES slot
+            # state -- the message meta, `_dirty`, `_file_changes` -- and a
+            # cancellation at a plain await returns control while it is still
+            # writing. The turn-exit flush below would then start a second
+            # flush on the same slot with the first in flight, and two
+            # concurrent writers are how that metadata goes missing or lands on
+            # the wrong message. Draining means control returns with no write
+            # outstanding.
+            await drained_to_thread(_flush_file_changes, slot)
             # Save to history and trigger memory consolidation
             await save_slot_off_loop(state, slot)
         # Reset ALL retry budgets once the cycle completes (success OR the
@@ -18283,12 +18295,18 @@ async def _run_chat(
             setattr(client, "child_fidelity_aware", False)
         except Exception:
             pass
-        # Ensure file changes always surface, even on cancel/error. Wrapped so
-        # a raise here cannot skip the re-arm below and re-introduce the orphan
-        # bug this fix prevents.
+        # Ensure file changes always surface, even on cancel/error. The
+        # per-path snapshot reads open every component of the path on Windows,
+        # so they run off the loop -- through `drained_to_thread`, which keeps
+        # the await alive until the worker finishes, so a cancelled turn still
+        # flushes instead of returning with the read in flight. Both the worker's
+        # own failure and the cancellation it then re-raises are absorbed, so
+        # neither can skip the re-arm below and re-introduce the orphan bug this
+        # fix prevents; a cancellation already propagating through this `finally`
+        # resumes once the block ends.
         try:
-            _flush_file_changes(slot)
-        except Exception:
+            await drained_to_thread(_flush_file_changes, slot)
+        except (Exception, asyncio.CancelledError):
             logger.debug("_flush_file_changes failed", exc_info=True)
         # Replay settlement belongs on the one path every turn exit crosses.
         # A clean, non-synthetic landed end_turn is the only ordinary terminal

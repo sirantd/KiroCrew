@@ -201,6 +201,24 @@ _EXPECTED_GATE_CALL_SITES: dict[str, int] = {
     # root and cache key checks, stay on ``is_sensitive_path``: none of those
     # values is canonicalised first.
     "kiro_crew/security/paths.py": 1,
+    # ``hooks._screen_and_resolve_held``: the BOUNDED arm of the Windows tail of
+    # ``validate_file_path``, where the held walk covered only a prefix of the path.
+    # Both halves of the contract hold. The argument is canonical without a resolve:
+    # ``_canonicalize_within_hold`` runs ``realpath`` on the proven prefix and joins
+    # the remainder as text, and that remainder holds no link for a resolution to
+    # follow -- the walk classified every component it PROVED off that component's own
+    # descriptor and would have reported a reparse point instead of this outcome, and a
+    # name that holds nothing redirects nothing. And the bounded gate is the one thing
+    # this arm must not use: it resolves its candidate again, which would send
+    # ``realpath`` through the single component nothing is holding and re-open the
+    # junction-swap window the bound exists to close. The call never runs on the event
+    # loop, because ``validate_file_path`` is synchronous and every coroutine reaching
+    # it hands it to a worker (``logo`` and ``api_skill_detail`` through
+    # ``discovery_executor``, ``start_background`` through ``asyncio.to_thread``, and
+    # ``_run_chat``'s two turn-flush exits through ``drained_to_thread``). The SETTLED
+    # arm of the same function stays on ``is_sensitive_path``: the whole chain is held
+    # there, so that gate's own resolution traverses nothing that can be swapped.
+    "kiro_crew/hooks.py": 1,
 }
 
 
