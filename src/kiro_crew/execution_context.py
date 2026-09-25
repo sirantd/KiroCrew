@@ -524,7 +524,9 @@ def read_session_execution(session_key: str, *, required: bool = False) -> Execu
         from kiro_crew.memory_stores import MissingExecutionIdentity
 
         missing = MissingExecutionIdentity(
-            "Execution memory is unavailable: session has no canonical member identity; "
+            "Execution memory is unavailable: session has no canonical member identity "
+            "(this chat predates 0.7.0.6 and lacks a member binding); open a new chat "
+            "with the same member (its memory is intact) or archive this one; "
             "Global was not used"
         )
         if record.get("member_id") or record.get("selection_kind") == "member":
@@ -534,8 +536,92 @@ def read_session_execution(session_key: str, *, required: bool = False) -> Execu
             from kiro_crew.memory_stores import memory_store_version
 
             if memory_store_version(store) == 2:
+                backfilled = _backfill_legacy_member_record(session_key, record, store)
+                if backfilled is not None:
+                    return backfilled
                 raise missing
     return execution
+
+
+def _backfill_legacy_member_record(
+    session_key: str, record: Mapping[str, Any], store: str
+) -> ExecutionContext | None:
+    """Derive and persist the carrier a pre-``execution_context`` member record lacks.
+
+    0.7.0.5 wrote a member chat as ``{agent, memory_store}``. The start-of-process
+    store migration (``migrate_legacy_member_stores``) gives the config and the V2
+    store their identity but never touches session records, so without this every
+    such chat is refused at the read above. This is the missing half of that
+    backfill, done once at first read: the derived carrier is written into the
+    record, and every later read decodes it like any other session.
+
+    Nothing here guesses a member. The derivation is admitted only when the
+    attribution is unambiguous and mirrors what the store migration itself
+    required: the store is a declared V2 store whose ``owner_member_id`` names
+    exactly one configured member (`member_config_for_id`), that member resolves
+    to this store (`resolve_member_execution`), and the record's own ``agent``
+    names that member by alias or by id. A record with no ``agent``, an ``agent``
+    naming anyone else, a template pick, a store the migration could not
+    attribute, or a restricted mode is left untouched and the caller keeps
+    refusing. None of these conditions widens who may reach the store: they are
+    the same facts a fresh member selection resolves through.
+
+    The write is a compare-and-set against the exact legacy shape that was read,
+    not `bind_session_execution`, which would re-enter this read. The store came
+    from the session's own record, so the result is never vouched: the migrated
+    session is on the same footing as a member session after a restart and
+    re-establishes own-store authority the same way, by re-selecting its agent.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    agent = record.get("agent")
+    if not isinstance(agent, str) or not agent:
+        return None
+    # A name-only pick writes no ``agent_kind``; only an explicit template pick
+    # says this was never a member session.
+    if record.get("agent_kind") not in (None, "", "member"):
+        return None
+    mode = record.get("memory_mode", "persistent")
+    if mode != "persistent":
+        return None
+    config = KiroCrewConfig.load()
+    declaration = config.memory_stores.get(store)
+    owner_member_id = getattr(declaration, "owner_member_id", "")
+    if not isinstance(owner_member_id, str) or not owner_member_id:
+        return None
+    try:
+        alias, _ = member_config_for_id(config, owner_member_id)
+        if agent not in (alias, owner_member_id):
+            return None
+        execution = resolve_member_execution(config, alias, memory_mode=mode)
+    except UnknownMemoryStore:
+        return None
+    if execution.store.store_id != store:
+        return None
+    committed = ConversationLog().update_metadata_if(
+        session_key,
+        {
+            EXECUTION_CONTEXT_KEY: execution.to_record(),
+            "memory_store": execution.store.legacy_name,
+            "memory_mode": execution.memory_mode,
+        },
+        lambda meta: EXECUTION_CONTEXT_KEY not in meta
+        and meta.get("memory_store") == store
+        and meta.get("agent") == agent,
+    )
+    if committed:
+        logging.getLogger(__name__).info(
+            "Backfilled the member binding of session %r from its store's declared owner",
+            session_key,
+        )
+        return execution
+    # Another reader committed first: its record is the authority, not this derivation.
+    current, readable = ConversationLog().get_metadata_status(session_key)
+    if not readable:
+        raise _unavailable("session record is unreadable")
+    return execution_from_record(current, required=False)
 
 
 def capture_session_execution(session_key: str, *, template_id: str = "") -> ExecutionContext:
