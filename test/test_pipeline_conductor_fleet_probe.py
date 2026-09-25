@@ -869,6 +869,10 @@ def test_a_pytest_filename_is_not_a_pytest_command(mod, tmp_path, monkeypatch):
         "203": ["grep", "-E", "^(FAILED|ERROR)| passed|failed", "/wt/pytest.log"],
         "204": ["tail", "-2", "/wt/pytest.log"],
         "205": ["pip", "install", "pytest-cov"],
+        # The word as a DIRECTORY, where a path separator rather than a dot ends
+        # the token: the command here is `grep`, and the runner names a folder.
+        "210": ["grep", "-rn", "FAILED", "/wt/pytest/results.log"],
+        "211": ["type", r"C:\wt\pytest\results.log"],
         # The whole step: a capped run and a log read in one argument.
         "206": ["bash", "-c", CAPPED_STEP],
     }
@@ -901,8 +905,8 @@ def test_the_banned_line_names_the_command_without_echoing_its_arguments(
     one, and by the time anybody opens ``ps`` the process is usually gone. The
     field answers that -- but a command line is where a credential and a checkout
     layout ride, so only shapes that cannot hold either are printed: program and
-    runner NAMES, option names with the value dropped, a digits-only value kept
-    because that is the cap the rule just judged, and a count for the rest.
+    runner NAMES, option names with the value dropped, the cap flag's digits kept
+    because that is the field the rule just judged, and a count for the rest.
     """
     root = host_proc(tmp_path, monkeypatch)
     fleet = tmp_path / "wt"
@@ -922,8 +926,11 @@ def test_the_banned_line_names_the_command_without_echoing_its_arguments(
         # An environment assignment in front of the command: the one place a secret
         # sits in the LEADING token, where a program name would otherwise print.
         "302": ["GITHUB_TOKEN=ghp-not-a-real-secret", "pytest", "test/test_x.py"],
-        # A numeric value belongs to the decision and stays; `-n auto` is the cap
-        # flag WITHOUT a number, so the flag prints and the word does not.
+        # The cap flag's number belongs to the decision and stays; another flag's
+        # number does not, because "any flag whose value is digits" is a rule about a
+        # shape and a custom rule can point this scan at a program whose numeric
+        # option value is a secret. `-n auto` is the cap flag WITHOUT a number, so
+        # the flag prints and the word does not.
         "303": ["pytest", "--maxfail=2", "-n", "auto", "test/test_x.py"],
         # More flags than the field prints: the remainder is counted, never cut
         # silently.
@@ -938,7 +945,7 @@ def test_the_banned_line_names_the_command_without_echoing_its_arguments(
 
     assert "cmd=python,-m,pytest,--token,--cov,+2" in line["301"]
     assert "cmd=pytest,+2" in line["302"]
-    assert "cmd=pytest,--maxfail=2,-n,+2" in line["303"]
+    assert "cmd=pytest,--maxfail,-n,+2" in line["303"]
     assert "cmd=pytest,-a,-b,-c,-d,-e,-f,-g,+3" in line["304"]
 
     whole = "\n".join(lines)
@@ -951,6 +958,148 @@ def test_the_banned_line_names_the_command_without_echoing_its_arguments(
         "auto",
     ):
         assert secret not in whole, secret
+
+
+def test_an_assignment_value_holding_a_separator_is_still_withheld(mod, tmp_path, monkeypatch):
+    """The ``=`` decides before the directory is dropped, or the strip leaks the tail.
+
+    An inline ``KEY=value`` in front of a command is the one place a secret sits in
+    the LEADING token, where a program name would otherwise print. Testing its
+    shape AFTER dropping everything up to the last separator cannot see that,
+    because base64 secrets and presigned URLs routinely contain ``/``: the tail of
+    ``AWS_SECRET_ACCESS_KEY=…/dEf9gHi`` is ``dEf9gHi``, which is a perfectly good
+    program name by shape. So the assignment is recognised on the whole token.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        # Slash-bearing, the shape a separator-stripping check gets wrong.
+        "311": ["AWS_SECRET_ACCESS_KEY=wJalr/K7MDENG/bPxRfiCY", "pytest", "test/test_x.py"],
+        # Backslash-bearing: the strip folds ``\`` to ``/`` first, so it is the
+        # same hole spelled for the other platform.
+        "312": [r"AZURE_TOKEN=abc\def\gHiJkL", "pytest", "test/test_x.py"],
+        # A separator-bearing value on a token that is NOT first, so neither the
+        # program branch nor the flag branch may take it.
+        "313": ["pytest", "TMPDIR=/wt/private-checkout/tmp", "test/test_x.py"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,+2" in line["311"]
+    assert "cmd=pytest,+2" in line["312"]
+    assert "cmd=pytest,+2" in line["313"]
+
+    whole = "\n".join(lines)
+    for fragment in (
+        "wJalr",
+        "K7MDENG",
+        "bPxRfiCY",
+        "gHiJkL",
+        "private-checkout",
+        "AWS_SECRET_ACCESS_KEY",
+        "AZURE_TOKEN",
+        "TMPDIR",
+    ):
+        assert fragment not in whole, fragment
+
+
+def test_a_short_option_value_is_dropped_whether_glued_or_spaced(mod, tmp_path, monkeypatch):
+    """A short option glues its value on, so length is all that separates the two.
+
+    ``-k`` takes a selector, which the scope readout already treats as being as
+    sensitive as any other argument. Spelled ``-k name`` the value is its own token
+    and is withheld; spelled ``-kname`` there is no ``=`` to split at, so a shape
+    that accepts ``-`` plus letters accepts the value along with the name. Only a
+    bare two-character short flag is echoed whole.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        "321": ["pytest", "-kMyCustomerName", "test/test_x.py"],
+        "322": ["pytest", "-k", "MyCustomerName", "test/test_x.py"],
+        "323": ["pytest", "-k=MyCustomerName", "test/test_x.py"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,-k,+1" in line["321"]
+    assert "cmd=pytest,-k,+2" in line["322"]
+    assert "cmd=pytest,-k,+1" in line["323"]
+    assert "MyCustomerName" not in "\n".join(lines)
+
+
+def test_a_numeric_option_value_prints_only_for_the_cap_flag(mod, tmp_path, monkeypatch):
+    """Digits are kept because the CAP was judged, not because digits look harmless.
+
+    A caller-supplied rule can point this scan at any program, and that program's
+    numeric option value can be a secret -- an account id, a token that happens to
+    be digits. "Any flag whose value is digits" is a rule about a shape and admits
+    all of them; the two cap flags are the only ones this line has a reason to
+    print, so they are the only ones named.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        "331": ["custom-runner", "-u1234567890", "--jobs=4"],
+        "332": ["custom-runner", "-n0", "--numprocesses=4"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines(
+        {"fleet_worktrees": [str(fleet)], "banned_process_res": [r"\bcustom-runner\b"]}
+    )
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=custom-runner,-u,--jobs" in line["331"]
+    assert "cmd=custom-runner,-n0,--numprocesses=4" in line["332"]
+    assert "1234567890" not in "\n".join(lines)
+
+
+def test_a_retained_token_is_clipped_at_the_character_bound(mod, tmp_path, monkeypatch):
+    """Every printable shape is unbounded in LENGTH, so the token count is not a bound.
+
+    ``--`` followed by any number of letters is a well-formed option name, and this
+    line is re-emitted once per cycle for as long as the pid lives, so one token
+    can carry an arbitrary payload into a conductor's context past a cap that only
+    counts tokens. The clip is marked, for the same reason a withheld token is
+    counted: neither may read as the whole thing.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    long_flag = "--" + "z" * 4096
+    entry = proc_pid(root, "341", ["pytest", long_flag], starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1, lines
+    printed = lines[0].split("cmd=")[1].split()[0]
+    assert printed == f"pytest,{long_flag[: mod._MAX_CMD_TOKEN_CHARS]}~"
+    assert len(printed) < len(long_flag)
+
+
+def test_every_default_rule_prints_as_one_whitespace_separated_field(mod):
+    """``rule=`` echoes the pattern verbatim onto a line read as fields.
+
+    The reader splits a ``BANNED`` line on whitespace to find ``cwd=``, ``age=``,
+    ``scope=`` and ``cmd=``, which is why ``cmd=`` joins its tokens with commas. A
+    pattern carrying a literal space would split ``rule=`` into several fields and
+    break the same reader, so whitespace inside a rule is spelled as an escape.
+    """
+    for pattern in mod.DEFAULT_BANNED_RES:
+        assert len(pattern.split()) == 1, pattern
 
 
 def test_host_lines_counts_someone_elses_run_without_printing_it(mod, tmp_path, monkeypatch):

@@ -279,7 +279,9 @@ DEFAULT_ERR_RES = (
 #:   two apart: ``.`` and ``-`` are non-word characters, so ``pytest.log``,
 #:   ``pytest.ini``, ``.pytest_cache`` and ``pytest-cov`` all satisfy it. A worker's
 #:   test step runs the capped pytest and then greps the log it wrote, which is
-#:   exactly that shape.
+#:   exactly that shape. A path SEPARATOR ends the token for the same reason a dot
+#:   does: in ``/tmp/pytest/results.log`` the word is a directory, and the command
+#:   is whatever program was given that path.
 #: * The cap is read from the SAME command. One cmdline can carry a whole shell
 #:   script in a single argument, where the capped run and a bare one are different
 #:   lines, so the lookahead stops at a command separator (``;``, ``&``, ``|``, a
@@ -288,7 +290,10 @@ DEFAULT_ERR_RES = (
 #:   then excuse every uncapped run beside it.
 #:
 #: The cap's own flag must start a token too, so a target like ``test-n1.py`` cannot
-#: be read as ``-n 1`` and quietly pass an unbounded run.
+#: be read as ``-n 1`` and quietly pass an unbounded run. Its whitespace is spelled
+#: ``[\x20\t]`` rather than with a literal space because ``rule=`` prints the pattern
+#: verbatim onto a line read as whitespace-separated fields, and a pattern holding a
+#: space would split that one field into three.
 #:
 #: What the pair does NOT separate: a runner name standing alone as some other
 #: program's argument (``grep -rn pytest src``) still matches. Telling that from a
@@ -298,8 +303,8 @@ DEFAULT_ERR_RES = (
 #: residual error stays on the reporting side, like the rest of this scan, and the
 #: ``cmd=`` field on the line shows which program the match sat in.
 DEFAULT_BANNED_RES = (
-    r"(?<![\w./+=-])(?:[^\s;&|<>()]*/)?pytest(?![\w.+-])"
-    r"(?![^;&|\n]*(?<![\w./-])(?:-n|--numprocesses)[ \t]*=?[ \t]*\d)",
+    r"(?<![\w./+=-])(?:[^\s;&|<>()]*/)?pytest(?![\w./\\+-])"
+    r"(?![^;&|\n]*(?<![\w./-])(?:-n|--numprocesses)[\x20\t]*=?[\x20\t]*\d)",
     r"\bvitest\b\s+run\s*$",
 )
 
@@ -433,26 +438,45 @@ _COMMAND_SEPARATORS = ";&|\n"
 
 #: A program name, once its directory is dropped: letters, digits and the joiners
 #: real executables use (``python3.12``, ``py.test``, ``g++``, ``run-tests``). An
-#: environment assignment in front of a command (``GITHUB_TOKEN=…  pytest``) carries
-#: ``=`` and so is not a program name by this shape, which is the point: the leading
-#: token is the one place a secret sits without looking like an option value.
+#: environment assignment in front of a command (``GITHUB_TOKEN=…  pytest``) is kept
+#: out by the ``=`` test that runs BEFORE the directory is dropped, not by this
+#: shape: the tail of ``KEY=a/bXYZ`` is ``bXYZ``, which is secret text wearing a
+#: program's shape, and a shape test applied after the strip cannot see that.
 _SAFE_PROGRAM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
-#: An option NAME: what is safe to echo out of a flag. Values are dropped whatever
-#: they hold, so ``--token=…`` prints as ``--token``.
-_SAFE_FLAG_RE = re.compile(r"^--?[A-Za-z][A-Za-z0-9-]*$")
+#: A LONG option name: what is safe to echo out of a ``--flag``. Values are dropped
+#: at the ``=`` whatever they hold, so ``--token=…`` prints as ``--token``, and a
+#: long option's value can arrive no other way than after an ``=`` or as its own
+#: token, both of which this shape excludes.
+_SAFE_LONG_FLAG_RE = re.compile(r"^--[A-Za-z][A-Za-z0-9-]*$")
 
-#: A flag whose value is entirely digits, kept WITH the value because that is the
-#: field the rule just judged: ``-n0``, ``-n=4``, ``--numprocesses=4``. Without it
-#: ``-n auto`` and ``-n0`` both print as ``-n`` on a line that says the run is
-#: unbounded, which reads as a contradiction. A digit run can hold no path, no URL
-#: and no token text; a purely numeric secret is the residual, and no test runner
-#: takes one as a flag value.
-_SAFE_NUMERIC_FLAG_RE = re.compile(r"^(?:-[A-Za-z]|--[A-Za-z][A-Za-z0-9-]*)=?\d+$")
+#: A SHORT option name, which is one letter and nothing else. A short option's value
+#: is routinely GLUED to it with no ``=`` to split at (``-kMyCustomerName``,
+#: ``-u1234``), so length is the only thing separating the name from the value: a
+#: longer token keeps its two-character prefix and the rest is counted as withheld.
+_SAFE_SHORT_FLAG_RE = re.compile(r"^-[A-Za-z]$")
+
+#: The cap flag with its value, kept WHOLE because that value is the field the rule
+#: just judged: ``-n0``, ``-n=4``, ``--numprocesses=4``. Without it ``-n auto`` and
+#: ``-n0`` both print as ``-n`` on a line that says the run is unbounded, which reads
+#: as a contradiction. Only these two flags earn it. A digits-only value is harmless
+#: text on its own, but "any flag whose value is digits" is a rule about a SHAPE, and
+#: a caller-supplied ``banned_process_res`` can point this scan at a program whose
+#: numeric option value is a secret (``-u1234``); the cap flags are the only ones
+#: this scan has a reason to print, so they are the only ones named.
+_SAFE_NUMERIC_FLAG_RE = re.compile(r"^(?:-n|--numprocesses)=?\d+$")
 
 #: How many tokens of a command may be printed. A script line can be arbitrarily
 #: long and this lands in a conductor's model context one line per match.
 _MAX_CMD_TOKENS = 8
+
+#: How many characters of ONE retained token may be printed. Every shape above is
+#: unbounded in length -- ``--`` followed by 100 KB of letters is a well-formed
+#: option name -- and a token cap is what keeps the token count above from being the
+#: only bound on a line re-emitted every cycle while the pid lives. A clipped token
+#: is marked with a trailing ``~`` for the same reason a withheld one is counted:
+#: neither may read as the whole thing.
+_MAX_CMD_TOKEN_CHARS = 48
 
 
 def _redacted_command(cmd: str, hit: re.Match[str]) -> str:
@@ -468,12 +492,24 @@ def _redacted_command(cmd: str, hit: re.Match[str]) -> str:
 
     * the leading token and any runner token, as a BASENAME -- the program's name
       is what identifies the command, while its directory is the part that leaks a
-      checkout layout, and a name that is not program-shaped is withheld instead;
-    * option NAMES, with the value dropped at the ``=``, and the value kept only
-      when it is entirely digits;
-    * nothing else. Targets, option values and bare words are counted, not shown,
-      and the count is printed as ``+<n>`` so a truncated command cannot read as a
-      complete one.
+      checkout layout, and a name that is not program-shaped is withheld instead.
+      A token holding ``=`` is never a program name: it is an inline environment
+      assignment, whose value can itself contain ``/``, so the ``=`` is tested
+      BEFORE the directory is dropped -- otherwise the tail of
+      ``AWS_SECRET_ACCESS_KEY=…/abc`` arrives at the shape test as ``abc`` and
+      passes it;
+    * option NAMES, with the value dropped at the ``=``. A LONG option can hold a
+      value no other way, but a SHORT one glues it on with nothing to split at
+      (``-kMyCustomerName``), so only a bare two-character short flag is echoed
+      whole and a longer one keeps its first two characters;
+    * the cap flag with its numeric value, because that is the field the rule
+      judged;
+    * nothing else. Targets and bare words are counted, not shown, and the count is
+      printed as ``+<n>`` so a truncated command cannot read as a complete one. An
+      option's VALUE is not in that count: it is dropped at the name boundary, and a
+      flag printed without a value is itself the record that one went. A retained
+      token is clipped at ``_MAX_CMD_TOKEN_CHARS`` and marked ``~``, since every
+      shape above admits an arbitrarily long token.
 
     The text comes from the same ``cmdline`` read the rule matched, so it cannot
     disagree with ``rule=`` about what was seen. Splitting on whitespace means an
@@ -486,18 +522,35 @@ def _redacted_command(cmd: str, hit: re.Match[str]) -> str:
     segment = cmd[max(before) + 1 : min(after) if after else len(cmd)]
     kept: list[str] = []
     withheld = 0
+
+    def keep(text: str) -> None:
+        """Append *text*, clipped to the per-token bound and marked when clipped."""
+        if len(text) > _MAX_CMD_TOKEN_CHARS:
+            text = text[:_MAX_CMD_TOKEN_CHARS] + "~"
+        kept.append(text)
+
     for index, token in enumerate(segment.split()):
         bare = token.strip("\"'")
-        base = bare.replace("\\", "/").rpartition("/")[2]
+        assigned = "=" in bare
+        # Dropping the directory is safe only once the token is known not to be an
+        # assignment: the strip is what turns a slash-bearing secret VALUE into a
+        # program-shaped word.
+        base = "" if assigned else bare.replace("\\", "/").rpartition("/")[2]
         name = bare.split("=", 1)[0]
         if len(kept) >= _MAX_CMD_TOKENS:
             withheld += 1
         elif base.lower() in _RUNNER_BASES or (index == 0 and _SAFE_PROGRAM_RE.match(base)):
-            kept.append(base)
+            keep(base)
         elif _SAFE_NUMERIC_FLAG_RE.match(bare):
-            kept.append(bare)
-        elif _SAFE_FLAG_RE.match(name):
-            kept.append(name)
+            keep(bare)
+        elif _SAFE_LONG_FLAG_RE.match(name) or _SAFE_SHORT_FLAG_RE.match(name):
+            keep(name)
+        elif not assigned and _SAFE_SHORT_FLAG_RE.match(bare[:2]):
+            # A short flag with its value glued on. Printing the name and dropping
+            # the value is what the ``=`` spelling already does one branch up, so
+            # the two spellings of one flag read the same and neither adds to the
+            # withheld count -- a flag shown without its value says a value went.
+            keep(bare[:2])
         else:
             withheld += 1
     if withheld:

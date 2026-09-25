@@ -972,9 +972,11 @@ and ages into `IDLE`.
 
 `cmd=` on a `BANNED` line is the matched command reduced to what cannot hold a
 secret: the program name, the runner name, option names with their values dropped
-(a digits-only value is kept, since that is the cap the rule judged), and `+<n>`
-for the arguments withheld. Read it before stopping anyone — it is what separates
-a real uncapped run from a command that merely names one, and no argv is echoed.
+(the cap flag keeps its digits, since that is the field the rule judged), `+<n>`
+for the arguments withheld, and a trailing `~` on any single token long enough to
+be clipped. An inline `KEY=value` in front of the command is withheld whole. Read
+it before stopping anyone — it is what separates a real uncapped run from a
+command that merely names one, and no argv is echoed.
 
 The handled set keeps the last dispositioned PAYLOAD report as `settled`, so a
 later `IDLE` or `NOPROGRESS` mark on the same session cannot resurrect a ruling
