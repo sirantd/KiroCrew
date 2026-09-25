@@ -974,6 +974,44 @@ class TestRotationSplitting:
         assert r._segment_uploads_safe is True
 
     @pytest.mark.asyncio
+    async def test_a_midline_cut_in_indented_code_degrades_uploads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A four-space indented logical line that is dirty-cut MID-LINE leaves
+        the tail continuing that literal-code context without its indent (GPT
+        security finding).
+
+        A reference arriving on the de-indented tail later would scan
+        markup-bearing alone, so the semantic seal would upload a source-literal
+        file the full text keeps literal. The per-chunk span scan cannot see it
+        (the ref has not arrived at rotation) and no backtick or escape debt is
+        present, so the rotation must fail closed on the indentation alone.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        # One over-limit indented-code line, no ref yet; it is cut mid-line and
+        # the tail resumes the same logical line without the four-space indent.
+        r._buf = ["    " + "y" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is False
+
+    @pytest.mark.asyncio
+    async def test_a_midline_cut_without_indent_keeps_uploads_eligible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The indentation-debt rule fires only on a real four-space indent.
+
+        A non-indented logical line cut mid-line opens no literal-code context,
+        so a reference on its tail is genuinely real in the full text too and
+        extraction handles it correctly -- no literalness flip, no degrade.
+        """
+        r, _ = self._renderer(monkeypatch, 60)
+        assert r._segment_uploads_safe is True
+        r._buf = ["z" * 90 + "\n"]
+        await r._rotate_on_length()
+        assert r._segment_uploads_safe is True
+
+    @pytest.mark.asyncio
     async def test_fence_grammar_seams_survive_a_rotation(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

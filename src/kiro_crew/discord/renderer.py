@@ -975,6 +975,26 @@ class DiscordRenderer(Renderer):
                     run = len(sealed_text) - len(sealed_text.rstrip("\\"))
                     if run % 2 == 1:
                         degraded = True
+                if not degraded:
+                    # Indentation debt across the seal boundary. A four-space
+                    # indented logical line is literal code, but only relative
+                    # to its own line start. When the cut lands MID-LINE inside
+                    # such a line, the sealed prefix keeps the indent and the
+                    # live tail resumes the same logical line without it — so a
+                    # reference that arrives on the tail later scans markup-
+                    # bearing alone and the semantic seal uploads a
+                    # source-literal file, though the full text keeps it
+                    # literal. Neither the per-chunk span scan (the ref has not
+                    # arrived at rotation) nor the backtick/escape scans (this
+                    # debt carries no ` or `\`) can see it. A clean line-
+                    # boundary cut needs no equivalent: ``split_markdown_safe``
+                    # never strips leading whitespace, so the tail keeps its own
+                    # indent. Fail closed.
+                    cut = len(split_source) - len(tail)
+                    if 0 < cut < len(split_source) and split_source[cut - 1] != "\n":
+                        line_start = split_source.rfind("\n", 0, cut) + 1
+                        if split_source[line_start:cut].expandtabs(4).startswith("    "):
+                            degraded = True
             if degraded:
                 self._segment_uploads_safe = False
         for ch in sealed:
