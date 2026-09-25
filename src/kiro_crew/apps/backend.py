@@ -78,7 +78,11 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.session_pid import group_vouching_available, signal_orphaned_spawn_group
+from kiro_crew.session_pid import (
+    group_vouching_available,
+    process_spawn_instance,
+    signal_orphaned_spawn_group,
+)
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 
@@ -368,6 +372,92 @@ def _capture_adopted_owners(
         )
         return None
     return owners, start_times
+
+
+def _adoption_provenance(app_name: str, owners: list[int]) -> tuple[bool, str]:
+    """Whether EVERY pid in *owners* is attributable to this gateway's spawn for *app_name*.
+
+    Adoption otherwise keys on two facts that say nothing about the code the
+    listener runs: the port the manifest declares, and a health answer on it. A
+    backend that outlives its app's uninstall and rebinds that port satisfies both,
+    so the next install that happens to use the same app name adopts it -- the
+    gateway then addresses a process the install did not place as that app's
+    backend, reports its health as the app's, and aims stop at its PIDs.
+
+    The record that closes it already exists: every backend this gateway spawns is
+    written to the app pidfile as ``pid`` + ``start_time`` + per-spawn
+    ``spawn_instance``, and that file lives in the crew data home, which the sandbox
+    masks from an app backend's own namespace. Two routes attribute ONE owner, and
+    either is enough for that owner:
+
+    ``leader`` -- the owner IS the recorded pid and its live start instant still
+    equals the recorded one. A pid plus a start instant names one process for good,
+    so this route answers on every platform, and it attributes that pid alone.
+
+    ``tree`` -- the owner's exec-time environment carries the recorded
+    ``spawn_instance``. The whole spawn tree inherits that token, so this route
+    reaches a pre-fork worker or a detached child still holding the port after its
+    leader has exited. It reads ``/proc/<pid>/environ``, which exists on Linux
+    alone; :func:`group_vouching_available` reports that, and the reason names it
+    so an operator can tell "not ours" from "this host cannot see".
+
+    EVERY owner must clear a route, because every owner the caller captured enters
+    the managed set and is signalled at stop. A same-UID ``SO_REUSEPORT`` co-binder
+    lands in the same dispatch tier as the real backend, so attributing the set from
+    one match would hand stop an unrelated process to terminate -- and the start-time
+    token stop re-checks was captured at the same moment, so it confirms that
+    bystander rather than excluding it.
+
+    FAILS CLOSED, uniformly: no recorded spawn, an unreadable pidfile, a row
+    carrying neither usable identity, an empty owner set, and any owner no route
+    attributes all return ``False``. Refusing costs a start on a port the gateway
+    does not own, which the caller reports; adopting on an unproven listener is the
+    defect itself.
+
+    Returns ``(attributed, reason)``. *reason* is a short phrase for the log and the
+    audit trail on both verdicts.
+    """
+    if not owners:
+        return False, "no owning pid to attribute"
+    try:
+        with _pidfile_lock:
+            row = _read_pidfile().get(app_name)
+    except Exception as exc:  # noqa: BLE001 — an unreadable record must refuse, not raise
+        return False, f"app pidfile unreadable ({exc})"
+    if not isinstance(row, dict):
+        return False, "no spawn recorded for this app"
+    try:
+        recorded_pid = int(row.get("pid", 0))
+    except (TypeError, ValueError):
+        recorded_pid = 0
+    recorded_start = row.get("start_time")
+    instance = row.get("spawn_instance")
+    if not isinstance(instance, str) or not instance:
+        instance = ""
+    vouchable = bool(instance) and group_vouching_available()
+    unattributed: list[int] = []
+    for pid in owners:
+        if (
+            recorded_pid > 0
+            and recorded_start
+            and pid == recorded_pid
+            and _proc_start_time(pid) == recorded_start
+        ):
+            continue
+        if vouchable and process_spawn_instance(pid) == instance:
+            continue
+        unattributed.append(pid)
+    if not unattributed:
+        return True, f"every owner {owners} belongs to the recorded spawn"
+    if not instance:
+        why = "the row carries no spawn instance to vouch its tree with"
+    elif not vouchable:
+        why = "this host cannot read a process's spawn instance"
+    else:
+        why = "they were not placed by this gateway for this app"
+    return False, (
+        f"owner pid(s) {unattributed} are not the recorded spawn (pid {recorded_pid}): {why}"
+    )
 
 
 def _pid_is_self_or_descendant_of(pid: int, ancestor: int) -> bool:
@@ -2046,13 +2136,6 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             healthy = _probe_adoption_health(port, manifest.backend.healthCheck)
 
             if healthy:
-                try:
-                    sel().log_api_access(
-                        caller="gateway", operation="app_backend_adopt",
-                        outcome="adopted", resources=f"{app_name} port={port}",
-                    )
-                except Exception as exc:
-                    logger.debug("SEL audit failed for app %s backend adopt: %s", app_name, exc)
                 # Record owning PIDs at adoption time, scoped to the listener
                 # the health probe actually reached. The probe above only ever
                 # talks to 127.0.0.1:<port>; loopback_owner_pids mirrors the
@@ -2068,7 +2151,33 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 if adopted is None:
                     return None
                 adopted_pids, adopted_start_times = adopted
-                logger.info("App %s: healthy instance already on port %d — adopting (pids=%s)", app_name, port, adopted_pids)
+                # The owner set is what provenance is judged on, so this runs here
+                # rather than before the capture: a health answer on the declared
+                # port says nothing about which process gave it, and the identity
+                # question is "is this listener the spawn this gateway recorded for
+                # this app". A listener nothing attributes is refused — see
+                # _adoption_provenance for the routes and the fail-closed cases.
+                attributed, provenance = _adoption_provenance(app_name, adopted_pids)
+                try:
+                    sel().log_api_access(
+                        caller="gateway", operation="app_backend_adopt",
+                        outcome="adopted" if attributed else "refused_unattributed",
+                        resources=f"{app_name} port={port} provenance={provenance}",
+                    )
+                except Exception as exc:
+                    logger.debug("SEL audit failed for app %s backend adopt: %s", app_name, exc)
+                if not attributed:
+                    logger.warning(
+                        "App %s: refusing to adopt the instance on port %d (pids %s): %s. "
+                        "Stop that process before starting this app, or let the gateway "
+                        "spawn the backend on a port it owns.",
+                        app_name, port, adopted_pids, provenance,
+                    )
+                    return None
+                logger.info(
+                    "App %s: healthy instance already on port %d — adopting (pids=%s, %s)",
+                    app_name, port, adopted_pids, provenance,
+                )
                 ap = AppProcess(
                     app_name=app_name, port=port, pid=0, proc=None,
                     healthy=True, started_at=time.time(), log_path=str(log_path),
@@ -2077,13 +2186,16 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                     gateway_started=True,
                     # NOT `_admitted_builtin`. That classification is sound only for a
                     # process the gateway itself launched from the path the gate vetted.
-                    # Here the gateway launched nothing: it found a listener already
-                    # answering on the port and adopted it, and no check establishes
-                    # that the listener is executing the shipped code the manifest
-                    # declares. Carrying the exemption across would let anything that
-                    # answers a builtin's port inherit "shipped provenance" and be
-                    # skipped by the revocation sweep for good -- the next boot re-probes
-                    # and re-adopts to the same verdict, so it would never self-correct.
+                    # Here the gateway launched nothing on this call: it found a listener
+                    # already answering on the port. Provenance names that listener as a
+                    # spawn this gateway recorded for this app, which is what admits it
+                    # at all, but it does not establish that the process is still
+                    # executing the shipped code the manifest declares -- a spawn outlives
+                    # an in-place rewrite of the files it started from. Carrying the
+                    # exemption across would let a listener inherit "shipped provenance"
+                    # and be skipped by the revocation sweep for good -- the next boot
+                    # re-probes and re-adopts to the same verdict, so it would never
+                    # self-correct.
                     # The ceiling therefore applies to an adopted backend. A genuinely
                     # shipped one is stopped and respawned BY the gateway, which vets
                     # its execution path and classifies it correctly on that path.
@@ -2886,10 +2998,25 @@ def stop_app_backend(
             _restart_attempts.pop(app_name, None)
         # Keep cleanup inside the lifecycle transition's serialization. A later explicit
         # start cannot record its successor between the pop and this identity check.
+        # The removed row is kept because this stop can still REFUSE below, and each
+        # refusal restores tracking for a retry; an adopted backend's provenance is read
+        # from that row, so a retry without it cannot attribute the listener it is
+        # trying to stop and refuses forever.
+        forgotten_row: dict[str, Any] | None = None
         if ap is not None and ap.proc is not None:
-            _forget_app_pid_if(app_name, ap.pid, ap.pid_start_time)
+            forgotten_row = _forget_app_pid_if(app_name, ap.pid, ap.pid_start_time)
         else:
-            _forget_app_pid(app_name)
+            forgotten_row = _forget_app_pid(app_name)
+
+    def _restore_for_retry() -> None:
+        """Undo exactly what the transition above removed, so a retry can proceed."""
+        if forgotten_row is not None:
+            _restore_app_pid(app_name, forgotten_row)
+        with _lock:
+            if ap is not None:
+                _processes.setdefault(app_name, ap)
+                if ap.port:
+                    _allocated_ports.setdefault(app_name, ap.port)
 
     if not ap:
         return False
@@ -2968,10 +3095,7 @@ def stop_app_backend(
                     "SEL audit failed for rejected_descendant_serving %s: %s",
                     app_name, exc,
                 )
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
     elif not ap.proc and ap.port:
         # Adopted process (proc=None) — kill only PIDs we recorded at adoption
@@ -2990,10 +3114,7 @@ def stop_app_backend(
             except Exception as exc:
                 logger.debug("SEL audit failed for rejected_no_pids %s: %s", app_name, exc)
             # Restore tracking so a retry is possible after re-adoption
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
         try:
             # PID-reuse guard: signal a recorded PID only when its live
@@ -3100,10 +3221,7 @@ def stop_app_backend(
                 app_name, ap.port, exc,
             )
             # Restore tracking so a retry is possible
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
         if (
             _retry_if_serving is not None
@@ -3141,10 +3259,7 @@ def stop_app_backend(
                     "SEL audit failed for rejected_replacement_serving %s: %s",
                     app_name, exc,
                 )
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
 
     if ap.proc:
@@ -3636,6 +3751,14 @@ def _rebind_adopted_owners(ap: AppProcess, health_path: str) -> bool:
     Reuses the adoption-time consistency sandwich (:func:`_capture_adopted_owners`), so a
     responder that exits mid-capture cannot hand ownership to a bystander. Returns False
     when ownership cannot be established, which the caller treats as "do not promote".
+
+    Attribution is re-asked on the re-captured set, not inherited from the adoption
+    that installed this record. The set can be a DIFFERENT population: this path runs
+    after an adopted backend stops answering, so an unrelated listener that answers the
+    declared health path in its place would otherwise be written into the owner record
+    and promoted -- the same "outlives its app and rebinds that port" shape
+    :func:`_adoption_provenance` exists to refuse, reached through recovery instead of
+    through a start.
     """
     try:
         captured = _capture_adopted_owners(ap.app_name, ap.port, health_path)
@@ -3652,6 +3775,22 @@ def _rebind_adopted_owners(ap: AppProcess, health_path: str) -> bool:
         )
         return False
     pids, start_times = captured
+    attributed, provenance = _adoption_provenance(ap.app_name, pids)
+    if not attributed:
+        try:
+            sel().log_api_access(
+                caller="gateway", operation="app_backend_adopt",
+                outcome="refused_unattributed",
+                resources=f"{ap.app_name} port={ap.port} rebind provenance={provenance}",
+            )
+        except Exception as exc:
+            logger.debug("SEL audit failed for app %s rebind refusal: %s", ap.app_name, exc)
+        logger.warning(
+            "App %s: refusing to re-bind the instance on port %s (pids %s): %s. "
+            "Leaving it unhealthy rather than managing a listener this gateway does not own.",
+            ap.app_name, ap.port, pids, provenance,
+        )
+        return False
     with _lock:
         if _processes.get(ap.app_name) is not ap:
             return False
@@ -4694,19 +4833,35 @@ def _record_app_pid(
     return start_time
 
 
-def _forget_app_pid(app_name: str) -> None:
-    """Drop an app's pidfile entry (called when no process identity is tracked)."""
+def _forget_app_pid(app_name: str) -> dict[str, Any] | None:
+    """Drop an app's pidfile entry and return it (called when no process identity is tracked).
+
+    The removed row is handed BACK so a caller that must undo the removal can. A stop
+    drops the row inside its lifecycle transition, before it signals anything, and it
+    can then REFUSE and restore tracking; the row is where an adopted backend's
+    provenance is read from, so leaving it dropped makes every retry unable to
+    attribute the listener it is trying to stop.
+    """
     try:
         with _pidfile_lock:
             data = _read_pidfile()
-            if data.pop(app_name, None) is not None:
+            removed = data.pop(app_name, None)
+            if removed is not None:
                 _write_pidfile(data)
+            return removed if isinstance(removed, dict) else None
     except Exception as exc:  # noqa: BLE001
         logger.debug("Could not forget app pid for %s: %s", app_name, exc)
+        return None
 
 
-def _forget_app_pid_if(app_name: str, pid: int, start_time: str | None) -> None:
-    """Drop a pidfile row only if it still identifies the expected process."""
+def _forget_app_pid_if(
+    app_name: str, pid: int, start_time: str | None
+) -> dict[str, Any] | None:
+    """Drop a pidfile row only if it still identifies the expected process.
+
+    Returns the removed row, or ``None`` when the row stayed, for the same
+    reversibility reason as :func:`_forget_app_pid`.
+    """
     try:
         with _pidfile_lock:
             data = _read_pidfile()
@@ -4718,8 +4873,31 @@ def _forget_app_pid_if(app_name: str, pid: int, start_time: str | None) -> None:
             ):
                 data.pop(app_name, None)
                 _write_pidfile(data)
+                return entry
+            return None
     except Exception as exc:  # noqa: BLE001
         logger.debug("Could not conditionally forget app pid for %s: %s", app_name, exc)
+        return None
+
+
+def _restore_app_pid(app_name: str, row: dict[str, Any]) -> None:
+    """Put back a row a refused stop removed, unless the name has been re-recorded.
+
+    Deliberately ``setdefault`` and not an overwrite: between the removal and the
+    restore a fresh spawn can have recorded its own identity, and replacing that with
+    the older row would aim both the stale-reap and adoption provenance at a process
+    that is gone. Never raises -- a restore that cannot happen leaves the retry no
+    worse off than before this function existed.
+    """
+    try:
+        with _pidfile_lock:
+            data = _read_pidfile()
+            if app_name in data:
+                return
+            data[app_name] = row
+            _write_pidfile(data)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not restore app pid for %s: %s", app_name, exc)
 
 
 def retire_windows_app_tracking(pid: int, creation: int) -> None:
