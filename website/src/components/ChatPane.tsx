@@ -2001,7 +2001,7 @@ export default function ChatPane({
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)
-              navigate(settingsPath({ tab: 'chat', highlight: 'key:dashboard.model_picker_hidden_models' }))
+              navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
             }} />}
           </div>,
           document.body,

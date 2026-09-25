@@ -10,6 +10,7 @@
  * download-disabled gate and the in-flight gate are the two places where the
  * wrong answer puts a button in front of the user that cannot do anything.
  */
+import { MemoryRouter } from 'react-router-dom'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -72,9 +73,9 @@ import { Provider } from 'react-redux'
 // not the app singleton: a shared store would carry `activeSlot` across suites.
 import { createTestStore } from './helpers'
 
-function wrap(ui: React.ReactElement, store = createTestStore()) {
+function wrap(ui: React.ReactElement, store = createTestStore(), sub = 'discovery') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<Provider store={store}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
+  return render(<MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}><Provider store={store}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider></MemoryRouter>)
 }
 
 const statusLine = () => screen.queryByTestId('feature-video-status')
