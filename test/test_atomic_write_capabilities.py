@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -44,6 +45,42 @@ def test_bytes_content_is_not_newline_translated(tmp_path):
     aw.atomic_write(target, b"\r\n\n\r")
 
     assert target.read_bytes() == b"\r\n\n\r"
+
+
+def test_durable_mkdir_syncs_created_ancestors_deepest_first(tmp_path, monkeypatch):
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    target = existing / "one" / "two" / "store"
+    synced: list[Path] = []
+    monkeypatch.setattr(aw, "fsync_dir", lambda path: synced.append(Path(path)))
+
+    aw.durable_mkdir(target)
+
+    assert target.is_dir()
+    assert synced == [existing / "one" / "two", existing / "one", existing]
+
+
+def test_durable_mkdir_existing_tree_has_no_sync_cost(tmp_path, monkeypatch):
+    target = tmp_path / "existing" / "store"
+    target.mkdir(parents=True)
+    synced: list[Path] = []
+    monkeypatch.setattr(aw, "fsync_dir", lambda path: synced.append(Path(path)))
+
+    aw.durable_mkdir(target)
+
+    assert synced == []
+
+
+def test_durable_mkdir_propagates_creation_sync_failure(tmp_path, monkeypatch):
+    target = tmp_path / "new" / "store"
+
+    def fail_sync(_path):
+        raise OSError("directory sync failed")
+
+    monkeypatch.setattr(aw, "fsync_dir", fail_sync)
+    with pytest.raises(OSError, match="directory sync failed"):
+        aw.durable_mkdir(target)
+    assert target.is_dir()
 
 
 @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="descriptor-relative writes are POSIX")

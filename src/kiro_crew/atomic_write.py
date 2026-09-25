@@ -499,6 +499,39 @@ def fsync_dir(path: Path | str, *, best_effort: bool = False) -> None:
         )
 
 
+def durable_mkdir(path: Path | str, *, parents: bool = True, exist_ok: bool = True) -> None:
+    """Create *path* and sync every directory entry created along the way.
+
+    ``Path.mkdir(parents=True)`` can create several levels, but the name of each
+    new level lives in its parent's directory metadata. A power loss can therefore
+    remove the whole new subtree after ``mkdir`` returned unless those parents are
+    synced too.
+
+    Record missing levels before creation, stopping at the nearest lexically
+    existing ancestor. After ``mkdir`` succeeds, sync each created level's parent
+    deepest-first, ending at that pre-existing ancestor. Existing hierarchies pay
+    no sync cost. The walk deliberately does not call ``resolve()``: an existing
+    symlink is a trusted boundary rather than an invitation to climb its target.
+
+    Syncs are strict for real I/O errors because creation has not published the
+    caller's file yet; callers can still abort honestly. Unsupported directory
+    syncing remains quiet under :func:`fsync_dir`'s platform contract.
+    """
+    target = Path(path)
+    missing: list[Path] = []
+    level = target
+    while not level.exists():
+        missing.append(level)
+        parent = level.parent
+        if parent == level:
+            break
+        level = parent
+
+    target.mkdir(parents=parents, exist_ok=exist_ok)
+    for created in missing:
+        fsync_dir(created.parent)
+
+
 def read_bytes_with_retry(path: Path | str, *, max_bytes: int | None = None) -> bytes:
     """``Path.read_bytes()``, retrying the Windows sharing-violation window.
 
