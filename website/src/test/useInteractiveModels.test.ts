@@ -6,7 +6,7 @@ import { api } from '../api/client'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-import { filterInteractiveModels, normalizeHiddenModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { filterInteractiveModels, normalizeHiddenModels, shouldSeparateCodexEffort, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 
 const MODELS = [
   { name: 'auto', description: '' },
@@ -64,6 +64,27 @@ describe('interactive model visibility', () => {
   it('filters hidden models but always keeps auto and the active model', () => {
     expect(filterInteractiveModels(MODELS, ['auto', 'model-a', 'model-b'], ['model-b']).map(model => model.name))
       .toEqual(['auto', 'model-b'])
+  })
+
+  it('offers one Codex model row per base model when effort variants are advertised', () => {
+    const codexModels = [
+      { name: 'gpt-6-sol[low]', description: 'Fast' },
+      { name: 'gpt-6-sol[medium]', description: 'Balanced' },
+      { name: 'gpt-6-sol[high]', description: 'Deep' },
+      { name: 'gpt-6-astra[max]', description: 'Flagship' },
+      { name: 'claude-opus-4.8[1m]', description: 'Long context' },
+    ]
+    expect(filterInteractiveModels(codexModels, [], [], true).map(model => model.name))
+      .toEqual(['gpt-6-sol', 'gpt-6-astra', 'claude-opus-4.8[1m]'])
+  })
+
+  it('enables separate effort only for an explicitly selected Codex backend', () => {
+    const pairModels = [{ name: 'gpt-6-sol[medium]' }]
+    expect(shouldSeparateCodexEffort('codex', pairModels)).toBe(true)
+    expect(shouldSeparateCodexEffort('claude', pairModels)).toBe(false)
+    expect(shouldSeparateCodexEffort('', pairModels)).toBe(false)
+    expect(shouldSeparateCodexEffort(undefined, pairModels)).toBe(false)
+    expect(shouldSeparateCodexEffort('codex', [{ name: 'auto' }])).toBe(false)
   })
 
   it('trims, deduplicates, and ignores invalid config entries', () => {

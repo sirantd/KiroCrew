@@ -26,6 +26,7 @@ from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_of
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.apps import permissions as app_permissions
@@ -68,6 +69,7 @@ from kiro_crew.dashboard.chat_orchestrator import (
 )
 from kiro_crew.dashboard.chat_persistence import (
     _FLUSH_SNAPSHOT_RETRIES,
+    _SAFE_EFFORT_RE,
     _TRANSIENT_ROLES,
     COLOR_HEX_RE,
     _attach_variants,
@@ -136,6 +138,7 @@ from kiro_crew.dashboard.remote_adopt import (
 from kiro_crew.dashboard.remote_relay import (
     RemoteTurnError,
     create_peer_slot,
+    ensure_version_parity,
     forward_peer_selection,
     forward_peer_stop,
     peer_is_connected,
@@ -9335,6 +9338,91 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             "skipped_running": skipped_running,
             "unchanged": unchanged,
             "failed": failed,
+        }
+    )
+
+
+async def api_chat_slot_selection_capabilities(request: web.Request) -> web.Response:
+    """Report the live ACP session's model and effort selection capabilities.
+
+    An absent session is unknown, not unsupported. The composer can preserve its
+    cold-start behavior until the first ACP session has advertised its options.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if slot is None:
+        return _slot_not_found()
+    denied = _deny_cross_app_slot_access(request, slot, name, "slot_selection_capabilities")
+    if denied is not None:
+        return denied
+    if slot.is_remote:
+        denied = deny_non_owner_remote_operation(request, slot, "slot_selection_capabilities")
+        if denied is not None:
+            return denied
+        mgr = getattr(state, "instances_manager", None)
+        if mgr is None:
+            return web.json_response({"known": False})
+        try:
+            await ensure_version_parity(mgr, slot.instance_id)
+            async with mgr.proxy_request(
+                slot.instance_id,
+                "GET",
+                f"api/chat/slots/{slot.remote_slot}/selection-capabilities",
+            ) as upstream:
+                raw = await upstream.content.read(4097)
+                status = upstream.status
+            if status != 200 or len(raw) > 4096:
+                return web.json_response({"known": False})
+            peer = json.loads(raw)
+        except Exception as exc:
+            logger.debug("Peer selection capabilities unavailable (%s)", type(exc).__name__)
+            return web.json_response({"known": False})
+        if not isinstance(peer, dict) or peer.get("known") is not True:
+            return web.json_response({"known": False})
+        backend = peer.get("backend")
+        if not isinstance(backend, str) or len(backend) > 32:
+            return web.json_response({"known": False})
+        levels = peer.get("effort_levels")
+        levels = (
+            [
+                level
+                for level in levels[:32]
+                if isinstance(level, str) and _SAFE_EFFORT_RE.fullmatch(level)
+            ]
+            if isinstance(levels, list)
+            else []
+        )
+        return web.json_response(
+            {
+                "known": True,
+                "backend": backend,
+                "effort_supported": peer.get("effort_supported") is True,
+                "effort_levels": levels,
+                "model_effort_pair_ids": backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
+            }
+        )
+    provider = state.sessions.get_provider(effective_session_key(slot))
+    if not isinstance(provider, AcpProvider):
+        return web.json_response({"known": False})
+    backend = provider.capabilities.backend
+    supported = provider.supports_effort()
+    levels = (
+        [
+            level
+            for level in provider.get_valid_effort_levels()
+            if isinstance(level, str) and _SAFE_EFFORT_RE.fullmatch(level)
+        ][:32]
+        if supported
+        else []
+    )
+    return web.json_response(
+        {
+            "known": True,
+            "backend": backend,
+            "effort_supported": supported,
+            "effort_levels": levels,
+            "model_effort_pair_ids": backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
         }
     )
 

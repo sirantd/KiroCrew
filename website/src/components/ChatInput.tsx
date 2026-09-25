@@ -625,6 +625,7 @@ interface ChatInputProps {
   approvalMode?: string
   reasoningEffort?: string
   onReasoningEffortClick?: (rect: DOMRect) => void
+  separateEffort?: boolean
   providerId?: string
   /** Invoked when an @-mention picks a file or directory. `kind` defaults to
    *  'file'. `token` is the exact composer text the pick inserted (e.g.
@@ -981,6 +982,7 @@ function ChatInput({
   approvalMode,
   reasoningEffort,
   onReasoningEffortClick,
+  separateEffort,
   providerId: _providerId,
   onFileSelect,
   onFileOpen,
@@ -5194,13 +5196,27 @@ function ChatInput({
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>
                 </>
               )}
-              {onReasoningEffortClick && !shelfCompact && (
+              {onReasoningEffortClick && !separateEffort && !shelfCompact && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
                   <span className="opacity-60 shrink-0">{effortLabel(reasoningEffort || '')}</span>
                 </>
               )}
             </button>
+          )}
+          {separateEffort && onReasoningEffortClick && (
+            <div className="ml-1 pl-1 border-l border-border flex items-center shrink-0">
+              <Btn
+                type="button"
+                className="inline-flex items-center h-7 px-2 text-[12px] text-muted hover:text-text rounded-md border-none bg-transparent"
+                aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+                title={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+                disabled={isRunning}
+                onClick={e => onReasoningEffortClick(e.currentTarget.getBoundingClientRect())}
+              >
+                {effortLabel(reasoningEffort || '')}
+              </Btn>
+            </div>
           )}
           </div>
         </div>

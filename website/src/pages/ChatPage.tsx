@@ -251,7 +251,7 @@ import WelcomeView from '../components/WelcomeView'
 import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
-import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { filterInteractiveModels, modelWithoutEffort, shouldSeparateCodexEffort, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
@@ -918,6 +918,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
   const localModels = useAvailableModels()
+  const backendConfigQ = useQuery<{ agent?: { acp_backend?: string } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
   // A peer-bound session's shelf must offer the PEER's rosters. Both hooks above
   // read THIS machine same-origin, so a remote session left on them would list
   // crews and models that do not exist over there — accepted by the picker, then
@@ -935,10 +939,28 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       contextWindow: m.context_window || undefined,
     }))
   }, [remoteCrew.isRemote, remoteCrew.capabilities, localModels])
+  const selectionCapabilitiesQ = useQuery({
+    queryKey: ['slot-selection-capabilities', activeSlot],
+    queryFn: () => api.chatSlotSelectionCapabilities(activeSlot!),
+    enabled: !!activeSlot,
+    // A new ACP session may not exist when its slot first appears. Recheck
+    // until the agent reports its config options, then refresh less often.
+    refetchInterval: query => query.state.data?.known ? 30_000 : 2_000,
+  })
+  const selectionCapabilities = selectionCapabilitiesQ.data?.known
+    ? selectionCapabilitiesQ.data
+    : undefined
   const hiddenModelsQ = useModelPickerHiddenModelsQuery()
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
+  // The backend ID is authoritative. A non-Codex harness may advertise the
+  // same bracketed model shape without accepting Codex's base-model/effort split.
+  const activeBackend = selectionCapabilities?.backend ?? (remoteCrew.isRemote
+    ? remoteCrew.capabilities?.acp_backend
+    : backendConfigQ.data?.agent?.acp_backend)
+  const codexPairModels = (!selectionCapabilities || selectionCapabilities.model_effort_pair_ids === true)
+    && shouldSeparateCodexEffort(activeBackend, effectiveModels)
   // Whether the picker may offer `Auto (Jev)` (see `lib/jevRoute.ts`): the fleet's
   // answer AND the owner's keystone consent, both required. Two reads the page
   // already makes for other reasons, so the row costs no new request.
@@ -970,12 +992,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         filterInteractiveModels(effectiveModels, hiddenModelIds, [
           pickerSlot?.model || '',
           pickerSlot?.served_model || '',
-        ]),
+        ], codexPairModels),
         jevRouteOn,
         jevRouteLabel,
       )
     },
-    [effectiveModels, hiddenModelIds, slots, activeSlot, jevRouteOn, jevRouteLabel],
+    [effectiveModels, hiddenModelIds, slots, activeSlot, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelPickerModels)
   // Whether the composer held focus when the picker was opened from its chip
@@ -3076,6 +3098,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           model: value,
           jev_route: modelName === JEV_ROUTE_MODEL,
         })))
+      queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', activeSlot] })
     } catch (e) {
       // Same failure surface as the agent switch beside this: the shared
       // notice toast, preferring the server's own message. The chip keeps
@@ -3090,7 +3113,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // notice toast above, never by a menu left open. Reasoning-effort edits
     // live on the drill-in page and keep the menu open on their own.
     // setPendingModel is a stable useState setter.
-  }, [activeSlot, dispatch, setPendingModel])
+  }, [activeSlot, dispatch, queryClient, setPendingModel])
   // A pick from the picker: a row click or Enter on the sole filtered match.
   // Closes the menu and, when the composer held focus at open time, hands
   // focus back to it (see `modelPickerReturnsFocusRef`). The picker's other
@@ -3820,21 +3843,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // authoritative — and is subscribed to rather than read, because it can flip
   // without the list changing.
   const _modelsDegraded = useModelsDegraded(provider.id)
+  const displayModels = codexPairModels
+    ? filterInteractiveModels(availableModels, [], [], true)
+    : availableModels
+  const modelPin = currentSlot?.model || resolvedModel || ''
+  const displayPin = codexPairModels ? modelWithoutEffort(modelPin) : modelPin
   const shownModel = displayModel(
-    currentSlot?.model || resolvedModel || '',
-    availableModels,
+    displayPin,
+    displayModels,
     _modelsDegraded,
     currentSlot?.model_withheld,
     // Names the backend's own choice when the slot inherits, so the chip is not
     // a bare `auto` for a session running one specific model.
-    currentSlot?.served_model,
+    codexPairModels ? modelWithoutEffort(currentSlot?.served_model || '') : currentSlot?.served_model,
   )
+  const effortSupported = provider.capabilities.reasoningEffort && (
+    selectionCapabilities
+      ? selectionCapabilities.effort_supported === true
+      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+  )
+  const effortLevelsOverride = selectionCapabilities
+    ? selectionCapabilities.effort_levels
+    : remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined
   // The same answer WITHOUT that substitution, for the pin-to-agent row: that
   // row asks about the PIN, and it must stay disabled for a withheld one even
   // now that the chip names the model the session inherited instead.
   const _pinShownModel = displayModel(
-    currentSlot?.model || resolvedModel || '',
-    availableModels,
+    displayPin,
+    displayModels,
     _modelsDegraded,
     currentSlot?.model_withheld,
   )
@@ -3845,16 +3881,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const remoteContextWindow = useMemo(() => {
     if (!remoteCrew.isRemote) return 0
     const picked = shownModel === 'auto' ? '' : shownModel
-    return remoteCrew.capabilities?.models.find(m => m.model_name === picked)?.context_window || 0
-  }, [remoteCrew.isRemote, remoteCrew.capabilities, shownModel])
-  // True when the pin row would be a no-op: the agent already stores exactly
-  // the model the composer is showing. 'auto' is the inherit spelling, never a
-  // stored pin, so it never counts as pinned. Reads the slot's REAL model, not
-  // `shownModel` — this pairs with the write below, and a display fallback must
-  // never decide what gets persisted.
-  const _modelPinActive = currentSlot?.model || resolvedModel || ''
+    return remoteCrew.capabilities?.models.find(m =>
+      (codexPairModels ? modelWithoutEffort(m.model_name) : m.model_name) === picked,
+    )?.context_window || 0
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, shownModel, codexPairModels])
+  // True when the pin row would be a no-op: the agent already stores the
+  // selected base model. 'auto' is the inherit spelling, never a stored pin.
+  // Read the slot's pin through displayPin, not the fallback shownModel: a
+  // withheld model must never become the value saved to the agent template.
+  const _modelPinActive = displayPin
   const _modelPinPinned =
-    !!_modelPinCfg?.model && _modelPinCfg.model === _modelPinActive && _modelPinActive !== 'auto'
+    !!_modelPinCfg?.model &&
+    (codexPairModels ? modelWithoutEffort(_modelPinCfg.model) : _modelPinCfg.model) === _modelPinActive &&
+    _modelPinActive !== 'auto'
   // The configured default effort for new sessions. A slot that has never
   // touched the effort control carries '' (no override) but still RUNS at this
   // default — the backend applies `slot.reasoning_effort or agent.reasoning_effort`
@@ -7819,7 +7858,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               approvalMode={displayMode}
               providerId={provider.id}
               reasoningEffort={effectiveEffort}
-              onReasoningEffortClick={provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
+              separateEffort={effortSupported}
+              onReasoningEffortClick={effortSupported ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
               onAutomationClick={setAutomationOpen}
               automation={automation}
               automationOpen={automationOpen}
@@ -7932,11 +7972,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 onClose={() => setModelDropdown(false)}
                 modelVisibilityError={hiddenModelsQ.isError}
                 onRetryModelVisibility={() => hiddenModelsQ.refetch()}
-                hasEffort={!!(activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel))}
+                hasEffort={false}
                 slot={activeSlot}
                 currentEffort={currentSlot?.reasoning_effort || ''}
                 defaultEffort={defaultEffort}
-                effortLevelsOverride={remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined}
+                effortLevelsOverride={effortLevelsOverride}
                 onManageModels={modelPickerConfigured ? undefined : () => {
                   setModelDropdown(false)
                   navigate(settingsPath({ tab: 'chat', highlight: 'key:dashboard.model_picker_hidden_models' }))
@@ -8011,9 +8051,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               )
             })()}
             {/* Reasoning effort dropdown portal */}
-            {reasoningEffortDropdown && reasoningEffortBtnRect && activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) && createPortal(
+            {reasoningEffortDropdown && reasoningEffortBtnRect && activeSlot && effortSupported && createPortal(
               <div ref={reasoningEffortDropdownRef} className="fixed z-[9999] animate-slide-up" style={(() => { const left = Math.max(8, Math.min(reasoningEffortBtnRect.left, window.innerWidth - 220)); return { bottom: window.innerHeight - reasoningEffortBtnRect.top + 4, left: isMobile ? 8 : left, ...(isMobile ? { right: 8, maxWidth: 'calc(100vw - 16px)' } : {}) } })()}>
-                <ReasoningEffortDropdown slot={activeSlot} currentEffort={currentSlot?.reasoning_effort || ''} defaultEffort={defaultEffort} levelsOverride={remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined} onClose={() => setReasoningEffortDropdown(false)} />
+                <ReasoningEffortDropdown slot={activeSlot} currentEffort={currentSlot?.reasoning_effort || ''} defaultEffort={defaultEffort} levelsOverride={effortLevelsOverride} onClose={() => setReasoningEffortDropdown(false)} />
               </div>,
               document.body
             )}

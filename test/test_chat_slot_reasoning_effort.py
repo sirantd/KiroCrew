@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+import kiro_crew
+from kiro_crew.dashboard import chat_handlers
 from kiro_crew.dashboard.chat import api_chat_slot_reasoning_effort
+from kiro_crew.dashboard.chat_handlers import api_chat_slot_selection_capabilities
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.providers.acp import AcpProvider
 
 
 def _make_app(state: DashboardState) -> web.Application:
@@ -17,6 +23,9 @@ def _make_app(state: DashboardState) -> web.Application:
     app["state"] = state
     app.router.add_post(
         "/api/chat/slots/{slot}/reasoning-effort", api_chat_slot_reasoning_effort
+    )
+    app.router.add_get(
+        "/api/chat/slots/{slot}/selection-capabilities", api_chat_slot_selection_capabilities
     )
     return app
 
@@ -33,6 +42,131 @@ def _mock_state(slot: _ChatSlot | None = None, provider: object = None) -> Dashb
     # (matches prior behaviour for the "no session yet" path).
     state.sessions.get_provider = MagicMock(return_value=provider)
     return state
+
+
+class TestSlotSelectionCapabilities:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend", "levels", "pair_ids"),
+        [
+            ("codex", ["low", "medium", "high"], True),
+            ("claude", ["low", "high"], False),
+            ("pi", ["off", "minimal", "high"], False),
+        ],
+    )
+    async def test_uses_the_live_acp_provider(self, backend, levels, pair_ids):
+        slot = _ChatSlot("test")
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend=backend)
+        provider.supports_effort.return_value = True
+        provider.get_valid_effort_levels.return_value = levels
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "known": True,
+            "backend": backend,
+            "effort_supported": True,
+            "effort_levels": levels,
+            "model_effort_pair_ids": pair_ids,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unknown_when_no_live_provider_exists(self):
+        state = _mock_state(_ChatSlot("test"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"known": False}
+
+    @pytest.mark.asyncio
+    async def test_live_provider_can_report_effort_unsupported(self):
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="opencode")
+        provider.supports_effort.return_value = False
+        state = _mock_state(_ChatSlot("test"), provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "known": True,
+            "backend": "opencode",
+            "effort_supported": False,
+            "effort_levels": [],
+            "model_effort_pair_ids": False,
+        }
+        provider.get_valid_effort_levels.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remote_slot_reads_the_peers_live_capabilities(self, monkeypatch):
+        slot = _ChatSlot("test")
+        slot.executor = "remote"
+        slot.instance_id = "nobita"
+        slot.remote_slot = "peer-chat-9"
+        state = _mock_state(slot)
+        payload = {
+            "known": True,
+            "backend": "pi",
+            "effort_supported": True,
+            "effort_levels": ["off", "minimal", "high"],
+            "model_effort_pair_ids": False,
+        }
+
+        class _Proxy:
+            async def __aenter__(self):
+                return SimpleNamespace(
+                    status=200,
+                    content=SimpleNamespace(read=AsyncMock(return_value=json.dumps(payload).encode())),
+                )
+
+            async def __aexit__(self, *_args):
+                return False
+
+        manager = SimpleNamespace(
+            peer_version=AsyncMock(return_value=(True, kiro_crew.__version__)),
+            proxy_request=MagicMock(return_value=_Proxy()),
+        )
+        state.instances_manager = manager
+        monkeypatch.setattr(chat_handlers, "deny_non_owner_remote_operation", lambda *_args: None)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == payload
+        manager.proxy_request.assert_called_once_with(
+            "nobita", "GET", "api/chat/slots/peer-chat-9/selection-capabilities"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remote_slot_is_unknown_when_its_peer_is_unavailable(self, monkeypatch):
+        slot = _ChatSlot("test")
+        slot.executor = "remote"
+        slot.instance_id = "nobita"
+        slot.remote_slot = "peer-chat-9"
+        state = _mock_state(slot)
+        state.instances_manager = SimpleNamespace(
+            peer_version=AsyncMock(return_value=(True, kiro_crew.__version__)),
+            proxy_request=MagicMock(side_effect=ConnectionError("peer offline")),
+        )
+        monkeypatch.setattr(chat_handlers, "deny_non_owner_remote_operation", lambda *_args: None)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"known": False}
 
 
 class TestChatSlotReasoningEffort:

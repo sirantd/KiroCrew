@@ -130,6 +130,25 @@ class TestPayloadShapes:
 
         assert data["default_agent"] == "coder"
 
+    async def test_the_peers_backend_is_carried_beside_its_roster(self, monkeypatch):
+        _enable_instances(monkeypatch)
+        replies = _all_ok(
+            **{
+                "/api/agents": (
+                    True,
+                    {
+                        "agents": [{"name": "coder"}],
+                        "default_agent": "coder",
+                        "acp_backend": "codex",
+                    },
+                ),
+            }
+        )
+
+        data = await _body(await hi.api_instances_capabilities(_request(_state(replies))))
+
+        assert data["acp_backend"] == "codex"
+
     async def test_an_unreadable_roster_reports_no_default_agent(self, monkeypatch):
         """ "" rather than a guess: the caller must not substitute the local default."""
         _enable_instances(monkeypatch)

@@ -848,8 +848,43 @@ describe('ChatInput', () => {
     })
   })
 
-  // ── Reasoning effort merged into model button ──
+  // ── Independent model and reasoning effort controls ──
   describe('reasoning effort button', () => {
+    it('opens effort without opening the model picker', () => {
+      const onModelClick = vi.fn()
+      const onReasoningEffortClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          modelName="gpt-6-sol[medium]"
+          reasoningEffort="high"
+          separateEffort
+          onModelClick={onModelClick}
+          onReasoningEffortClick={onReasoningEffortClick}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Reasoning effort' }))
+      expect(onReasoningEffortClick).toHaveBeenCalledOnce()
+      expect(onReasoningEffortClick.mock.calls[0][0]).toHaveProperty('x')
+      expect(onModelClick).not.toHaveBeenCalled()
+      expect(screen.getByTestId('composer-model-chip')).not.toHaveTextContent('High')
+    })
+    it.each(['global.anthropic.claude-opus-4-8[1m]', 'ollama/llama3.2:3b'])(
+      'keeps model and effort separate for ACP model %s', modelName => {
+        renderWithProviders(
+          <ChatInput {...defaultProps}
+            modelName={modelName}
+            reasoningEffort="high"
+            separateEffort
+            onModelClick={vi.fn()}
+            onReasoningEffortClick={vi.fn()}
+          />
+        )
+        expect(screen.getByRole('button', { name: 'Reasoning effort' })).toBeInTheDocument()
+        expect(screen.getByTestId('composer-model-chip')).toHaveTextContent(modelName)
+        expect(screen.getByTestId('composer-model-chip')).not.toHaveTextContent('High')
+      },
+    )
     it('renders for acp provider', () => {
       const onClick = vi.fn()
       renderWithProviders(

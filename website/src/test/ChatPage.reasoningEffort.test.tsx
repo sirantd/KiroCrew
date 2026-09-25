@@ -119,6 +119,16 @@ function renderDropdown(props: Partial<Parameters<typeof ReasoningEffortDropdown
 describe('ReasoningEffortDropdown', () => {
   beforeEach(() => { mockApi.effortLevels.mockClear(); mockApi.chatSlotReasoningEffort.mockClear() })
 
+  it('uses ACP-advertised Pi levels in their reported order', async () => {
+    renderDropdown({ currentEffort: 'minimal', levelsOverride: ['off', 'minimal', 'high'] })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    expect(slider).toHaveAttribute('aria-valuemax', '2')
+    expect(slider).toHaveAttribute('aria-valuenow', '1')
+    fireEvent.keyDown(slider, { key: 'ArrowRight' })
+    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'high'))
+    expect(mockApi.effortLevels).not.toHaveBeenCalled()
+  })
+
   it('renders a slider over the concrete levels with the current value', async () => {
     renderDropdown()
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })

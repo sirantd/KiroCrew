@@ -3943,6 +3943,14 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
   },
   models: () => fetch('/api/models').then(j),
+  chatSlotSelectionCapabilities: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/selection-capabilities').then(j) as Promise<{
+      known: boolean
+      backend?: string
+      effort_supported?: boolean
+      effort_levels?: string[]
+      model_effort_pair_ids?: boolean
+    }>,
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the

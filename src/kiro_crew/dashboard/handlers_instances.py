@@ -1434,6 +1434,11 @@ async def api_instances_capabilities(request: web.Request) -> web.Response:
                 if isinstance(agents_payload, dict)
                 else ""
             ),
+            "acp_backend": (
+                _cap_str(agents_payload.get("acp_backend"), 32)
+                if isinstance(agents_payload, dict)
+                else ""
+            ),
             "models": _cap_rows(
                 _cap_list(raw.get("models"), "models"),
                 {
