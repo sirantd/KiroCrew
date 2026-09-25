@@ -133,24 +133,52 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       ? el.querySelector(`[data-display-index="${nextIdx}"]`) as HTMLElement | null
       : null
     const nextTop = nextEl ? nextEl.getBoundingClientRect().top : null
+    const pinEl = el.querySelector(`[data-display-index="${pinIdx}"]`) as HTMLElement | null
+    // A row being edited is never the stand-in. Editing swaps the bubble for a
+    // textarea + Cancel/Send tree (UserMessage's `if (editing)` render), and the
+    // stand-in state hides the whole row: an edit opened BEFORE the row reached
+    // the fold would then carry on inside an invisible field — keystrokes landing
+    // where nothing can be seen, and a Send below the viewport that scrolling can
+    // never reveal. A card over an editor would also be a copy of text the reader
+    // is changing. Editing state lives inside UserMessage, so the hook reads its
+    // `data-message-editing` marker off the DOM it already measures.
+    if (pinEl?.querySelector('[data-message-editing]')) { setPinned(null); return }
     // The pinned row is `visibility: hidden` while the card stands in for it, so
     // it keeps its layout box and stays measurable — which is what makes the
-    // progressive fold possible: the row's bottom edge is where the reply begins.
+    // progressive fold possible.
     //
-    // The BUBBLE, not the row, for the ceiling. A user row is not just padding
-    // around its bubble: UserMessage puts an action row (copy / copy-link / edit)
-    // beneath it, so `rowH - ROW_PAD_Y * 2` overshoots the bubble by that strip's
-    // height (32px measured) and the card would stand in for the bubble as a
-    // taller box. `.user-bubble` is the class the bubble and the pinned card
-    // already share (the theme hook both use), so it is the right handle for "the
-    // box this card is a copy of". Falls back to the row's content box when a host
-    // renders no bubble node.
-    const pinEl = el.querySelector(`[data-display-index="${pinIdx}"]`) as HTMLElement | null
-    const pinBubble = pinEl?.querySelector('.user-bubble') as HTMLElement | null
+    // The BUBBLE, not the row, for both the ceiling and the fold's bottom edge. A
+    // user row is not just padding around its bubble: UserMessage puts an action
+    // row (copy / copy-link / pin / edit / timestamp) beneath it, so the row's
+    // box overshoots the bubble by that strip's height (26px measured) plus its
+    // 4px gap. The card stands in for the bubble alone — the strip is re-shown in
+    // place under the hidden row (index.css `[data-pinned-standin]`), so a card
+    // folding down to the ROW's bottom would cover exactly the controls that
+    // hand-off leaves visible. `.message-bubble` is the theming contract's hook
+    // for the bubble box (website/docs/theming-contract.md), carried by the
+    // plain `.user-bubble` and by a steer's accent bubble alike, so a pinned
+    // steer measures its bubble too instead of falling back to the row. Falls
+    // back to the row's content box when a host renders no bubble node.
+    const pinBubble = pinEl?.querySelector('.message-bubble') as HTMLElement | null
     const pinRect = pinEl?.getBoundingClientRect()
-    const bubbleH = pinBubble
-      ? pinBubble.getBoundingClientRect().height
+    const bubbleRect = pinBubble?.getBoundingClientRect()
+    // The fold's ceiling: the card's NATURAL height, i.e. from its own top to the
+    // bubble's bottom at the hand-off frame. The card's top sits ROW_PAD_Y under
+    // the row's top (both put that padding above their content), so this is the
+    // bubble's height for a plain bubble — and more for a steer, whose accent
+    // bubble starts under its badge (20px line + 4px gap): a ceiling of the
+    // bubble's own height there stopped the card 24px short of the bubble's
+    // bottom, a blank band above the re-shown strip that only closed once the
+    // reader had scrolled that far. Measured from the row rather than assumed,
+    // so whatever a host renders above its bubble is accounted for.
+    const standinH = (bubbleRect && pinRect)
+      ? bubbleRect.bottom - pinRect.top - ROW_PAD_Y
       : (pinRect ? Math.max(0, pinRect.height - ROW_PAD_Y * 2) : null)
+    // The edge the fold tracks: the bubble's own bottom (the strip and the reply
+    // begin below it), or the row's content-box bottom in the no-bubble fallback.
+    const bubbleBottom = bubbleRect
+      ? bubbleRect.bottom
+      : (pinRect ? pinRect.bottom - ROW_PAD_Y : null)
     // Height for THIS frame. Derived from the row and the settled resting height,
     // never from the live card, so the card's own size is not an input to the
     // geometry that sets it (see computeLiveCardH).
@@ -161,10 +189,29 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     // The threshold lives here because this is where the resting height lives;
     // duplicating it in the card would let the two disagree about "at rest".
     const restingH = pinCollapsedHRef.current
-    const liveRaw = (pinRect && bubbleH != null)
-      ? computeLiveCardH(pinRect.bottom - foldY, restingH, bubbleH)
+    const liveRaw = (bubbleBottom != null && standinH != null)
+      ? computeLiveCardH(bubbleBottom - foldY, restingH, standinH)
       : undefined
     const liveH = liveRaw != null && liveRaw > restingH + 0.5 ? liveRaw : undefined
+    // Whether the row's re-shown action strip is still UNCOVERED — any of it
+    // below the card's resting bottom, i.e. on screen. This is what the hosts
+    // write as the `folding` value of the row's `data-pinned-standin` marker
+    // (the value index.css re-shows the strip on), and it is derived from
+    // occlusion, NOT from the fold: the fold ends when the card reaches its
+    // clamp, but the strip hangs under the bubble's bottom, so at that frame the
+    // whole strip is still on screen below the card and slides under it over the
+    // next strip's-height of scroll (its `mt-1` gap plus its buttons). Keyed on
+    // `liveH` the marker dropped at the clamp — copy / copy-link / pin vanished
+    // under the pointer and that band went blank for those last pixels. The
+    // strip's OWN rect, so whatever a host renders there is measured rather than
+    // assumed; the card's RESTING bottom, because this geometry never reads the
+    // live card (see the resting-height note below). A row without a strip
+    // falls back to the fold itself.
+    const strip = pinEl?.querySelector('[data-message-actions]')
+    const stripBottom = strip ? strip.getBoundingClientRect().bottom : null
+    const stripUncovered = stripBottom != null
+      ? stripBottom > foldY + ROW_PAD_Y + restingH + 0.5
+      : liveH != null
     // The SETTLED resting height, never the live card rect.
     //
     // The card grows past its resting size in two states — the hover peek
@@ -208,6 +255,7 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       push,
       bannerH,
       liveH,
+      stripUncovered,
     }))
   }, [requiresMountedHandoff, scrollerRef])
   // rAF-throttle the per-scroll recompute: updatePinnedPrompt does a

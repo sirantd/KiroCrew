@@ -349,6 +349,140 @@ describe('usePinnedPrompt push geometry is resting-height-derived', () => {
 })
 
 /**
+ * The fold stands in for the BUBBLE, not the row. UserMessage draws an action
+ * strip (copy / copy link / pin / timestamp) under its bubble, and the hidden row
+ * re-shows that strip in place (index.css `[data-pinned-standin]`), so the card
+ * has to fold down to the bubble's bottom edge: a card reaching the ROW's bottom
+ * would sit exactly over the controls the hand-off leaves visible.
+ */
+describe('usePinnedPrompt folds the card to the bubble, leaving the action strip clear', () => {
+  it('reports a live height whose bottom is the bubble bottom, with the strip below it uncovered', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The pinned row (index 2) is a tall prompt whose top has crossed the fold
+    // (fold at 100): row 60..460, bubble 64..430, then a 4px gap and the 26px
+    // action strip UserMessage renders under the bubble (434..460).
+    setRect(g.rows[2], 60, 400)
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble user-bubble'
+    const strip = document.createElement('div')
+    strip.setAttribute('data-message-actions', '')
+    g.rows[2].append(bubble, strip)
+    setRect(bubble, 64, 366)
+    setRect(strip, 434, 26)
+    // Push the incoming prompt far down so the card is not being pushed out.
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    // Card top is fold + ROW_PAD_Y = 104; bubble bottom is 430 → 326px tall.
+    // The row's bottom (460) would have given 356px and buried the strip. The
+    // strip, wholly below the folding card's bottom, is uncovered.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 326, stripUncovered: true })
+  })
+
+  it('keeps the strip uncovered once the card rests, while any of it is still below the card', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The same row scrolled 290px further: bubble bottom at fold + 40 (140),
+    // strip 144..170. The card has reached its 60px clamp — its resting bottom
+    // is fold + 4 + 60 = 164 — so no live height is reported, yet 6px of the
+    // strip still show below the card. Keyed on the fold, this is where copy /
+    // copy-link / pin vanished under the pointer and the band went blank.
+    setRect(g.rows[2], -230, 400)
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble user-bubble'
+    const strip = document.createElement('div')
+    strip.setAttribute('data-message-actions', '')
+    g.rows[2].append(bubble, strip)
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    expect(h.result.current.pinned?.liveH, 'the fold is over').toBeUndefined()
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+  })
+
+  it('drops the mark on a later frame of the same pin, once the strip has slid under the card', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], -230, 400)
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble user-bubble'
+    const strip = document.createElement('div')
+    strip.setAttribute('data-message-actions', '')
+    g.rows[2].append(bubble, strip)
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+    // 20px on: the strip's bottom (150) is above the card's resting bottom
+    // (164), so the whole strip is under the card. The same message is still
+    // pinned, so this is the same-message path of nextPinnedPromptState — the
+    // flag has to be carried there or the marker stays stuck at `folding`.
+    setRect(g.rows[2], -250, 400)
+    setRect(bubble, -246, 366)
+    setRect(strip, 124, 26)
+    setRect(g.rows[3], 150, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned?.liveH, 'still at rest').toBeUndefined()
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: false })
+  })
+
+  it('measures a steer bubble too, through the shared message-bubble hook', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], 60, 400)
+    // A steer's bubble carries `message-bubble` but not `user-bubble`.
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble'
+    g.rows[2].append(bubble)
+    setRect(bubble, 88, 300)
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    // 388 − 104 = 284, under the stand-in's 324px ceiling (row top 60 to bubble
+    // bottom 388, less the row padding) — the fold is still in progress.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 284 })
+  })
+
+  it('caps the fold at the stand-in\'s natural height, so a steer\'s card reaches its bubble bottom', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The hand-off frame: row 2's top is ON the fold (100). A steer's accent
+    // bubble starts under its badge, 28px below the row top instead of the 4px
+    // of row padding a plain bubble has, so the box the card stands in for runs
+    // from the card's top (104) to the bubble's bottom (428): 324px.
+    setRect(g.rows[2], 100, 400)
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble'
+    g.rows[2].append(bubble)
+    setRect(bubble, 128, 300)
+    setRect(g.rows[3], 500, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    // A ceiling of the bubble's own 300px would stop the card 24px short of the
+    // bubble's bottom — a blank band above the strip re-shown under it.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 324 })
+  })
+
+  it('never takes a row that is being edited as the stand-in', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // UserMessage marks its editing render with `data-message-editing`. The
+    // stand-in state would hide the whole row, editor and Send included, so the
+    // hook leaves the row visible and shows no card at all.
+    const editor = document.createElement('div')
+    editor.setAttribute('data-message-editing', '')
+    g.rows[2].append(editor)
+    wire(h, g)
+    expect(h.result.current.pinned).toBeNull()
+  })
+})
+
+/**
  * Reduced motion must remove the eased TRAVEL of the jump, not its convergence.
  * The landing is re-derived every frame because rows mount, images load and the
  * banner swaps DURING the jump — and the swap is caused by our own scroll write,
