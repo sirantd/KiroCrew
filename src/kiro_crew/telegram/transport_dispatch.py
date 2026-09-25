@@ -68,6 +68,8 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -1143,6 +1145,13 @@ class TelegramDispatcher:
             if not muted:
                 await renderer.on_turn_start()
             _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
+            # The crew log this conversation was writing, read IMMEDIATELY before
+            # ``get_or_create`` -- after the await above, with nothing suspending
+            # between this line and the allocation. A concurrent turn on this key
+            # can allocate and recycle a successor while this one is suspended, and
+            # a value read before that suspension would make the successor cite its
+            # grandparent and orphan the intermediate log (``predecessor_sid``).
+            previous_sid = predecessor_sid(self.sessions, session_key)
             provider, is_new, resumed = await self.sessions.get_or_create(
                 session_key,
                 agent=agent,
@@ -1161,6 +1170,26 @@ class TelegramDispatcher:
                 model=(None if resumed_key is not None else self._model_pref.get(route) or None),
             )
             _acquired = True
+            if resumed_key is None:
+                # The session's crew log, opened the moment the allocation lands
+                # and before ANY further await: the work ledger appends every write
+                # to the acting session's log and rolls back one it cannot record,
+                # so a DM admitted as a conductor needs its log to exist before its
+                # first ledger call -- and a turn that bails between the allocation
+                # and a later opener (a failed attachment fetch, a renderer error)
+                # would leave a live session whose log is first created on the NEXT
+                # turn, by then a warm reuse whose predecessor read names itself, so
+                # the previous edge would never be written. Own sessions only: a
+                # resumed dashboard session's opener is the dashboard's, which
+                # alone holds its lineage. Never raises, never suspends.
+                open_turn_crew_log(
+                    provider,
+                    session_key=session_key,
+                    agent=agent,
+                    resumed=resumed,
+                    ctx_builder=self.ctx_builder,
+                    previous_sid=previous_sid,
+                )
             # Extraction's approved root is the provider's OWN resolved cwd, so a
             # path lexically outside it is refused before any metadata probe.
             # Read defensively: an absent cwd must mean "no uploads", never a dead

@@ -37,6 +37,7 @@ from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
 from kiro_crew.agent_sdk.drivers.acp_vocab import classify_stop_reason
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.history import transcript_stem
 from kiro_crew.hooks import (
     HOOK_REPLY,
     TOOL_AUTO_APPROVE,
@@ -610,6 +611,130 @@ def consume_reinjection(sessions: Any, session_key: str) -> bool:
     """
     consume = getattr(sessions, "consume_needs_reinjection", None)
     return bool(consume(session_key)) if callable(consume) else False
+
+
+def predecessor_sid(sessions: Any, session_key: str) -> str:
+    """The crew log *session_key* was last writing -- read BEFORE this turn allocates.
+
+    The ``previous_sid`` producer for :func:`open_turn_crew_log`, and the same one
+    the dashboard runner uses: ``SessionManager.mapped_sid`` read at each allocation
+    site right before ``get_or_create`` publishes the successor's id over the
+    mapping (``chat_runner``'s eager prefetch and turn site latch exactly this).
+    The moment is what matters, in both directions. A failed auto-compaction
+    recycles the session and empties the mapping's pointer in place, and
+    ``mapped_sid`` keeps answering from the stash that clear leaves
+    (``discarded_sid``) -- so until the successor is mapped, the id the recycle
+    dropped is still readable, and one instruction later it is the successor's
+    own id. Read after the allocation, every recycled conversation would open its
+    successor as an unrelated first log and the earlier history would fall off
+    the succession chain. Read too EARLY -- before an await that precedes the
+    allocation -- it can be equally wrong: a concurrent turn on the same key can
+    allocate and recycle a successor while this turn is suspended, and the value
+    read before that suspension names the store before that successor, so the
+    new log cites its grandparent and the intermediate log is orphaned. So the
+    call belongs immediately before ``get_or_create``, after every await that
+    precedes it, with nothing suspending in between.
+
+    The emitter does the comparing: a warm reuse or a ``session/load`` resume
+    hands back the live id, equal to the one this turn opens, and no edge is
+    written; only a cold successor with a different id cites its predecessor, and
+    only after the emitter has checked that predecessor's header names the same
+    slot. Best-effort: a store without the reader answers ``""``, which the
+    emitter reads as "nothing to follow".
+    """
+    reader = getattr(sessions, "mapped_sid", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(session_key) or "")
+    except Exception:
+        logger.debug("crew log: predecessor unreadable for %s", session_key, exc_info=True)
+        return ""
+
+
+def open_turn_crew_log(
+    provider: Any,
+    *,
+    session_key: str,
+    agent: str,
+    resumed: bool,
+    ctx_builder: Any = None,
+    previous_sid: str = "",
+) -> None:
+    """Open the channel session's crew log ahead of its turn, as the dashboard runner does.
+
+    ``crew_log_emit.on_session_opened`` is what CREATES a session's crew log, keyed
+    by its ACP session id; ``chat_runner._run_chat`` calls it on every dashboard turn
+    once the handle exists, and a warm reuse is silent. A channel conversation runs
+    its own copy of the turn loop, and without this call it opens no log at all.
+    That is a hole the work ledger falls into: the ledger is a projection of the
+    crew log, every ``work_ledger_record`` / ``work_report`` write appends one
+    ``work/recorded`` entry to the ACTING session's log, and a write with nowhere
+    to append is rolled back and refused (``crew_log_unrecorded``). An owner DM
+    that session control admits as a conductor therefore reached the ledger and
+    lost every write to it. Opening the log here, before ``TurnDriver.run``, is
+    what makes that admission usable. Free while the emitter is off -- the emitter
+    checks its own flag -- and it never raises, because the turn must not be lost
+    to its own record.
+
+    Only facts the dispatcher can establish are recorded; the emitter reads an
+    absent field as "not observed", never as false. The ACP session id comes off
+    *provider* (no id, no log: a turn that never got a session emits nothing, as
+    on the dashboard). ``slot`` is the key the dashboard surfaces this conversation
+    under -- the channel key folded to the filename charset, which is what
+    ``channel_slot_name`` spells and what ``session_create`` stamps as
+    ``_created_by`` on the workers this session dispatches, so the session tree
+    joins the two. The served model and the cwd are read off the provider, the
+    dashboard's own sources for them; ``resumed`` is ``get_or_create``'s answer.
+    The class is stated only when the memory mode is known, from the gateway's
+    live policy for the key (``ctx_builder.live_memory_mode_for_session``, wired by
+    the dashboard state; a builder without it states no class, which readers
+    refuse rather than assume), and it carries ``channel=True`` because a
+    channel-born conversation is published to its channel by definition -- the
+    same reading ``_crew_log_class`` takes off a linked slot. No ``parent``: a
+    conversation the person opened themselves is nobody's child. ``previous_sid``
+    is the crew log this conversation was writing before this turn's allocation
+    (:func:`predecessor_sid`, read by the dispatcher before ``get_or_create``):
+    the emitter writes the ``previous`` edge only when it names a different
+    store, which is what keeps a conversation's history reachable across the
+    cold successor a failed compaction leaves behind.
+
+    For the channel's OWN sessions only. A dashboard session resumed into the chat
+    (``!sessions``) is opened by the dashboard runner, which alone holds its
+    lineage: an opener from here would create that log without its ``parent``.
+    """
+    # Imported here, not at module scope, on purpose: this module is on the
+    # dashboard's boot path (``dashboard.handlers.crew_log`` reaches it), and the
+    # crew log is optional -- a flag-off launch must not load the storage package.
+    # ``test_crew_log_routes.py::test_this_module_does_not_load_the_storage_package_at_import``
+    # pins that from a clean interpreter; ``handlers/crew_log.py`` and
+    # ``work_ledger.rebuild_from_projection`` import the emitter the same way.
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    try:
+        session_id = crew_log_emit.session_id_of(provider)
+        if not session_id:
+            return
+        memory_mode = ""
+        live_mode = getattr(ctx_builder, "live_memory_mode_for_session", None)
+        if callable(live_mode):
+            try:
+                memory_mode = str(live_mode(session_key) or "")
+            except Exception:
+                logger.debug("crew log: memory mode unreadable for %s", session_key, exc_info=True)
+        crew_log_emit.on_session_opened(
+            session_id,
+            agent=agent or "",
+            slot=transcript_stem(session_key),
+            model=str(getattr(provider, "served_model", "") or ""),
+            cwd=str(getattr(provider, "cwd", "") or ""),
+            resumed=bool(resumed),
+            memory=memory_mode,
+            channel=True,
+            previous_sid=previous_sid,
+        )
+    except Exception:
+        logger.debug("crew log: opener skipped for %s", session_key, exc_info=True)
 
 
 def stop_reason_landed(stop_reason: str | None) -> bool:

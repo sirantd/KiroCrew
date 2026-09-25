@@ -78,6 +78,8 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -796,11 +798,20 @@ class DiscordDispatcher:
         provider = None
         is_new = False
         resumed = False
+        # The crew log this conversation was writing, read at each allocation site
+        # IMMEDIATELY before its ``get_or_create`` -- after every await that
+        # precedes it, never earlier. A concurrent turn on this key can allocate and
+        # recycle a successor while this one is suspended, and a value read before
+        # that suspension would name the store BEFORE that successor: the successor
+        # then cites its grandparent and the intermediate log is orphaned. See
+        # ``predecessor_sid`` for why the mapping still answers a recycled id.
+        previous_sid = ""
         if monitor_completion is not None:
             if resumed_key is not None:
                 return MonitorDispatchResult.UNAVAILABLE
             try:
                 _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
+                previous_sid = predecessor_sid(self.sessions, session_key)
                 provider, is_new, resumed = await self.sessions.get_or_create(
                     session_key,
                     agent=agent,
@@ -815,6 +826,17 @@ class DiscordDispatcher:
                 logger.exception("Discord monitor session claim failed")
                 return MonitorDispatchResult.UNAVAILABLE
             _acquired = True
+            # Own session by construction (a resumed key returned above). Opened
+            # HERE, at the allocation and before any further await -- see the
+            # regular site below for why the moment matters.
+            open_turn_crew_log(
+                provider,
+                session_key=session_key,
+                agent=agent,
+                resumed=resumed,
+                ctx_builder=self.ctx_builder,
+                previous_sid=previous_sid,
+            )
         elif resumed_key is not None:
             # A resumed session must run as ITSELF, not as Discord's agent. On a
             # cold start get_or_create applies the agent we pass, so handing it
@@ -924,6 +946,9 @@ class DiscordDispatcher:
             # first and persist the conversation in reverse order.
             if not _acquired:
                 _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
+                # Read here, after the await above and with nothing suspending
+                # between this line and the allocation -- see the note at the top.
+                previous_sid = predecessor_sid(self.sessions, session_key)
                 # ``model`` applies only when this call COLD-STARTS the session: the
                 # fast path returns a reused session before it consults the argument.
                 # That is exactly what ``!model``'s reply promises ("applies to your
@@ -935,6 +960,27 @@ class DiscordDispatcher:
                     model=self._model_pref.get(scope_id) or None,
                 )
                 _acquired = True
+                if resumed_key is None:
+                    # The session's crew log, opened the moment the allocation
+                    # lands and before ANY further await: the work ledger appends
+                    # every write to the acting session's log and rolls back one it
+                    # cannot record, so a DM admitted as a conductor needs its log
+                    # to exist before its first ledger call -- and a turn that bails
+                    # between the allocation and a later opener (a failed
+                    # attachment fetch, a renderer error) would leave a live session
+                    # whose log is first created on the NEXT turn, by then a warm
+                    # reuse whose predecessor read names itself, so the previous
+                    # edge would never be written. Own sessions only: a resumed
+                    # dashboard session's opener is the dashboard's, which alone
+                    # holds its lineage. Never raises, never suspends.
+                    open_turn_crew_log(
+                        provider,
+                        session_key=session_key,
+                        agent=agent,
+                        resumed=resumed,
+                        ctx_builder=self.ctx_builder,
+                        previous_sid=previous_sid,
+                    )
             assert provider is not None
             renderer.authorize_upload_root(provider.cwd)
             # The turn footer's context chip reads usage off the session provider,

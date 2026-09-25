@@ -4121,6 +4121,107 @@ class TestAutomaticOriginMirror:
         self._turn(d)
         assert sess.origin_links == {}
 
+    def test_a_dm_turn_opens_the_crew_log_the_work_ledger_writes_into(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The work ledger is a projection of the crew log: every write appends a
+        ``work/recorded`` entry to the ACTING session's log and rolls the cache back
+        (``crew_log_unrecorded``) when there is nowhere to append. A DM that session
+        control admits as a conductor therefore needs its log to exist before its
+        first ledger call, and only the turn path can create it -- the dashboard
+        runner does so on every turn, and this dispatcher runs its own turn loop.
+
+        Real emitter, real writer, isolated home. The admission itself is another
+        suite's subject (``test_session_control_owner_dm.py``) and is granted here.
+        """
+        import json
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.crew_log import emit, projection
+        from kiro_crew.crew_log.resolve import unit_for_session_key
+        from kiro_crew.dashboard.handlers import work_ledger as ledger_routes
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-owner-dm-turn", raising=False)
+        ledger_routes._BOARD_LOCKS.clear()
+
+        async def _recognized(*a: Any, **k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(ledger_routes, "_recognize_session", _recognized)
+        monkeypatch.setattr(ledger_routes, "_is_restricted_session", lambda *a: False)
+        monkeypatch.setattr(ledger_routes, "_contained_channel_caller", lambda request, sk: "")
+
+        async def _goal_write(sess: Any, key: str) -> tuple[int, dict[str, Any]]:
+            app = web.Application()
+            state = MagicMock()
+            state.sessions = sess
+            app["state"] = state
+            req = make_mocked_request(
+                "POST", "/api/work-ledger/record", app=app, headers={"X-Session-Key": key}
+            )
+            req["internal_auth"] = True
+            req.json = AsyncMock(  # type: ignore[method-assign]
+                return_value={"action": "goal", "goal": "ship it", "round": 1}
+            )
+            resp = await ledger_routes.api_work_ledger_record(req)
+            return resp.status, json.loads(resp.text)
+
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({7})
+            self._turn(d)
+            key = d._session_key(("direct", "7"))
+            unit = unit_for_session_key(sess, key)
+            assert unit == "acp-owner-dm-turn"
+            status, body = asyncio.run(_goal_write(sess, key))
+            assert (status, body.get("code")) == (200, None), body
+
+            handle = projection.open_session_log(unit)
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert opened[0].data["slot"] == key.replace(":", "_")
+            assert "class" not in opened[0].data, "no live policy reader on this builder"
+            assert [e.type for e in entries].count("work/recorded") == 1
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+            ledger_routes._BOARD_LOCKS.clear()
+
+    def test_a_recycled_conversation_opens_its_successor_log_citing_the_predecessor(
+        self, monkeypatch
+    ) -> None:
+        """The Telegram twin of the Discord succession pin: the id the mapping still
+        names BEFORE this turn's allocation -- after a compaction recycle, the stashed
+        predecessor -- reaches ``on_session_opened`` as ``previous_sid``, so the
+        successor's log cites the one it replaces. A mapping that names the live id
+        (a warm turn) hands over the same id, which the emitter reads as no edge."""
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        opened: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            crew_log_emit,
+            "on_session_opened",
+            lambda session_id, **kw: opened.append((session_id, kw.get("previous_sid", ""))),
+        )
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-2", raising=False)
+        d, _cli, sess = _dispatcher({7})
+        # Read before ``get_or_create``: the mapping still names the recycled store.
+        sess.mapped_sid = lambda key: "acp-gen-1"
+        self._turn(d)
+        assert opened == [("acp-gen-2", "acp-gen-1")]
+        # A store that cannot answer hands over "" -- nothing to follow, never a raise.
+        del sess.mapped_sid
+        self._turn(d)
+        assert opened[-1] == ("acp-gen-2", "")
+
     def test_forum_turn_binds_the_topic_not_the_supergroup_general(self) -> None:
         # The bind shares _origin_mirror_link with /link, so a forum turn must
         # carry the Topic id — a General-scoped binding would thread dashboard
@@ -4191,15 +4292,32 @@ class TestAutomaticOriginMirror:
         self._turn(d)
         assert sess.mirror_links == {key: chosen}
 
-    def test_a_binding_for_another_channel_does_not_block_the_bind(self) -> None:
-        # set_channel writes the legacy slack_channel_id for a new telegram
-        # session, so the first turn can see a synthesized non-telegram link.
-        # That says nothing about telegram mirroring and must not suppress it.
+    def test_the_first_turns_bucket_row_does_not_block_the_bind(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # set_channel writes the legacy slack_channel_id bucket for a new telegram
+        # session with no thread. The STORE reads that row as no mirror (a Slack
+        # mirror is never synthesized without a thread), so the first turn's bind
+        # lands; a Slack binding that names a thread is deliberate and is left alone.
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        store = SessionMap()
         d, _cli, sess = _dispatcher({7})
+        sess.get_mirror_link = store.get_mirror_link
+        sess.set_mirror_link = store.set_mirror_link
         key = d._session_key(("direct", "7"))
-        sess.mirror_links[key] = ChannelLink("slack", channel_id="telegram:7")
+        store.set_slack_link(key, "", "telegram:7")
+        assert store.get_mirror_link(key) is None
         self._turn(d)
-        assert sess.mirror_links[key] == ChannelLink("telegram", channel_id="7", thread_id=None)
+        assert store.get_mirror_link(key) == ChannelLink("telegram", channel_id="7", thread_id=None)
+
+        store.set_slack_link(key, "1786300000.000100", "C0OPS")
+        store.clear_mirror_link(key)
+        threaded = store.get_mirror_link(key)
+        assert threaded == ChannelLink("slack", channel_id="C0OPS", thread_id="1786300000.000100")
+        self._turn(d)
+        assert store.get_mirror_link(key) == threaded, "a deliberate binding is never repointed"
 
     def test_the_refusal_survives_a_generation_rotation(self) -> None:
         # /new and the configured idle/daily reset rotate the :genN suffix. Keyed
