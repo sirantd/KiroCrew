@@ -369,7 +369,9 @@ originating session for completion injection.
 
 Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 1. Policy refusals that leave no durable trace: empty task, memory identity,
-   `cwd` outside `subagent_cwd_allowed_roots`, spawn governance.
+   `cwd` outside `subagent_cwd_allowed_roots`, spawn governance, and the parent
+   agent spec's `toolsSettings.subagent.availableAgents` (see § Parent agent
+   spec allowlist below).
 2. For persistent work, **persist** the row in the task store (write-before-ack; see § Durable task
    queue). A store write failure is a refusal with
    `error_code="task_store_unavailable"`; the id is never handed out as accepted.
@@ -386,6 +388,59 @@ Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
    slot, and the next pump settlement pass retries it before ordinary refill.
    Registration consumes the reservation; a durable refusal releases it.
 6. Register, take the slot, `starting`; then the approval branch below.
+
+### Parent agent spec allowlist (`toolsSettings.subagent.availableAgents`)
+
+kiro-cli defines `toolsSettings.subagent.availableAgents` for its own built-in
+`subagent` tool: a glob list of the agents an agent may spawn, and **omitting it
+allows all**. Kiro Crew's sub-agents come through `spawn_run` /
+`spawn_sub_agents` rather than that tool, so the gate honours the same
+declaration itself (`subagent._vet_parent_available_agents`, called from
+`spawn_impl` right after `_vet_spawn_governance`):
+
+- **Parent** = the kiro agent template the CALLING session runs as, read from
+  its execution record (`read_session_execution(parent_session_key).template_id`)
+  and resolved in the user-level agents directory the way `agent_spec_path`
+  resolves a name (declared `name` wins, filename stem is the fallback; two
+  specs declaring the name are both applied, tightest-wins). Read through the
+  signature-cached `parsed_agent_specs` snapshot — a warm call is one `scandir`,
+  the same cost class as the `list_agents` scan `_validate_agent` already pays.
+  The read is synchronous on purpose: the off-loop `cached_agent_specs` serves
+  empty rows on a cold cache, and an empty read would admit a spawn the
+  declaration forbids.
+- **Target** = the EFFECTIVE child template (`execution.template_id`: explicit
+  `agent`, the inherited parent template, or a `crew=`/`target_member` member's
+  `kiro_agent`), matched with `fnmatch.fnmatchcase` against each glob. An
+  app's namespaced `<app>--<agent>` also matches on its bare half, which is
+  the name the app's own spec lists.
+- **When it bites**: ONLY when the parent's spec declares the key. No parent
+  (a direct `POST /api/spawn` with no session, a test), no spec for the
+  parent, or a spec without the key is "allow all" — every session whose agent
+  never wrote the key keeps exactly the admission it had. A declared value that
+  is not a list is an EMPTY allowlist (declared, nothing allowed).
+- **`trustedAgents` is not read.** Upstream it means "run these sub-agents
+  without permission prompts"; treating it as an allowlist would refuse spawns
+  the operator never meant to forbid.
+- **Intersection, not replacement**: the governance gate
+  (`capabilities.spawn.scopes.agents`) runs first and both must admit. This
+  check only narrows what the spec grants; it never widens a governance denial.
+- **Refusal**: a policy refusal before the row is persisted, audited as
+  `outcome="denied"`, with `error_code=agent_not_available`
+  (`subagent.AGENT_NOT_AVAILABLE_CODE`) and prose naming the parent, the key
+  and the allowed globs (grammar-checked, redacted, bounded like every rendered
+  roster). `spawn_run` short-circuits the rest of a wave on this code exactly
+  as it does on `agent_not_found`.
+- **Not covered yet**: a parent whose spec lives only in a project's
+  `.kiro/agents` (the gate does not know the parent session's project dir);
+  its declaration is not honoured. There is no warning when a spec declares
+  the key but the session's `tools` lack the kiro-cli `subagent` tool.
+
+The spawn tools advertise the same view: `spawn_run`'s "Valid names right now"
+roster and `spawn_list`'s "Available agents" line drop the names the parent's
+declaration forbids and say so
+(`mcp_tools.spawn._parent_allowlist_filter`). That is advisory — the tool
+server resolves its own session's template best-effort and filters nothing
+when it cannot — and the gate above is the decision.
 
 Spawn flow:
 1. **YOLO mode**: skips approval, runs immediately
@@ -1985,15 +2040,18 @@ Errors: 400 (missing task), 429 (capacity reached), 503 (subagents not available
 **Typed rejections.** A rejection raised INSIDE `spawn()` answers 400 with a
 machine-readable `code` beside the advisory `error` prose (plus `counted: true` —
 see Wave liveness above): `agent_not_found` for a named-but-unknown agent,
+`agent_not_available` for a target the parent agent spec's
+`toolsSettings.subagent.availableAgents` forbids (§ Parent agent spec allowlist),
 `spawn_rejected` for every other kind (empty task, low memory, cwd refusal,
 governance). `code` is the contract and `error` is advisory (RFC 9457 3.1.3),
 which is what lets the refusal sentence be reworded without breaking a client.
-The identifier is minted AT the decision — `subagent.AGENT_NOT_FOUND_CODE`,
-returned by `_validate_agent` — carried on `SubagentInfo.error_code`, and
-forwarded by the handler without being respelled there, so the value has exactly
+The identifiers are minted AT the decision — `subagent.AGENT_NOT_FOUND_CODE`,
+returned by `_validate_agent`, and `subagent.AGENT_NOT_AVAILABLE_CODE`, set by
+the gate — carried on `SubagentInfo.error_code`, and
+forwarded by the handler without being respelled there, so each value has exactly
 one spelling in the tree.
 
-`spawn_run` switches on that code for the wave short-circuit (#4842): once the
+`spawn_run` switches on those codes for the wave short-circuit (#4842): once the
 gateway has refused an agent name, the remaining members of a wave sharing it are
 not re-posted. Fail-soft in both version directions — an old client still
 text-matches the unchanged prose, and a new client against a gateway that sends

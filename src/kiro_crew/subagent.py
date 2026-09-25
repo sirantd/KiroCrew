@@ -13,6 +13,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Container, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -220,6 +221,22 @@ UNADVERTISED_AGENTS = frozenset(
 #: code exists to remove.
 AGENT_NOT_FOUND_CODE = "agent_not_found"
 
+#: Wire code for the refusal ``_vet_parent_available_agents`` returns: the target
+#: agent exists, but the PARENT agent's spec declares
+#: ``toolsSettings.subagent.availableAgents`` and the target matches none of its
+#: globs. A second refusal kind, so it carries its own identifier rather than
+#: inheriting ``agent_not_found`` (whose prose tells the caller the name does not
+#: exist, which would send it looking for a typo instead of at its own spec).
+#: Same single-definition rule: ``mcp_tools.spawn`` imports it for the wave
+#: short-circuit, and the gateway handler forwards the field without naming it.
+AGENT_NOT_AVAILABLE_CODE = "agent_not_available"
+
+#: Grammar an ``availableAgents`` glob must satisfy to be RENDERED into a refusal:
+#: the agent-name alphabet plus the fnmatch metacharacters. Matching never
+#: consults this; it only keeps instruction-shaped text out of a caller's context,
+#: as ``_AGENT_NAME_RE`` does for plain names.
+_AGENT_GLOB_RE = re.compile(r"^[A-Za-z0-9_*?!\[\]-]{1,64}$")
+
 
 def visible_agent_names(
     names: Iterable[str],
@@ -424,6 +441,172 @@ def _vet_spawn_governance(parent_session_key: str, agent: str, app: str = "") ->
         except Exception:
             logger.debug("governance degrade audit unavailable", exc_info=True)
         return "subagent spawn denied: governance evaluation failed (fail-closed)"
+
+
+def spawn_allowlist(spec: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """The ``toolsSettings.subagent.availableAgents`` globs *spec* declares.
+
+    This is kiro-cli's own key, defined for its built-in ``subagent`` tool: "glob
+    patterns for agents this agent can spawn; omit to allow all". Kiro Crew's
+    sub-agents come through ``spawn_run`` instead, so the same declaration is
+    honoured at the spawn gate rather than silently ignored.
+
+    Returns ``None`` when the key is OMITTED -- that is "allow all", and it is
+    the only value under which the gate stays out of the way, so every spec that
+    never wrote the key keeps the behaviour it had. A declared list is returned
+    as written (non-string entries dropped). A declared value that is not a list
+    is an EMPTY allowlist: the operator meant to restrict and the shape is
+    wrong, so nothing is allowed rather than everything.
+
+    ``trustedAgents``, the sibling key, is NOT an allowlist and is not read
+    here: upstream it means "run these sub-agents without permission prompts",
+    and reading it as a restriction would refuse spawns an operator never meant
+    to forbid.
+    """
+    settings = spec.get("toolsSettings")
+    if not isinstance(settings, Mapping):
+        return None
+    subagent = settings.get("subagent")
+    if not isinstance(subagent, Mapping) or "availableAgents" not in subagent:
+        return None
+    declared = subagent.get("availableAgents")
+    if not isinstance(declared, (list, tuple)):
+        return ()
+    return tuple(entry for entry in declared if isinstance(entry, str) and entry)
+
+
+def agent_matches_allowlist(agent: str, allowlist: Iterable[str]) -> bool:
+    """kiro-cli's glob semantics for ``availableAgents``: case-sensitive fnmatch.
+
+    An app's materialized agent is spawned under its namespaced name
+    (``<app>--<agent>``) while the app's own spec lists the bare name kiro-cli's
+    gate matches against, so the bare half is tried as well.
+    """
+    import fnmatch
+
+    candidates = {agent}
+    if "--" in agent:
+        candidates.add(agent.split("--", 1)[1])
+    return any(
+        fnmatch.fnmatchcase(candidate, pattern) for pattern in allowlist for candidate in candidates
+    )
+
+
+def parent_spawn_allowlists(parent_template: str) -> tuple[tuple[str, ...], ...]:
+    """Every ``availableAgents`` list the specs naming *parent_template* declare.
+
+    Resolution follows :func:`kiro_crew.agent.agent_spec_path`: a spec whose
+    DECLARED ``name`` is *parent_template* wins; ``<parent_template>.json`` (or
+    ``.md``) is read only when no spec declares the name. Two specs declaring
+    the same name are both kept -- the target must then satisfy each, which is
+    tightest-wins rather than a guess at which one kiro-cli loaded.
+
+    Empty when *parent_template* is empty, names no spec, or its spec omits the
+    key: each of those is "no declaration to honour", the unchanged case.
+
+    Reads the user-level agents directory through
+    :func:`kiro_crew.agent_discovery.parsed_agent_specs`, the signature-cached
+    snapshot: a warm call is one ``scandir``, the same cost class as the
+    ``list_agents`` scan ``_validate_agent`` already pays on this path. The
+    synchronous read is deliberate -- the off-loop ``cached_agent_specs`` serves
+    EMPTY rows on a cold cache, and an empty read here would admit a spawn the
+    declaration forbids. A parent living only in a project's ``.kiro/agents``
+    is not resolved here (its declaration is not honoured yet; see the module
+    spec).
+    """
+    # ``match``, not ``fullmatch``: the pattern is anchored, and the roster
+    # ratchet reserves the ``fullmatch`` spelling for ``visible_agent_names``.
+    if not parent_template or not _AGENT_NAME_RE.match(parent_template):
+        return ()
+    from kiro_crew.agent_discovery import parsed_agent_specs
+
+    try:
+        rows = parsed_agent_specs(operation="spawn_available_agents", source="subagent")
+    except Exception:  # noqa: BLE001 - an unreadable directory declares nothing
+        logger.debug("parent agent spec scan failed", exc_info=True)
+        return ()
+    declared = [data for data, _path in rows if data.get("name") == parent_template]
+    if not declared:
+        declared = [
+            data
+            for data, path in rows
+            if path.stem == parent_template and not isinstance(data.get("name"), str)
+        ] or [data for data, path in rows if path.stem == parent_template]
+    lists = (spawn_allowlist(data) for data in declared)
+    return tuple(allowlist for allowlist in lists if allowlist is not None)
+
+
+def _parent_template_for_spawn(parent_session_key: str) -> str:
+    """The kiro agent template the calling session runs as, or ``""``.
+
+    Read from the session's canonical execution record -- the same record
+    ``resolve_spawn_execution`` derives the child's identity from moments
+    earlier on this path, served from the live in-process map for a running
+    session. A caller with no session (a direct API post, a test) or a record
+    that cannot be read has no parent spec to honour, so the answer is ``""``
+    and :func:`_vet_parent_available_agents` stays out of the way -- the record
+    read itself is what refuses an unreadable parent (``memory_unavailable``),
+    before this is reached.
+    """
+    if not parent_session_key:
+        return ""
+    from kiro_crew.execution_context import read_session_execution
+
+    try:
+        execution = read_session_execution(parent_session_key)
+    except Exception:  # noqa: BLE001 - no record -> no declaration to honour
+        logger.debug("parent execution record unavailable for %s", parent_session_key)
+        return ""
+    return execution.template_id if execution is not None else ""
+
+
+def _vet_parent_available_agents(parent_template: str, agent: str) -> str | None:
+    """Return a denial reason when the parent's spec forbids spawning *agent*.
+
+    *parent_template* is the kiro agent the CALLING session runs as, *agent* the
+    template the child would run as (explicit, inherited or a member's). The
+    denial is returned only when the parent's spec declares
+    ``toolsSettings.subagent.availableAgents`` AND *agent* matches none of its
+    globs. No parent, no spec, or an omitted key is ``None`` -- kiro-cli's "omit
+    to allow all" -- so a session whose agent never declared the key sees no
+    change. An empty *agent* is ``None`` too: the gate resolves the effective
+    template before asking, so there is nothing here to match.
+
+    This is one half of an intersection with ``_vet_spawn_governance``
+    (``capabilities.spawn.scopes.agents``): both must admit. It narrows what the
+    agent spec grants and never widens what governance denies.
+    """
+    if not agent:
+        return None
+    allowlists = parent_spawn_allowlists(parent_template)
+    if not allowlists:
+        return None
+    if all(agent_matches_allowlist(agent, allowlist) for allowlist in allowlists):
+        return None
+    # The globs travel with the refusal so the caller can self-correct, under the
+    # same discipline as every rendered roster: grammar-checked (a glob adds
+    # ``*?[]!`` to the agent-name alphabet, nothing else), redacted, bounded.
+    patterns = sorted(
+        {
+            pattern
+            for allowlist in allowlists
+            for pattern in allowlist
+            if _AGENT_GLOB_RE.fullmatch(pattern)
+        }
+    )
+    shown = [redact_via_context(p) for p in patterns[:_MAX_AVAILABLE_IN_ERROR]]
+    withheld = len(patterns) - len(shown)
+    roster = ", ".join(shown) + (f" (+{withheld} more)" if withheld else "")
+    logger.warning(
+        "Agent %r is not in parent agent %r availableAgents; refusing spawn",
+        agent,
+        parent_template,
+    )
+    return (
+        f"agent {agent!r} is not in the parent agent {parent_template!r} spec's "
+        f"toolsSettings.subagent.availableAgents"
+        + (f" (allowed: {roster})" if roster else " (the list is empty)")
+    )
 
 
 def _redact(text: str) -> str:

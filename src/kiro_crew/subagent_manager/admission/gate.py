@@ -10,14 +10,17 @@ from .types import ClaimPoint, PreparedSpawn
 if TYPE_CHECKING:
     from ...execution_context import ExecutionContext
     from ...subagent import (
+        AGENT_NOT_AVAILABLE_CODE,
         KiroCrewConfig,
         SubagentInfo,
         _cost_bucket,
         _effective_next_start_gb,
+        _parent_template_for_spawn,
         _startup_cost_gb,
         _startup_memory_reserve_gb,
         _validate_agent,
         _validate_app_agent_ownership,
+        _vet_parent_available_agents,
         _vet_spawn_governance,
         asyncio,
         cached_admission_check,
@@ -489,8 +492,56 @@ class _GateMixin(ManagerComponent):
                 )
             )
 
+        # --- Parent agent spec: ``toolsSettings.subagent.availableAgents`` ---
+        # kiro-cli's own allowlist of what THIS agent may spawn, honoured here
+        # because Kiro Crew's sub-agents bypass kiro-cli's built-in ``subagent``
+        # tool. Checked against the EFFECTIVE child template (explicit,
+        # inherited, or a member's), so ``crew=`` cannot route around it, and
+        # only when the parent's spec declares the key -- omitted is "allow
+        # all", the unchanged case. An intersection with the governance gate
+        # above: both must admit.
+        allowlist_err = (
+            _vet_parent_available_agents(
+                _parent_template_for_spawn(parent_session_key), execution.template_id
+            )
+            if _gate
+            else None
+        )
+        if allowlist_err:
+            if _persistent_diagnostics:
+                logger.warning("Subagent spawn refused by parent agent spec: %s", allowlist_err)
+            else:
+                logger.warning("Subagent %s refused by parent agent spec", agent_id)
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="denied",
+                error=allowlist_err if _persistent_diagnostics else "spawn denied by agent spec",
+                metadata=(
+                    {"agent": execution.template_id, **_task_audit}
+                    if _persistent_diagnostics
+                    else _task_audit
+                ),
+            )
+            return _refuse_row(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    memory_mode=_memory_mode,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error=f"spawn refused: {allowlist_err}",
+                    error_code=AGENT_NOT_AVAILABLE_CODE,
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
         # --- Persist BEFORE any resource check: write-before-ack. Policy refusals
-        # above (empty task, memory identity, cwd, governance) never reach the
+        # above (empty task, memory identity, cwd, governance, the parent spec's
+        # allowlist) never reach the
         # store, so a refused spawn leaves no row; from here on the row exists
         # and every later exit either starts it, defers it, or marks it failed.
         # A drained spawn (_from_queue) already has its row. ---
