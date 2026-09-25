@@ -843,6 +843,12 @@ class TelegramApprovalDecider:
     #: nonce does not match is refused, which is what stops a button from a previous
     #: run answering a live prompt that reuses its request id.
     _NONCES: dict[str, str] = {}
+    #: Keys a wait currently OWNS -- added when ``__call__`` takes the future and
+    #: discarded in the same ``finally`` that unregisters it. The registry holds
+    #: one future per key, so the wait that added a key is the one that clears it.
+    #: :meth:`discard_session` reads this to leave an owned window alone, since a
+    #: wait under this session key need not belong to the turn running that sweep.
+    _AWAITED: set[str] = set()
 
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
@@ -941,12 +947,27 @@ class TelegramApprovalDecider:
         so nothing else closes that window, and the nonce left behind is what
         authorizes a press.
 
+        Skips a key a wait OWNS, which is what keeps this a sweep of unawaited
+        windows rather than of every window a session holds. Not every wait under
+        a session key belongs to the turn that runs this sweep: a spawn-approval
+        prompt is armed under the parent session key and awaited by a detached
+        task with its own window, so sweeping it would pop the future and nonce
+        while an operator still had the buttons in front of them -- their press
+        would then resolve nothing and the spawn would deny at its timeout on a
+        refusal nobody made. Ownership is the predicate rather than the shape of
+        the request id, so a wait added later is covered without being enumerated
+        here.
+
         Drops only PENDING reservations. A resolved one holds a decision that was
         already delivered, and the prefix carries its own ``:`` so one session key
         cannot match another that merely starts the same way.
         """
         prefix = f"{session_key}:"
-        for k in [k for k, fut in cls._REGISTRY.items() if k.startswith(prefix) and not fut.done()]:
+        for k in [
+            k
+            for k, fut in cls._REGISTRY.items()
+            if k.startswith(prefix) and not fut.done() and k not in cls._AWAITED
+        ]:
             cls._REGISTRY.pop(k, None)
             cls._NONCES.pop(k, None)
 
@@ -976,6 +997,8 @@ class TelegramApprovalDecider:
             reserved if reserved is not None else asyncio.get_running_loop().create_future()
         )
         TelegramApprovalDecider._REGISTRY[k] = fut
+        # This wait now owns the key, so the end-of-turn sweep must leave it be.
+        TelegramApprovalDecider._AWAITED.add(k)
         try:
             return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
         except asyncio.TimeoutError:
@@ -984,6 +1007,7 @@ class TelegramApprovalDecider:
             self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             return False  # deny-by-default on timeout
         finally:
+            TelegramApprovalDecider._AWAITED.discard(k)
             TelegramApprovalDecider._REGISTRY.pop(k, None)
             # Retire the nonce with the prompt, so a button for a request id the
             # provider later reuses cannot match a nonce that is not live.

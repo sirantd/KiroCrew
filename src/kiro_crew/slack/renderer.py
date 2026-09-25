@@ -272,6 +272,12 @@ class SlackApprovalDecider:
     #: reference to the per-turn decider) resolves clicks through this.
     _REGISTRY: dict[str, "SlackApprovalDecider"] = {}
 
+    #: Registry keys a wait currently OWNS -- added when ``__call__`` takes the
+    #: future and discarded in the same ``finally`` that unregisters it.
+    #: :meth:`discard_session` reads this to leave an owned window alone, since a
+    #: wait under one session key need not belong to the turn running that sweep.
+    _AWAITED: set[str] = set()
+
     def __init__(self, session_key: str = "") -> None:
         self._futures: dict[str, asyncio.Future[bool]] = {}
         self.session_key = session_key
@@ -307,6 +313,8 @@ class SlackApprovalDecider:
         # key to avoid cross-session collisions (kiro-cli rids restart at 1).
         self._futures[rid] = fut
         SlackApprovalDecider._REGISTRY[key] = self
+        # This wait now owns the key, so the end-of-turn sweep must leave it be.
+        SlackApprovalDecider._AWAITED.add(key)
         try:
             # Deny-by-default if the user never clicks within the window.
             return await asyncio.wait_for(fut, timeout=_APPROVAL_TIMEOUT)
@@ -316,6 +324,7 @@ class SlackApprovalDecider:
             self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             return False
         finally:
+            SlackApprovalDecider._AWAITED.discard(key)
             self._futures.pop(rid, None)
             if SlackApprovalDecider._REGISTRY.get(key) is self:
                 SlackApprovalDecider._REGISTRY.pop(key, None)
@@ -383,9 +392,16 @@ class SlackApprovalDecider:
         Drops only PENDING reservations, so a decision already delivered is left
         alone, and matches on the namespaced prefix with its own ``:`` so one
         session key cannot match another that merely starts the same way.
+
+        Skips a key a wait OWNS, which keeps this a sweep of unawaited windows
+        rather than of every window a session holds. A wait under one session key
+        need not belong to the turn running the sweep, and popping a future an
+        operator is still deciding on would deny at its timeout on a refusal
+        nobody made. Ownership is the predicate rather than the shape of the
+        request id, so a wait added later is covered without being enumerated.
         """
         prefix = f"{session_key}:"
-        for key in [k for k in cls._REGISTRY if k.startswith(prefix)]:
+        for key in [k for k in cls._REGISTRY if k.startswith(prefix) and k not in cls._AWAITED]:
             dec = cls._REGISTRY.get(key)
             if dec is None:
                 continue
