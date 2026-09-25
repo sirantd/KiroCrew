@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
 from typing import Optional
 
+from kiro_crew import platform_compat
 from kiro_crew.cloud import aws
+from kiro_crew.config.loader import config_dir
 from kiro_crew.sel import sel
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -28,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 SOURCE_KEY_NAME = "kirocrew-src.tar.gz"
 _BUCKET_PREFIX = "kirocrew-src-"
+
+#: Leaf, directly under the data home, that source tarballs are built in. Not a
+#: name under the stdlib temp root: see :func:`_staging_dir`.
+_STAGING_DIR_LEAF = "cloud-src-staging"
 
 # Directories never shipped to the box (rebuilt there, irrelevant, or SECRET).
 # The tarfile fallback (used when `git archive` is unavailable) filters by this
@@ -138,6 +145,207 @@ def _exclude_filter(ti: tarfile.TarInfo) -> Optional[tarfile.TarInfo]:
     return ti
 
 
+def _chain_the_launcher_owns(base: Path) -> list[Path]:
+    """The directories whose state this launcher is answerable for, root-first.
+
+    ``base`` and every directory up to and including the operator's own home, when
+    ``base`` sits inside it. A directory ABOVE that home belongs to the
+    administrator, or in a container to a uid not mapped into this namespace -- on a
+    sandboxed host even ``/`` reads as an unmapped owner. If one of those is hostile
+    then every program this account runs is already substituted and a check on one
+    tarball buys nothing, while refusing there would reject an ordinary container.
+
+    A data home the operator moved OUTSIDE their own home gets the whole chain
+    instead, because that premise does not cover it: a relocated home is exactly the
+    shared-host case where an ancestor can belong to a local peer.
+
+    ``base`` arrives link-free -- :func:`_staging_dir` refuses a link at the home or
+    above it before calling this -- so resolving here only normalises the home's own
+    spelling and cannot hide a component.
+    """
+    resolved = base.resolve()
+    chain = list(reversed(resolved.parents)) + [resolved]
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return chain  # cannot place the account boundary, so check everything
+    if resolved == home or home in resolved.parents:
+        return [node for node in chain if node == home or home in node.parents]
+    return chain
+
+
+def _first_replaceable(path: Path) -> Optional[tuple[Path, str]]:
+    """The outermost directory the launcher owns that another account could replace into.
+
+    Returns that directory and why it is unsafe, or ``None`` when the chain is
+    sound. Includes ``path`` itself, because replacing a directory entry needs
+    permission on its PARENT rather than on the entry: the data home's own state is
+    what decides whether the staging leaf inside it can be renamed away, and the
+    home's ancestors decide the same for the home. Which directories are in scope is
+    :func:`_chain_the_launcher_owns`.
+
+    Two things make a directory unsafe, and its mode is only one of them.
+
+    OWNERSHIP, first: a directory's owner can replace what is inside it whatever
+    the mode says, so an ancestor owned by neither this process nor root is unsafe
+    at ``0755`` exactly as much as at ``0777``. Root is trusted because a root that
+    wanted to substitute the tarball does not need a directory to do it.
+
+    Then the WRITE BITS, with the sticky exemption they carry. Under the sticky bit
+    an entry may be renamed only by the entry's own owner, by the DIRECTORY's
+    owner, or by root -- so sticky makes a directory safe only once its owner is
+    already trusted, which is what the ownership test settles first. A sticky
+    ancestor whose owner were foreign would hand that owner the same swap, which is
+    why the two tests are ordered and not alternatives. Others-WRITABLE is the mode
+    test rather than others-readable: the swap needs the write bit, and keeping the
+    tarball unreadable is the leaf's own owner-only mode's job.
+
+    Root-first, so the answer is the outermost problem rather than an inner symptom
+    of it. Windows mode bits and uids carry no ACL information, so the walk stands
+    down there and the ACL the lockdown applies is the guarantee instead.
+    """
+    if platform_compat.IS_WINDOWS:
+        return None
+    mine = os.geteuid()
+    for node in _chain_the_launcher_owns(path):
+        try:
+            info = node.stat()
+        except OSError:
+            # A directory this process cannot stat is one it cannot clear either,
+            # so it is the answer rather than something to walk past.
+            return node, "cannot be read, so it cannot be cleared"
+        if info.st_uid not in (mine, 0):
+            return node, f"is owned by another account (uid {info.st_uid})"
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022 and not mode & stat.S_ISVTX:
+            return node, f"is writable by other accounts and not sticky (mode {mode:04o})"
+    return None
+
+
+def _lock_to_owner(path: Path, label: str) -> None:
+    """Make ``path`` owner-only and REFUSE unless it actually is.
+
+    Two steps, because the first cannot stand alone.
+
+    ``platform_compat.restrict_dir_to_owner`` is the owner-only lockdown for a
+    directory on both platforms and is fail-loud by contract, so a mount that
+    rejects the change raises here instead of warning and letting the build carry
+    on over a loose directory.
+
+    Applying a mode is still not the same as HAVING it: a filesystem with a fixed
+    permission mask -- FAT, exFAT, a CIFS mount with a permissive ``dir_mode`` --
+    accepts the call and keeps its own mode, reporting success. So the mode is
+    read back, and any group or other bit refuses the build. Windows mode bits
+    carry no ACL information, so there the lockdown's own success is the guarantee
+    and the read-back stands down rather than judging a meaningless number.
+
+    Only for a directory this module OWNS. The data home belongs to the operator
+    and is verified, never rewritten: see :func:`_staging_dir`.
+    """
+    try:
+        platform_compat.restrict_dir_to_owner(str(path))
+    except OSError as exc:
+        raise aws.AWSError(
+            f"cannot make the {label} '{path}' owner-only -- refusing to build the source "
+            "tarball where another account could replace it.",
+            action="source:PackageLocalCheckout",
+        ) from exc
+    if platform_compat.IS_WINDOWS:
+        return
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise aws.AWSError(
+            f"cannot read the mode of the {label} '{path}' -- refusing to build the source "
+            "tarball without confirming it is owner-only.",
+            action="source:PackageLocalCheckout",
+        ) from exc
+    if mode & 0o077:
+        raise aws.AWSError(
+            f"the {label} '{path}' is reachable by other accounts (mode {mode:04o}) -- "
+            "refusing to build the source tarball there, because the AWS CLI re-opens it "
+            "by name after this process closes it.",
+            action="source:PackageLocalCheckout",
+        )
+
+
+def _staging_dir() -> Path:
+    """The launcher-owned directory a source tarball is built in.
+
+    :func:`upload_source` hands the tarball to ``s3api put-object`` as
+    ``--body <path>``, so the AWS CLI re-opens it by name after this process has
+    written and closed it. The stdlib temp root is the wrong place to leave a file
+    across that window: ``tempfile`` resolves that root from the environment
+    (``TMPDIR`` / ``TEMP`` / ``TMP``), so the staging location is whatever the
+    launcher's environment says, with no guarantee it is owner-only or sticky. A
+    staging root another account can write makes the closed file swappable before
+    the CLI opens it, and the launch would ship a tree that was never packaged --
+    the tarball is the whole source of the box's code, so a swap there is
+    arbitrary code on the instance. Resolving the directory from the data home
+    keeps the environment out of it, and nothing else picks names inside it.
+
+    Checks run ROOT-FIRST, the order
+    :func:`platform_compat.first_linked_ancestor` uses and for its reason: each one
+    runs only after everything above it is known good, so no probe traverses a
+    link. The whole chain is covered, because the leaf's own mode settles nothing
+    while an outer directory can replace what holds it.
+
+    The data home belongs to the operator, so it is VERIFIED and never rewritten,
+    and a refusal names the command that fixes it. Only the leaf, which this module
+    owns, is locked down.
+    """
+    base = config_dir()
+    linked = platform_compat.first_linked_ancestor(str(base))
+    if linked is not None:
+        # Deliberately not naming the ancestor: which one is a link is filesystem
+        # layout, and first_linked_ancestor's own contract reserves it for logs.
+        raise aws.AWSError(
+            "an ancestor of the data home is a link, so the source staging directory would "
+            "resolve somewhere other than where it appears -- refusing to build the source "
+            "tarball.",
+            action="source:PackageLocalCheckout",
+        )
+    if platform_compat.is_link_or_junction(base):
+        raise aws.AWSError(
+            f"the data home '{base}' is a link, not a real directory -- refusing to build "
+            "the source tarball through it.",
+            action="source:PackageLocalCheckout",
+        )
+    replaceable = _first_replaceable(base)
+    if replaceable is not None:
+        node, reason = replaceable
+        # The path IS named, unlike the linked ancestor above: it is the operator's
+        # own layout, they chose it through the data-home setting, and the path is
+        # what makes the message actionable.
+        raise aws.AWSError(
+            f"'{node}' {reason}, so what it holds can be replaced wholesale and the AWS CLI "
+            "would re-open the staged name inside the replacement -- refusing to build the "
+            "source tarball. Move the data home under a directory only you can write.",
+            action="source:PackageLocalCheckout",
+        )
+    staging = base / _STAGING_DIR_LEAF
+    if platform_compat.is_link_or_junction(staging):
+        raise aws.AWSError(
+            f"the source staging directory '{staging}' is a link, not a real directory "
+            "-- refusing to build the source tarball outside the data home.",
+            action="source:PackageLocalCheckout",
+        )
+    # No parents=True: the leaf sits directly under the data home, which
+    # ``config_dir()`` resolves and creates. A missing parent is a real error
+    # here, not something to paper over with a freshly minted tree.
+    staging.mkdir(exist_ok=True)
+    # Re-check after mkdir: exist_ok=True happily accepts a pre-existing link,
+    # and resolving both sides is what catches a component swapped higher up.
+    if staging.resolve() != (base.resolve() / _STAGING_DIR_LEAF) or not staging.is_dir():
+        raise aws.AWSError(
+            f"the source staging directory '{staging}' does not resolve to a real directory "
+            "inside the data home -- refusing to build the source tarball there.",
+            action="source:PackageLocalCheckout",
+        )
+    _lock_to_owner(staging, "source staging directory")
+    return staging
+
+
 def _use_git_archive(root: Path) -> Optional[Path]:
     """Try ``git archive`` (fast, respects .gitignore). Returns the tarball or None.
 
@@ -148,7 +356,7 @@ def _use_git_archive(root: Path) -> Optional[Path]:
     out = None
     try:
         out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to caller
-            prefix="kirocrew-src-", suffix=".tar.gz", delete=False
+            prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
         )
         out.close()
         rc = subprocess.run(  # noqa: S603 — fixed argv, no shell
@@ -173,7 +381,7 @@ def _use_git_archive(root: Path) -> Optional[Path]:
 def _refilter_archive(archive: Path) -> Path:
     """Rewrite a tarball keeping only members that pass :func:`_exclude_filter`."""
     filtered = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to caller
-        prefix="kirocrew-src-", suffix=".tar.gz", delete=False
+        prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
     )
     filtered.close()
     try:
@@ -303,30 +511,38 @@ def _tar_fallback(root: Path) -> Path:
         return False
 
     out = tempfile.NamedTemporaryFile(  # noqa: SIM115
-        prefix="kirocrew-src-", suffix=".tar.gz", delete=False
+        prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
     )
     out.close()
-    with tarfile.open(out.name, "w:gz") as tar:
-        for rel in sorted(tracked):
-            if _excluded(rel):
-                continue
-            abs_path = root / rel
-            if not abs_path.exists():  # tracked-but-deleted-in-worktree edge case
-                continue
-            # recursive=False is REQUIRED, not just an optimization: `git ls-files`
-            # lists a submodule as a single gitlink entry (its directory path).
-            # tar.add() on a directory recurses by default, which would package
-            # EVERY file under the submodule worktree — including untracked /
-            # gitignored ones (secrets), defeating the tracked-only guarantee.
-            # Each real tracked file is its own ls-files entry, so we never need
-            # tar to walk a directory for us; adding non-recursively packages
-            # exactly the tracked paths and skips submodule contents entirely.
-            if abs_path.is_dir():
-                # A gitlink/submodule dir — don't add the directory node at all
-                # (adding it recursively would leak; adding it non-recursively
-                # just stores an empty dir entry we don't need).
-                continue
-            tar.add(abs_path, arcname=rel, recursive=False)
+    try:
+        with tarfile.open(out.name, "w:gz") as tar:
+            for rel in sorted(tracked):
+                if _excluded(rel):
+                    continue
+                abs_path = root / rel
+                if not abs_path.exists():  # tracked-but-deleted-in-worktree edge case
+                    continue
+                # recursive=False is REQUIRED, not just an optimization: `git ls-files`
+                # lists a submodule as a single gitlink entry (its directory path).
+                # tar.add() on a directory recurses by default, which would package
+                # EVERY file under the submodule worktree — including untracked /
+                # gitignored ones (secrets), defeating the tracked-only guarantee.
+                # Each real tracked file is its own ls-files entry, so we never need
+                # tar to walk a directory for us; adding non-recursively packages
+                # exactly the tracked paths and skips submodule contents entirely.
+                if abs_path.is_dir():
+                    # A gitlink/submodule dir — don't add the directory node at all
+                    # (adding it recursively would leak; adding it non-recursively
+                    # just stores an empty dir entry we don't need).
+                    continue
+                tar.add(abs_path, arcname=rel, recursive=False)
+    except BaseException:
+        # An unreadable tracked file or a full disk must not leave a half-written
+        # tarball behind: the staging dir lives under the data home, which no
+        # reboot clears, and only the caller that gets a path back knows to
+        # remove it. Drop it here, then re-raise for the caller's own handling.
+        Path(out.name).unlink(missing_ok=True)
+        raise
     return Path(out.name)
 
 
