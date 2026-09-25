@@ -430,7 +430,7 @@ _lineage_seed_in_flight = False
 _lineage_failure_warned = False
 
 
-def _attach_slot_parents(rows: "list[dict]") -> None:
+def _attach_slot_parents(rows: "list[dict]", aliases: "dict[str, str] | None" = None) -> None:
     """Give every slot row its ``parent`` -- ``{slot, key}`` or ``None``. IN PLACE.
 
     This is what lets the chat sidebar nest a session under the one that opened it
@@ -446,6 +446,16 @@ def _attach_slot_parents(rows: "list[dict]") -> None:
     ``nestsUnder`` resolves ``parent.key`` against its own payload's keys, so that is
     the invariant it needs; a session key here would name no row and every child would
     silently detach.
+
+    *aliases* is ``DashboardState.spend_slot_by_session()`` -- session key to slot key
+    -- and it is the SAME argument the Sessions table's payload hands the same join.
+    It is what carries the spellings this payload's own keys do not: a conductor whose
+    turns run on a channel conversation is cited by that channel key, and a dashboard
+    session can be cited by its ``dashboard:`` spelling, neither of which is a slot
+    key. Without it the join answered "creator not running" for exactly those
+    conductors while the Sessions table nested their workers from the same fold, and
+    the two views disagreed about one gateway at one moment. ``None`` is accepted so a
+    caller with no registry to ask still gets every row's key.
 
     Whole-population work, so it lives after the per-slot loop rather than inside
     :meth:`DashboardState.serialize_slot`: resolving a citation to a LIVE creator needs
@@ -514,7 +524,7 @@ def _attach_slot_parents(rows: "list[dict]") -> None:
 
         proj = projection()
         if proj.seeded_for_current_store:
-            parents = lineage_parents(rows, proj.nodes())
+            parents = lineage_parents(rows, proj.nodes(), aliases)
             # A seed that FAILED leaves a readable but EMPTY state, so the check above
             # is satisfied and this path would otherwise never ask for another one --
             # the projection's own retry is reached only by a caller that seeds, and
@@ -7856,7 +7866,16 @@ class DashboardState:
             )
             d["subagents_running"] = bool(subs and subs.running_agents_for(f"dashboard:{s.key}"))
             out.append(d)
-        _attach_slot_parents(out)
+        # The slot-key/session-key correspondence the lineage join needs, read the same
+        # way ``/api/sessions/memory`` reads it for the Sessions table. Pure dict work
+        # over the live registry, so it costs nothing on this loop. Guarded because a
+        # state double in the suite may not carry the method, and because the join must
+        # receive a real mapping or nothing -- a mock's ``.get`` returns another mock.
+        try:
+            aliases = self.spend_slot_by_session()
+        except Exception:  # pragma: no cover - defensive during teardown
+            aliases = None
+        _attach_slot_parents(out, aliases if isinstance(aliases, dict) else None)
         return out
 
     def serialize_slot_views(
