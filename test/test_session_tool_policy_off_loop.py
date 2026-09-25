@@ -767,3 +767,154 @@ async def test_the_fence_probe_judges_the_canonical_target_with_the_spec_readers
     response = await _call(monkeypatch, agents)
     assert response.status == 409
     assert _body(response)["code"] == "policy_unreadable"
+
+
+# ---------------------------------------------------------------------------
+# The refusal names the file. A ``policy_unreadable`` reason that carries only
+# an exception class name -- ``(JSONDecodeError)`` -- leaves an operator told
+# to "fix or remove the unreadable spec" with no way to find it short of
+# validating every file in the directory by hand. The gate's VERDICT is not
+# what these tests pin: every case below is a 409 either way, and the
+# readable-directory controls above still answer 200.
+# ---------------------------------------------------------------------------
+
+
+def _reason_names_file_and_kind(reason: str, filename: str, kind: str, agents_dir: Path) -> None:
+    """The shared shape every unreadable-spec refusal must take.
+
+    The filename is quoted (``repr``: it is untrusted input from a
+    user-writable directory and the text reaches a terminal), the failure kind
+    is spelled out in words rather than an exception class, the tail says what
+    to do, and NO absolute path leaks: the reason reaches the MCP client's
+    error text, so the directory's location stays out of it.
+    """
+    assert repr(filename) in reason, reason
+    assert kind in reason, reason
+    assert "no restart needed" in reason, reason
+    assert str(agents_dir) not in reason, "the refusal leaked the agents directory's path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "content", "kind"),
+    [
+        ("broken.json", "{ not json", "not valid JSON"),
+        ("notes.md", "---\nname: reviewer\n", "frontmatter"),
+        ("._sidecar.json", '{"name": "x"}', "AppleDouble sidecar"),
+    ],
+    ids=["bad-json", "unclosed-fence", "appledouble"],
+)
+async def test_the_directory_guard_names_the_unreadable_file_and_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str, content: str, kind: str
+) -> None:
+    """One stray file denies every spec-less agent; the denial must say which.
+
+    Setup mirrors the field report: a perfectly good spec for someone else
+    (so the directory is not empty) plus one file the strict reader refuses.
+    The verdict stays 409 -- that is the gate's design -- but ``reason`` now
+    carries the filename and a plain-words failure kind, and the SEL row
+    carries the same text so the audit trail is actionable too.
+    """
+    (tmp_path / "somepkg-other.json").write_text(
+        json.dumps({"name": "other", "managedToolPolicy": {"exclude": ["x"]}}), encoding="utf-8"
+    )
+    (tmp_path / filename).write_text(content, encoding="utf-8")
+
+    sel = MagicMock()
+    monkeypatch.setattr(sessions_mod, "kiro_agents_dir", lambda: tmp_path)
+    monkeypatch.setattr(sessions_mod, "_sel", lambda: sel)
+    response = await sessions_mod.api_session_tool_policy(_request(_state()))
+
+    assert response.status == 409
+    body = _body(response)
+    assert body["code"] == "policy_unreadable"
+    _reason_names_file_and_kind(body["reason"], filename, kind, tmp_path)
+    assert f"the policy for {AGENT!r} is unknown" in body["reason"]
+    kwargs = sel.log_api_access.call_args.kwargs
+    assert kwargs["outcome"] == "denied"
+    assert repr(filename) in kwargs["error"], "the SEL row must name the file too"
+
+
+@pytest.mark.asyncio
+async def test_the_direct_filename_refusal_names_the_file_and_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``<agent>.json`` arm keeps its historical prefix and gains the file.
+
+    ``agent spec for 'reviewer' could not be read`` is what an earlier test
+    pins for this arm; the filename and kind are appended, not substituted, so
+    a reader matching on the old prefix still matches.
+    """
+    (tmp_path / f"{AGENT}.json").write_text("{ not json", encoding="utf-8")
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    reason = _body(response)["reason"]
+    assert f"agent spec for {AGENT!r} could not be read" in reason
+    _reason_names_file_and_kind(reason, f"{AGENT}.json", "not valid JSON", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_the_wrong_shape_refusals_name_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec that parses but is the wrong shape is named like one that does not.
+
+    Same disposition, same actionable shape: valid JSON that is not an object,
+    and a ``managedToolPolicy`` that is not an object, both name the direct
+    file the arm read.
+    """
+    (tmp_path / f"{AGENT}.json").write_text("[1, 2]", encoding="utf-8")
+    reason = _body(await _call(monkeypatch, tmp_path))["reason"]
+    _reason_names_file_and_kind(reason, f"{AGENT}.json", "not an object", tmp_path)
+
+    (tmp_path / f"{AGENT}.json").write_text(
+        json.dumps({"managedToolPolicy": "shell"}), encoding="utf-8"
+    )
+    reason = _body(await _call(monkeypatch, tmp_path))["reason"]
+    _reason_names_file_and_kind(reason, f"{AGENT}.json", "not an object", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_shape_policy_found_by_declared_name_names_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan returns a parse, not a path, so the refusal names the spec by
+    its declared name -- which identifies it, since exactly one declares it --
+    and still ends with the remedy. Same 409 as before; only the text grew."""
+    (tmp_path / f"SomePackage-{AGENT}.json").write_text(
+        json.dumps({"name": AGENT, "managedToolPolicy": "shell"}), encoding="utf-8"
+    )
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    reason = _body(response)["reason"]
+    assert f"managedToolPolicy for {AGENT!r} is str, not an object" in reason
+    assert f"declaring name {AGENT!r}" in reason
+    assert "no restart needed" in reason
+    assert str(tmp_path) not in reason
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_log_names_the_unreadable_file_once_per_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gateway log carries the full path, at WARNING, and does not flood.
+
+    The client re-asks for its policy on every ``tools/call`` (a 409 is never
+    negative-cached), so a warning per refusal would repeat once per tool call
+    for as long as the file stays broken. One line per (file, mtime) is
+    enough for an operator reading the log: a fix or a re-break changes the
+    mtime and is logged again. The full path is fine HERE -- the gateway log
+    is local -- where the wire reason above carries only the name.
+    """
+    broken = tmp_path / "broken.json"
+    broken.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(sessions_mod, "_UNREADABLE_SPEC_WARNED", set())
+
+    with caplog.at_level("WARNING", logger=sessions_mod.logger.name):
+        assert (await _call(monkeypatch, tmp_path)).status == 409
+        assert (await _call(monkeypatch, tmp_path)).status == 409
+
+    warnings = [r for r in caplog.records if "broken.json" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert repr(str(broken)) in warnings[0].getMessage()
+    assert "not valid JSON" in warnings[0].getMessage()

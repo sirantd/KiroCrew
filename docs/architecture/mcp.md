@@ -1171,6 +1171,27 @@ there is no timeout to debounce, and both negative
 clocks are process-global, so caching one session's malformed spec there would
 refuse calls for every sibling session in a pooled backend.
 
+The `409` body's `reason` names the file. Every `policy_unreadable` refusal the
+gateway writes -- the directory-wide guard (`_refuse_if_any_spec_is_unreadable`),
+the direct `<agent>.json`/`.md` read, and the two shape checks -- carries the
+offending spec's filename (`repr`'d: it is untrusted input from a user-writable
+directory and the text reaches a terminal), the failure kind in words (`not valid
+JSON`, `not UTF-8 text`, `markdown frontmatter that does not parse`, `an
+AppleDouble sidecar`, `larger than the spec size cap`, `resolves to a path the spec
+reader refuses`, `could not be opened (...)`) and one remedy sentence: move or fix
+that file in the agents directory, no restart needed. Never `str(exc)` verbatim,
+and never the directory's path: the strict reader's own messages quote the full
+path, and this text crosses the wire into the model-visible refusal. The SEL
+`denied` row carries the same `reason`; the gateway log carries the FULL path at
+`WARNING`, once per `(path, mtime)` -- the client re-asks on every `tools/call`, so
+a line per refusal would repeat for as long as the file stays broken. The MCP side
+reads `reason` off the body into `ToolPolicy.detail` (text only; the decision is
+the status and `code`, unchanged) and appends it to the `policy_unreadable`
+refusal as `Gateway reason: ...`, defanged (`neutralize_markers`), credential-redacted
+(`redact_via_context`) and bounded (`_POLICY_DETAIL_MAX_CHARS`) exactly as the
+`identity_unattested` arm treats its denial text. With no `reason` in the body --
+an older gateway -- the refusal is byte-identical to what it was.
+
 ## The MCP-first rule
 
 **A new LLM-facing capability MUST ship as an MCP tool, not only as a CLI

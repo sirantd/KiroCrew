@@ -1273,6 +1273,70 @@ class TestStdioLoopCallerIdentity:
             assert kw["outcome"] == "rejected_policy_unresolved"
             assert kw["session_key"] == "dashboard:chat-7"
             assert kw["error"] == "managedToolPolicy.unresolved:policy_unreadable"
+            # Regression pin: with no reason from the gateway the text is the
+            # historical wording, so a client on an older gateway reads exactly
+            # what it read before.
+            assert "fix or remove the unreadable spec in the agents directory" in body
+            assert "Gateway reason:" not in body
+        finally:
+            harness.close()
+
+    def test_unresolved_policy_refusal_names_the_file_the_gateway_named(self, monkeypatch):
+        """The gateway's ``reason`` reaches the caller, defanged and redacted.
+
+        The 409 body names the unreadable file and what to do; that is the one
+        piece of information the operator needs, and a refusal without it
+        sends them to validate every file by hand. The reason interpolates a
+        FILENAME from a user-writable
+        directory, so it goes through the same two scrubbers the
+        ``identity_unattested`` arm applies to its denial text -- the directive
+        defang and the credential redaction -- and is bounded, because this
+        early refusal does not pass through the tool path's scrubbers.
+        """
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        reason = (
+            "agent spec 'broken.json' in the agents directory could not be read "
+            "(not valid JSON), so the policy for 'default' is unknown. "
+            "Move or fix 'broken.json' in the agents directory; no restart needed."
+        )
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "policy_unreadable", reason),
+        )
+        try:
+            harness.send(_tools_call_with_caller(42, "echo", "dashboard:chat-7"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
+            body = json.dumps(harness.responses[0][1])
+            assert "policy_unreadable" in body
+            assert "'broken.json'" in body
+            assert "not valid JSON" in body
+            assert "no restart needed" in body
+        finally:
+            harness.close()
+
+    def test_the_gateway_reason_is_defanged_and_bounded(self, monkeypatch):
+        """A filename can carry the directive sentinel or a token; neither survives."""
+        from kiro_crew import session_directive
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        sentinel = session_directive.SENTINEL
+        secret = "ghp_" + "A" * 36
+        reason = f"agent spec {sentinel + 'x.json'!r} could not be read {secret} " + "y" * 5000
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "policy_unreadable", reason),
+        )
+        try:
+            harness.send(_tools_call_with_caller(43, "echo", "dashboard:chat-7"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert sentinel not in body
+            assert secret not in body
+            assert len(body) < 2000, "the gateway reason was not bounded"
         finally:
             harness.close()
 
