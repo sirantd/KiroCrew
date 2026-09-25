@@ -728,6 +728,254 @@ def test_service_ensure_is_idempotent(tmp_path, monkeypatch):
     assert svc.last_seq("erin") == seq_before
 
 
+class TestEnsureCostsAStatOnARepeat:
+    """A repeat ``ensure`` is the common case, so it has to be cheap.
+
+    It is called once per member on every roster read and once per message. A pass
+    that parses the file again and folds from the first event puts each member's
+    whole history on the roster read, so a 76-member install pays a cost that grows
+    with every event any of them records.
+
+    Cheap is pinned by what a repeat does NOT do: parse the file again, replace the
+    cached instance, fold from the first event, or spend a cross-process lease. The
+    three tests after that pin what it still MUST do -- see a foreign append, create
+    an absent log, and finish the legacy fold -- because each of those is a way to
+    make the first four pass for the wrong reason.
+    """
+
+    @staticmethod
+    def _service(tmp_path, monkeypatch) -> MemberEventLogService:
+        import kiro_crew.members as members
+
+        monkeypatch.setattr(members, "data_home", lambda: tmp_path)
+        root = tmp_path / "members"
+        root.mkdir()
+        return MemberEventLogService(root)
+
+    def test_a_second_ensure_does_not_refold_an_unchanged_log(self, tmp_path, monkeypatch):
+        svc = self._service(tmp_path, monkeypatch)
+        svc.ensure("erin", "Erin")
+        svc.append("erin", types.MEMBER_CONFIG, {"model": "m1"})
+
+        held = svc._logs["erin"]
+        counts = {"prime": 0, "load": 0}
+        real_prime = svc._registry.prime
+        real_load = held.load
+
+        def counting_prime(store, events):
+            counts["prime"] += 1
+            real_prime(store, events)
+
+        def counting_load():
+            counts["load"] += 1
+            real_load()
+
+        monkeypatch.setattr(svc._registry, "prime", counting_prime)
+        monkeypatch.setattr(held, "load", counting_load)
+
+        svc.ensure("erin", "Erin")
+
+        assert counts["prime"] == 0, "a repeat ensure folded the member from the first event"
+        assert counts["load"] == 0, "a repeat ensure parsed an unchanged file again"
+        assert svc._logs["erin"] is held, "a repeat ensure replaced the cached instance"
+        # And the state the first pass folded is still what is served.
+        assert svc.snapshot("erin")["values"][types.PROJ_ROSTER]["model"] == "m1"
+
+    def test_a_second_ensure_takes_no_cross_process_lease(self, tmp_path, monkeypatch):
+        """The lease is the expensive part of a fold that has nothing left to do."""
+        svc = self._service(tmp_path, monkeypatch)
+        svc.ensure("dave", "Dave")
+
+        holds = {"n": 0}
+        real_hold = svc._hold_unit
+
+        def counting_hold(slug):
+            holds["n"] += 1
+            return real_hold(slug)
+
+        monkeypatch.setattr(svc, "_hold_unit", counting_hold)
+        svc.ensure("dave", "Dave")
+
+        assert holds["n"] == 0, "a repeat ensure spent a cross-process lease acquire"
+
+    def test_a_second_ensure_sees_what_another_process_appended(self, tmp_path, monkeypatch):
+        """Correctness of the cheap path: it may skip work, never a commit.
+
+        The log has two ordinary writers, so the file can grow between two calls.
+        Asked of the REGISTRY rather than through ``snapshot``, because a read
+        refreshes too -- going through one could not say whether ``ensure`` crossed
+        the gap or the read did.
+        """
+        svc = self._service(tmp_path, monkeypatch)
+        svc.ensure("erin", "Erin")
+        svc.append("erin", types.SLOT_OPENED, {"slot_key": "member-erin"})
+
+        other = MemberLog("erin")
+        other.load()
+        stranger = other.append(types.SLOT_OPENED, {"slot_key": "worker-from-another-process"})
+
+        svc.ensure("erin", "Erin")
+
+        folded = svc._registry.snapshot("erin")["values"][types.PROJ_DRIVING]["open"]
+        assert folded == ["member-erin", "worker-from-another-process"], folded
+        assert svc._logs["erin"].last_seq() == stranger["seq"]
+
+    def test_an_absent_log_is_still_created_with_its_header(self, tmp_path, monkeypatch):
+        """``ensure`` is the path that PUBLISHES a member's log, cheap repeat or not."""
+        svc = self._service(tmp_path, monkeypatch)
+        assert not MemberLog("gale").exists(), "precondition: nothing on disk for this slug"
+
+        svc.ensure("gale", "Gale")
+
+        assert crew_log_path(KIND_MEMBER, "gale").exists()
+        created = MemberLog("gale")
+        created.load()
+        assert created.header is not None
+        assert created.header["id"] == "gale"
+        assert created.header["name"] == "Gale"
+        assert svc.logged_name("gale") == "Gale"
+
+    def test_a_first_ensure_still_completes_the_legacy_fold(self, tmp_path, monkeypatch):
+        """One pass per process is the budget, and the pass is the FIRST one.
+
+        The activity rows are written as FILES by hand: ``record_activity`` writes to
+        the event log, so building that half of the fixture through it would leave no
+        legacy file for the fold to read.
+        """
+        import json as _json
+
+        import kiro_crew.members as members
+
+        svc = self._service(tmp_path, monkeypatch)
+        members.write_dm_binding("dave", member="Dave", slot_key=members.member_slot_key("dave"))
+        members.write_member_rules("dave", member="Dave", text="be nice")
+        rows = [
+            {"ts": 1000 + i, "member": "Dave", "session": f"s{i}", "mode": "persistent"}
+            for i in range(3)
+        ]
+        dest = members.member_dir("dave") / members.ACTIVITY_FILE_NAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(
+            "".join(_json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+        )
+
+        svc.ensure("dave", "Dave")
+
+        events = svc.history("dave", before=None, limit=100)
+        etypes = [e["type"] for e in events]
+        assert types.MEMBER_BINDING in etypes, etypes
+        assert types.MEMBER_RULES in etypes, etypes
+        sessions = sorted(
+            str(e["data"].get("session")) for e in events if e["type"] == types.ACTIVITY_RECORD
+        )
+        assert sessions == ["s0", "s1", "s2"], sessions
+
+    def test_a_short_legacy_read_is_not_recorded_as_a_completed_fold(self, tmp_path, monkeypatch):
+        """A read that came back short has rows it never saw, so it settles nothing.
+
+        ``_read_legacy_activity_files`` answers ``complete=False`` by RETURNING, not by
+        raising -- an unreachable path, a file over the byte budget, an ``OSError``
+        part-way. A memo written on "the pass did not throw" would drop those rows for
+        the life of the process, where the unretired source is meant to be re-read.
+        """
+        import json as _json
+
+        import kiro_crew.members as members
+        from kiro_crew.eventlog import service as service_mod
+
+        svc = self._service(tmp_path, monkeypatch)
+        rows = [
+            {"ts": 1000 + i, "member": "Dave", "session": f"s{i}", "mode": "persistent"}
+            for i in range(3)
+        ]
+        dest = members.member_dir("dave") / members.ACTIVITY_FILE_NAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(
+            "".join(_json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+        )
+
+        real_read = service_mod._read_legacy_activity_files
+        calls = {"n": 0}
+
+        def short_first(slug):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # What the byte budget hands back: the rows read so far, and False.
+                return [rows[0]], False
+            return real_read(slug)
+
+        monkeypatch.setattr(service_mod, "_read_legacy_activity_files", short_first)
+
+        def _sessions() -> list[str]:
+            return sorted(
+                str(e["data"].get("session"))
+                for e in svc.history("dave", before=None, limit=100)
+                if e["type"] == types.ACTIVITY_RECORD
+            )
+
+        svc.ensure("dave", "Dave")
+        assert _sessions() == ["s0"], f"precondition: only the read rows land: {_sessions()}"
+
+        svc.ensure("dave", "Dave")
+        assert _sessions() == ["s0", "s1", "s2"], _sessions()
+
+    def test_a_failed_binding_read_is_not_recorded_as_a_completed_fold(self, tmp_path, monkeypatch):
+        """Same rule for the binding and rules reads: a swallowed failure settles nothing."""
+        import kiro_crew.members as members
+
+        svc = self._service(tmp_path, monkeypatch)
+        members.write_dm_binding("dave", member="Dave", slot_key=members.member_slot_key("dave"))
+
+        real_binding = members.read_dm_binding
+        calls = {"n": 0}
+
+        def failing_first(slug):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("binding store unreadable")
+            return real_binding(slug)
+
+        monkeypatch.setattr(members, "read_dm_binding", failing_first)
+
+        svc.ensure("dave", "Dave")
+        etypes = [e["type"] for e in svc.history("dave", before=None, limit=100)]
+        assert types.MEMBER_BINDING not in etypes, f"precondition: the read failed: {etypes}"
+
+        svc.ensure("dave", "Dave")
+        etypes = [e["type"] for e in svc.history("dave", before=None, limit=100)]
+        assert types.MEMBER_BINDING in etypes, etypes
+
+    def test_an_unreadable_binding_file_is_not_recorded_as_a_completed_fold(
+        self, tmp_path, monkeypatch
+    ):
+        """The reachable version of the case above, with nothing patched.
+
+        ``read_dm_binding`` is total by contract: it answers "not bound" for a
+        malformed file exactly as it does for an absent one, and it answers by
+        RETURNING. A fold that only watched for a raised exception would record this
+        member as settled with its binding never migrated -- while the file is still
+        sitting there, which is the definition of work a later pass can do.
+        """
+        import kiro_crew.members as members
+
+        svc = self._service(tmp_path, monkeypatch)
+        path = members.dm_binding_path("dave")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ this is not json", encoding="utf-8")
+        assert members.read_dm_binding("dave") is None, "precondition: it reads as not bound"
+
+        svc.ensure("dave", "Dave")
+        etypes = [e["type"] for e in svc.history("dave", before=None, limit=100)]
+        assert types.MEMBER_BINDING not in etypes, f"precondition: nothing migrated: {etypes}"
+
+        # The operator repairs the file. A later call in the SAME process has to pick
+        # it up, which it can only do if the first pass settled nothing.
+        members.write_dm_binding("dave", member="Dave", slot_key=members.member_slot_key("dave"))
+        svc.ensure("dave", "Dave")
+        etypes = [e["type"] for e in svc.history("dave", before=None, limit=100)]
+        assert types.MEMBER_BINDING in etypes, etypes
+
+
 # ---------------------------------------------------------------------------
 # MemberLog: publishing the header, and the failures a real filesystem hands back
 # ---------------------------------------------------------------------------
@@ -1910,7 +2158,7 @@ class TestARedactionFailureDropsTheFrameInsteadOfPublishingIt:
 
 
 class TestOneBadByteCannotBlockEveryLaterActivityWrite:
-    """The legacy file is agent-writable and read on every ``ensure``.
+    """The legacy file is agent-writable and read from ``ensure``.
 
     A strict decode raises from ``readline``, one frame outside the ``except
     ValueError`` that guards ``json.loads`` -- so a single torn byte would propagate
