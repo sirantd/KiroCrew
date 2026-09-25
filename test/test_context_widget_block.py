@@ -68,10 +68,12 @@ class TestWidgetBlockPlaceholder:
         # sections (Inline Widgets + Artifacts, ~640 chars for "more") when the
         # Artifacts pointer was added, and again by one theme-contract sentence
         # (~1000 / ~560) once answer-only widgets shipped unreadable in dark
-        # mode because the model never loaded the skill. Budgets sit just above
-        # today's sizes to keep catching accidental regrowth toward inlining
-        # full skill docs.
-        budgets = {"more": 1050, "less": 600}
+        # mode because the model never loaded the skill, and once more by the
+        # animation baseline (~1300 / ~700), which must reach agents whose
+        # skill:// mapping hides the skill. Budgets sit just above today's
+        # sizes to keep catching accidental regrowth toward inlining full
+        # skill docs.
+        budgets = {"more": 1350, "less": 750}
         for density, budget in budgets.items():
             result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
             assert len(result) < budget, f"{density} pointer too long: {len(result)} chars"
@@ -87,6 +89,26 @@ class TestWidgetBlockPlaceholder:
             assert "The frame is themed" in result, density
             assert "never a fixed palette" in result, density
             assert "background together with its text color" in result, density
+
+    def test_pointer_carries_the_animation_baseline(self):
+        # The widgets skill holds the full animation rules, but an agent whose
+        # skill:// mapping omits it never sees the skill. The floor -- move only
+        # when motion carries information, a pause control, the reduced-motion
+        # setting -- rides in the pointer so it holds without the skill.
+        for density in ("more", "less"):
+            result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
+            assert "Animate only when the" in result, density
+            assert "pause control" in result, density
+            assert "reduced-motion setting" in result, density
+
+    def test_conductor_prompt_carries_the_widget_block(self):
+        # The conductor talks to the person on the dashboard but ships its own
+        # prompt, not prompt.md, so without the token it gets no widget pointer.
+        # The worker reports as structured data to its conductor and is left out.
+        from kiro_crew import agent
+
+        assert agent._CONDUCTOR_SYSTEM_PROMPT.rstrip().endswith("{{WIDGET_BLOCK}}")
+        assert "{{WIDGET_BLOCK}}" not in agent._WORKER_SYSTEM_PROMPT
 
     def test_dashboard_underscore_key_also_matches(self):
         # Some dashboard sessions use `dashboard_<slot>` instead of `dashboard:<slot>`.

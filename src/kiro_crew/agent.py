@@ -7977,6 +7977,7 @@ acting on a goal. The user can message you at any time: apply goal changes at th
 round boundary, except a message that invalidates an in-flight item, which you
 handle immediately.
 
+{{WIDGET_BLOCK}}
 """
 
 

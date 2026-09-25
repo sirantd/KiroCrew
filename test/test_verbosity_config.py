@@ -358,12 +358,17 @@ class TestAnswerOnlyBlock:
         assert "Does the answer have a shape" in block
         assert "steps, before/after, cases and verdicts, sizes" in block
         assert (
-            "When your instructions carry an Inline Widgets section, the picture "
-            "IS an inline widget (an HTML artifact when it is large)" in block
+            "When your instructions carry an Inline Widgets section and the "
+            "picture needs color, size, position or motion, it IS an inline "
+            "widget (an HTML artifact when it is large)" in block
         )
+        # A grid of words and numbers gains nothing from an iframe: the mandate
+        # used to turn every plain table into a widget artifact. The criterion
+        # (color, size, position, motion) is a test, not a menu of forms.
+        assert "A grid of short labels and numbers is a plain markdown table" in block
         # The one form the observed failure took is named, so the mandate rules
         # out a table of prose without re-opening a menu of allowed forms.
-        assert "never a plain table of sentences" in block
+        assert "Never a table of sentences" in block
         # The fallback names the surfaces that cannot render them and says
         # what the markup becomes there, so the model has a reason, not a rule.
         assert (
